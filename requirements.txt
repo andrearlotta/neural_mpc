@@ -1,0 +1,5 @@
+casadi==3.6.3       # For optimization and symbolic computation
+torch==2.0.1        # For machine learning models and training (PyTorch)
+numpy==1.25.0       # For numerical operations
+plotly==5.15.0      # For data visualization and plotting
+matplotlib==3.7.2   # For additional plotting
