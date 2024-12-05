@@ -101,14 +101,14 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub):
     grad_y = jacobian(gaussian_values, y)
 
     # Gradient magnitude (norm) to guide towards higher values
-    gradient_magnitude = mmax(sqrt(grad_x**2 + grad_y**2))
+    gradient_magnitude = logsumexp(sqrt(grad_x**2 + grad_y**2))
 
     # Constraints for (x, y) bounds
     opti.subject_to((lb[0] - 5 <= x) <= ub[0] + 5)
     opti.subject_to((lb[1] - 5 <= y) <= ub[1] + 5)
 
     # Objective: Maximize the output of the Gaussian function with guiding term
-    opti.minimize(-logsumexp(gaussians_func(x, y, centers) * (1- weights))-  0.1 * gradient_magnitude)
+    opti.minimize(-gradient_magnitude)
 
     # Solver options
     options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0,"tol":1e-5, "sb": "no", "mu_strategy":"adaptive"}}
@@ -144,7 +144,7 @@ def main():
     y_steps = []
     z_steps = weights
 
-    while sum1(weights) <= len(centers) -1:
+    while sum1(weights) <= len(centers) -1e-1:
 
         # Optimize to find the maximum
         optimal_point_x,optimal_point_y, max_value, next_weights = maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub)
