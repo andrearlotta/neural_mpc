@@ -75,7 +75,7 @@ def generate_gaussian_function_2d(centers, sigma):
     return gaussians_func
 
 
-def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub):
+def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps=10, x0= 0.0, y0=0.0):
     """
     Uses CasADi's Opti to maximize the output of the 2D Gaussian function.
     Args:
@@ -92,26 +92,46 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub):
     # Decision variables
     x = opti.variable()
     y = opti.variable()
+    w = opti.variable(len(centers))
+    opti.set_initial(x,x0)
+    opti.set_initial(y,y0)
+    opti.subject_to(w == weights)
 
-    # Compute Gaussian values at (x, y)
-    gaussian_values = bayes_f(gaussians_func(x, y, centers) + 0.5 , weights)
-    
-    # Compute gradients of the Gaussian function with respect to x and y
-    grad_x = jacobian(gaussian_values, x)
-    grad_y = jacobian(gaussian_values, y)
+    W = [w]
 
-    # Gradient magnitude (norm) to guide towards higher values
-    gradient_magnitude = logsumexp(sqrt(grad_x**2 + grad_y**2))
+    X = [x]
+    Y = [y]
+    gradient_magnitude = []
+    for i in range(steps):
 
-    # Constraints for (x, y) bounds
-    opti.subject_to((lb[0] - 5 <= x) <= ub[0] + 5)
-    opti.subject_to((lb[1] - 5 <= y) <= ub[1] + 5)
+        # Constraints for (x, y) bounds
+        opti.subject_to((lb[0] -1 <= x) <= ub[0]+1)
+        opti.subject_to((lb[1] -1 <= y) <= ub[1]+1)
+        w_next = opti.variable(len(centers))
+        
+        opti.subject_to(w_next == bayes_f(gaussians_func(x, y, centers) + 0.5 , W[-1]))
+
+        # Compute gradients of the Gaussian function with respect to x and y
+        grad_x = jacobian(w_next, x)[0]
+        grad_y = jacobian(w_next, y)[0]
+
+        # Gradient magnitude (norm) to guide towards higher values
+        gradient_magnitude.append(mmax(sqrt(grad_x**2 + grad_y**2)))
+        
+        
+        # Compute Gaussian values at (x, y)
+        W.append(w_next)        
+
+        if i < steps -1:
+            x = opti.variable()
+            y = opti.variable()
+        
 
     # Objective: Maximize the output of the Gaussian function with guiding term
-    opti.minimize(-gradient_magnitude)
+    opti.minimize(-gradient_magnitude[-1])
 
     # Solver options
-    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0,"tol":1e-5, "sb": "no", "mu_strategy":"adaptive"}}
+    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0, "sb": "no", "mu_strategy":"adaptive"}}
     opti.solver('ipopt', options)
 
     sol = opti.solve()
@@ -119,7 +139,7 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub):
     optimal_x = sol.value(x)
     optimal_y = sol.value(y)
     max_value = sol.value(gaussians_func(optimal_x, optimal_y, centers) * weights)
-    next_weights = sol.value(gaussian_values)
+    next_weights = sol.value(W[-1])
     return optimal_x, optimal_y, max_value, next_weights
 
 
@@ -144,15 +164,21 @@ def main():
     y_steps = []
     z_steps = weights
 
-    while sum1(weights) <= len(centers) -1e-1:
+    x = [DM([0.0])]
+    y = [DM([0.0])]
+    i = 0
+    while (sum1(weights) <= len(centers) -1e-1 )and (i < 100) : 
 
         # Optimize to find the maximum
-        optimal_point_x,optimal_point_y, max_value, next_weights = maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub)
+        optimal_point_x,optimal_point_y, max_value, next_weights = maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, 10, x[-1], y[-1])
         x_steps = horzcat(x_steps, optimal_point_x)
         y_steps = horzcat(y_steps, optimal_point_y)
         z_steps = horzcat(z_steps, next_weights)
+        x.append(optimal_point_x)
+        y.append(optimal_point_y)
         weights = next_weights
         print(sum1(next_weights))
+        i += 1
     
     x_steps = x_steps.full().flatten()
     y_steps = y_steps.full().flatten()
