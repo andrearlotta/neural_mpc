@@ -4,78 +4,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tools import *
 
-
-def smooth_radial_bounds_function_casadi(max_value, min_value, max_distance):
-    """
-    Smooth radial function implemented in CasADi.
-    Decreases from max_value at the center to min_value at the borders.
-    
-    Returns:
-        A CasADi function that computes the radial function.
-    """
-    # Define symbolic variables
-    x = MX.sym("x")
-    y = MX.sym("y")
-
-    # Compute squared distance from the origin
-    r_squared = (x)**2 + (y)**2
-    r = r_squared**0.5
-
-    # Normalize distance to the range [0, 1]
-    r_normalized = r / max_distance
-    r_normalized = MX.fmin(MX.fmax(r_normalized, 0), 1)  # Clip to [0, 1]
-
-    # Smooth transition from max_value to min_value
-    value = min_value + (max_value - min_value) * (1 - r_normalized**2)
-
-    # Create the CasADi function
-    return Function("smooth_radial_bounds_function", 
-                    [x, y], 
-                    [value])
-
-def gaussian_2d(mu, sigma, x, y):
-    """
-    2D Gaussian function definition using CasADi, scaled to range between 0.5 and 1.
-    Args:
-    - mu: Mean of the Gaussian (2D vector).
-    - sigma: Standard deviation of the Gaussian.
-    - x, y: Symbolic variables for the inputs.
-
-    Returns:
-    - Scaled Gaussian expression.
-    """
-    raw_gaussian = (1 / (2 * pi * sigma**2)) * exp(
-        -0.5 * ((x - mu[0])**2 + (y - mu[1])**2) / sigma**2
-    )
-    max_gaussian = 1 / (2 * pi * sigma**2)  # Maximum value of the Gaussian
-    scaled_gaussian = 0.5 + 0.5 * (raw_gaussian / max_gaussian)  # Scale to range [0.5, 1]
-    return scaled_gaussian
-
-
-def generate_gaussian_function_2d(centers, sigma):
-    """
-    Creates a CasADi function to compute weighted 2D Gaussian values for given (x, y) and weights.
-    Args:
-    - centers: Array of 2D Gaussian centers.
-    - sigma: Standard deviation of the Gaussians.
-
-    Returns:
-    - CasADi function that computes Gaussian values for a given (x, y).
-    - The centers and weights as numpy arrays for reference.
-    """
-    x_input = MX.sym('x')
-    y_input = MX.sym('y')
-    weights = MX.sym('weights', len(centers))  # Symbolic weights
-
-    gaussian_exprs = [
-        gaussian_2d(mu, sigma, x_input, y_input) for mu in centers
-    ]
-    gaussian_exprs = sum(weights[i] * gaussian_exprs[i] for i in range(len(centers)))
-    gaussians_func = Function('gaussians_func', [x_input, y_input, weights], [gaussian_exprs])
-    return gaussians_func
-
-
-def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps=10, x0= 0.0, y0=0.0):
+def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps=1, x0= 0.0, y0=0.0):
     """
     Uses CasADi's Opti to maximize the output of the 2D Gaussian function.
     Args:
@@ -103,28 +32,25 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps
     Y = [y]
     gradient_magnitude = []
     for i in range(steps):
-
         # Constraints for (x, y) bounds
         opti.subject_to((lb[0] -1 <= x) <= ub[0]+1)
         opti.subject_to((lb[1] -1 <= y) <= ub[1]+1)
         w_next = opti.variable(len(centers))
-        
         opti.subject_to(w_next == bayes_f(gaussians_func(x, y, centers) + 0.5 , W[-1]))
-
         # Compute gradients of the Gaussian function with respect to x and y
-        grad_x = jacobian(w_next, x)[0]
-        grad_y = jacobian(w_next, y)[0]
-
+        grad_x = jacobian(logsumexp(w_next * (1-W[-1])), x)
+        grad_y = jacobian(logsumexp(w_next * (1-W[-1])), y)
         # Gradient magnitude (norm) to guide towards higher values
-        gradient_magnitude.append(mmax(sqrt(grad_x**2 + grad_y**2)))
-        
-        
+        gradient_magnitude.append(sqrt(grad_x**2 + grad_y**2))
+
         # Compute Gaussian values at (x, y)
         W.append(w_next)        
 
         if i < steps -1:
             x = opti.variable()
             y = opti.variable()
+            X.append(x)
+            Y.append(y)
         
 
     # Objective: Maximize the output of the Gaussian function with guiding term
@@ -136,16 +62,16 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps
 
     sol = opti.solve()
 
-    optimal_x = sol.value(x)
-    optimal_y = sol.value(y)
-    max_value = sol.value(gaussians_func(optimal_x, optimal_y, centers) * weights)
-    next_weights = sol.value(W[-1])
+    optimal_x = sol.value(X[1])
+    optimal_y = sol.value(Y[1])
+    max_value = sol.value(gaussians_func(optimal_x, optimal_y, centers) * weights) + 0.5
+    next_weights = sol.value(W[1])
     return optimal_x, optimal_y, max_value, next_weights
 
 
 def main():
     # Parameters
-    n_points = int(input("Enter the number of Gaussian centers (e.g., 5): "))  # User input for the number of centers
+    n_points = 10 #int(input("Enter the number of Gaussian centers (e.g., 5): "))  # User input for the number of centers
     sigma = 1.0  # Standard deviation
     lb = [-5, -5]  # Lower bounds for x and y
     ub = [5, 5]  # Upper bounds for x and y
@@ -193,7 +119,7 @@ def main():
     z_vals = np.zeros((100, 100))
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
-            z_vals[j, i] = mmax(np.ones(n_points) * 0.5  * gaussians_func(x, y, centers)).full().flatten()[0]
+            z_vals[j, i] = mmax(gaussians_func(x, y, centers)).full().flatten()[0]
 
     # Create the figure
     fig = go.Figure()
