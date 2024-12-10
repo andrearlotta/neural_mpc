@@ -4,7 +4,27 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tools import *
 
-def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps=1, x0= 0.0, y0=0.0):
+def generate_max_value_function(gaussians_func, dim):
+    """
+    Wraps the Gaussian function to output the maximum value among all outputs.
+    Args:
+    - gaussians_func: CasADi function that computes Gaussian values for a given x.
+
+    Returns:
+    - CasADi function that computes the maximum value among all Gaussian values.
+    """
+    drone_statex = MX.sym('_x')
+    drone_statey = MX.sym('_y')
+    trees_lambda = MX.sym('_centers', dim,2)
+    weights = MX.sym('weights', dim)
+
+    gaussian_values =  weights * gaussians_func(drone_statex, drone_statey, trees_lambda)
+    max_value = mmax(gaussian_values)
+    max_func = Function('max_func', [drone_statex, drone_statey, trees_lambda, weights], [max_value])
+    return max_func
+
+
+def maximize_with_opti_2d(max_gaussians_func, gaussians_func, centers, weights, sigma, lb, ub, steps=1, x0= 0.0, y0=0.0):
     """
     Uses CasADi's Opti to maximize the output of the 2D Gaussian function.
     Args:
@@ -17,49 +37,44 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps
     opti = Opti()
 
     bayes_f = bayes_func(len(centers))
-        
+    entropy_f = entropy_func(len(centers))
     # Decision variables
     x = opti.variable()
-    y = opti.variable()
-    w = opti.variable(len(centers))
     opti.set_initial(x,x0)
+    y = opti.variable()
     opti.set_initial(y,y0)
-    opti.subject_to(w == weights)
+    W = []
 
-    W = [w]
-
-    X = [x]
-    Y = [y]
+    X = []
+    Y = []
     gradient_magnitude = []
+    Obj = []
     for i in range(steps):
         # Constraints for (x, y) bounds
-        opti.subject_to((lb[0] -1 <= x) <= ub[0]+1)
-        opti.subject_to((lb[1] -1 <= y) <= ub[1]+1)
         w_next = opti.variable(len(centers))
-        opti.subject_to(w_next == bayes_f(gaussians_func(x, y, centers) + 0.5 , W[-1]))
-        # Compute gradients of the Gaussian function with respect to x and y
-        grad_x = jacobian(logsumexp(w_next * (1-W[-1])), x)
-        grad_y = jacobian(logsumexp(w_next * (1-W[-1])), y)
-        # Gradient magnitude (norm) to guide towards higher values
-        gradient_magnitude.append(sqrt(grad_x**2 + grad_y**2))
-
-        # Compute Gaussian values at (x, y)
+        opti.subject_to(w_next == bayes_f(gaussians_func(x, y, centers) + 0.5 ,  W[-1] if i !=0 else weights))
         W.append(w_next)        
+        Obj.append(entropy_f(W[-1]))
 
+        opti.subject_to((x >= (lb[0] -2)) <= ub[0]+2)
+        opti.subject_to((y >= (lb[1] -2)) <= ub[1]+2)
         if i < steps -1:
-            x = opti.variable()
-            y = opti.variable()
             X.append(x)
+            x = opti.variable()
             Y.append(y)
-        
+            y = opti.variable()
+
+    opti.minimize(sumsqr(1-vcat(W[1:])))
 
     # Objective: Maximize the output of the Gaussian function with guiding term
-    opti.minimize(-gradient_magnitude[-1])
-
     # Solver options
-    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0, "sb": "no", "mu_strategy":"adaptive"}}
+    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":5, "sb": "no", "mu_strategy":"adaptive", "tol":1e-3}}
     opti.solver('ipopt', options)
+    
 
+    hessian(opti.f,opti.x)[0].sparsity().spy()
+    jacobian(opti.g,opti.x).sparsity().spy()
+ 
     sol = opti.solve()
 
     optimal_x = sol.value(X[1])
@@ -86,6 +101,8 @@ def main():
 
     gaussians_func = create_l4c_nn_f(len(centers))
 
+
+    max_gaussians_func = generate_max_value_function(gaussians_func, len(centers))
     x_steps = []
     y_steps = []
     z_steps = weights
@@ -96,7 +113,7 @@ def main():
     while (sum1(weights) <= len(centers) -1e-1 )and (i < 100) : 
 
         # Optimize to find the maximum
-        optimal_point_x,optimal_point_y, max_value, next_weights = maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, 10, x[-1], y[-1])
+        optimal_point_x,optimal_point_y, max_value, next_weights = maximize_with_opti_2d(max_gaussians_func, gaussians_func, centers, weights, sigma, lb, ub, 10, x[-1], y[-1])
         x_steps = horzcat(x_steps, optimal_point_x)
         y_steps = horzcat(y_steps, optimal_point_y)
         z_steps = horzcat(z_steps, next_weights)
@@ -113,8 +130,8 @@ def main():
 
     print(max_value.T)
     # Visualization
-    x_vals = np.linspace(lb[0], ub[0], 100)
-    y_vals = np.linspace(lb[1], ub[1], 100)
+    x_vals = np.linspace(lb[0] - 2.5, ub[0] + 2.5, 100)
+    y_vals = np.linspace(lb[1] - 2.5, ub[1] + 2.5, 100)
 
     z_vals = np.zeros((100, 100))
     for i, x in enumerate(x_vals):
@@ -142,7 +159,7 @@ def main():
 
     xy_pairs = zip(x_steps, y_steps)  # Combine x_steps and y_steps into pairs
     for x, y in xy_pairs:
-        Z = vertcat(Z, mmax(np.ones(n_points) * 0.5 * gaussians_func(x, y, centers)))
+        Z = vertcat(Z, mmax(gaussians_func(x, y, centers)))
 
     Z = Z.full().flatten()
 
