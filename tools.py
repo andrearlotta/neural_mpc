@@ -7,7 +7,33 @@ from casadi import *
 def gaussian__ca(x, mean=0, std=1):
     return 0.5 + 0.5 * exp(-((x - mean) ** 2) / (2 * std**2))
 
-def create_l4c_nn_f(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=20), model_name="rbfnn_model_2d.pth", device="cuda"):
+
+def create_l4c_nn_f(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=20), model_name="rbfnn_model_2d.pth", dev="cpu"):
+
+    loaded_model.load_state_dict(torch.load(model_name))
+    loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
+    l4c_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device=dev)
+
+    for i in range(10):
+        x_sym = MX.sym('x_', trees_number,2)
+        y_sym = l4c_model(x_sym)
+        f_ = Function('y_', [x_sym], [y_sym])
+        df_ = Function('dy', [x_sym], [jacobian(y_sym, x_sym)])
+
+        x = DM([[0., 2.] for _ in range(trees_number)])
+        l4c_model(x)
+        f_(x)
+        df_(x)
+
+    drone_statex = MX.sym('drone_pos_x')
+    drone_statey = MX.sym('drone_pos_y')
+    drone_state1 = horzcat(drone_statex, drone_statey)
+    trees_lambda = MX.sym('trees_lambda', trees_number,2)
+    diff_ = repmat(drone_state1, trees_lambda.shape[0], 1) - trees_lambda
+    output = l4c_model(diff_)
+    return Function('F_single', [drone_statex, drone_statey, trees_lambda], [output])
+
+def create_l4c_nn_f_min(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=20), model_name="rbfnn_model_2d.pth", device="cpu"):
 
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
@@ -29,7 +55,12 @@ def create_l4c_nn_f(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=
     drone_state1 = horzcat(drone_statex, drone_statey)
     trees_lambda = MX.sym('trees_lambda', trees_number,2)
     diff_ = repmat(drone_state1, trees_lambda.shape[0], 1) - trees_lambda
-    output = l4c_model(diff_)
+    casadi_quad_approx_sym_out = l4c_model(diff_)
+
+    casadi_quad_approx_sym_out = horzcat(casadi_quad_approx_sym_out, MX.zeros(casadi_quad_approx_sym_out.shape[0]))
+    output = []
+    for i  in range(casadi_quad_approx_sym_out.shape[0]):
+        output = vertcat(output, mmax(casadi_quad_approx_sym_out[i,:]))
     return Function('F_single', [drone_statex, drone_statey, trees_lambda], [output])
 
 def bayes_func(shape_):
@@ -108,7 +139,7 @@ def gaussian_2d(mu, sigma, x, y):
     - Scaled Gaussian expression.
     """
     raw_gaussian = (1 / (2 * pi * sigma**2)) * exp(
-        -0.5 * ((x - mu[0])**2 + (y - mu[1])**2) / sigma**2
+        -0.5 * ((x - mu)**2 + (y - mu)**2) / sigma**2
     )
     max_gaussian = 1 / (2 * pi * sigma**2)  # Maximum value of the Gaussian
     scaled_gaussian = 0.5 + 0.5 * (raw_gaussian / max_gaussian)  # Scale to range [0.5, 1]
