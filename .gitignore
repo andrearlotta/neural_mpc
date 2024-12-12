@@ -1,2 +1,4 @@
 _l4c_generated/*
 __pycache__/*
+rootfinder.py
+global_planner_1d.py
