@@ -1,10 +1,16 @@
 from tools import *
 import plotly.graph_objects as go
 import numpy as np
-from casadi import MX, DM, Opti, rootfinder, logsumexp
+from casadi import MX, DM, Opti, rootfinder, logsumexp, log10
 from casadi import *
 count = 0
-for i in range(100):
+
+# Funzione Entropia
+def entropy(confidences):
+    epsilon = 1e-6
+    return -logsumexp(confidences * log10(confidences + epsilon)/ log10(2))
+
+for i in range(1):
     # Parameters
     n_trees = 20
     lbx = -20
@@ -17,7 +23,7 @@ for i in range(100):
     # Generate random 2D Gaussian centers
     trees_p = np.array([np.random.uniform(lb, ub) for _ in range(n_trees)])
     
-    l4c_nn_f = create_l4c_nn_f(n_trees,device='cpu')
+    l4c_nn_f = create_l4c_nn_f(n_trees,dev='cpu')
 
     # Analytical Function Rootfinding Example
     X = MX.sym('x', 1)  # Define symbolic variable
@@ -76,7 +82,8 @@ for i in range(100):
     f_Z = Function('f_Z', [x_sym, y_sym], [Z_expr])
     z = opti.variable() 
     opti.subject_to(z > f_Z(x,y))
-    opti.minimize(- mmax((l4c_nn_f(x,y, trees_p) + 0.5)*(-(1+f_Z(x,y)))))# 1/logsumexp(-0.5+l4c_nn_f(x, trees_p), 0.01)**.5)  # Objective function
+    opti.minimize(- mmax((l4c_nn_f(x,y, trees_p) + 0.5)*(-(1+f_Z(x,y)))) )
+    #- mmax((l4c_nn_f(x,y, trees_p) + 0.5)*(-(1+f_Z(x,y)))))# 1/logsumexp(-0.5+l4c_nn_f(x, trees_p), 0.01)**.5)  # Objective function
 
     # Solver options
     options = {"ipopt": {"hessian_approximation": "limited-memory","mu_strategy":"adaptive"}}
@@ -108,9 +115,14 @@ for i in range(100):
         for j, y in enumerate(y_vals):
             z_vals[j, i] =   - mmax((l4c_nn_f(x,y, trees_p) + 0.5)*(-f_Z(x,y)))#mmax(gaussians_func(x, y, centers)).full().flatten()[0]
 
-
-
-    # Add the surface plot
+    entropy_f = entropy_func(len(trees_p))
+    bayes_f = bayes_func(len(trees_p))
+    entropy_grid = np.zeros((len(x_vals), len(y_vals)))
+    b0 = np.array([np.random.uniform(0.5, 0.9) for _ in range(n_trees)])
+    for i, x in enumerate(x_vals):
+        for j, y in enumerate(y_vals):
+            entropy_grid[j, i] = entropy(bayes_f(l4c_nn_f(x, y, trees_p) + 0.5, b0 )).full().flatten()
+            print(entropy_grid[j, i])
     fig_a.add_trace(
         go.Surface(
             z=z_vals,
@@ -153,3 +165,23 @@ for i in range(100):
         showlegend=True
     )
     fig_a.show()
+
+    # Plot B: Entropy Surface
+    fig_b = go.Figure()
+    fig_b.add_trace(
+        go.Surface(
+            z=entropy_grid,
+            x=x_vals,
+            y=y_vals,
+            colorscale='Viridis',
+            showscale=True
+        )
+    )
+    fig_b.update_layout(
+        title="Entropy Surface",
+        xaxis_title="x",
+        yaxis_title="y",
+        template="plotly",
+        showlegend=True
+    )
+    fig_b.show()
