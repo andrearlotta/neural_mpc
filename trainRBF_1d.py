@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import torch.nn.functional as F
 
 # Define the Gaussian function for ground truth
-def gaussian(x, mean, std):
+def gaussian(x, mean, std, maxval=0.45):
     """
     Computes the Gaussian function.
     Parameters:
@@ -14,7 +14,7 @@ def gaussian(x, mean, std):
     Returns:
         torch.Tensor: Gaussian values.
     """
-    return torch.exp(-0.5 * ((x - mean) / std) ** 2) / (std * (2 * torch.pi) ** 0.5)
+    return torch.exp(-0.5 * ((x - mean) / std) ** 2) / (maxval * std * (2 * torch.pi) ** 0.5)
 
 # Define the Radial Basis Function Layer
 class RBFLayer(torch.nn.Module):
@@ -61,7 +61,7 @@ class RBFNN(torch.nn.Module):
         return self.linear_layer(rbf_output)
 
 # Training function
-def train_rbfnn(mean=0, std=1, num_centers=20, lr=1e-3, epochs=20, batch_size=32, save_path="rbfnn_model.pth"):
+def train_rbfnn(mean=0, std=2.0, num_centers=20, lr=1e-3, epochs=20, batch_size=32, save_path="models/rbfnn_model_1d.pth"):
     # Generate training data
     x = torch.linspace(-1, 1, 1000)  # Range between -1 and 1
     scaled_x = torch.tanh(x)  # Non-linear transformation for density near 0
@@ -145,7 +145,7 @@ def train_rbfnn(mean=0, std=1, num_centers=20, lr=1e-3, epochs=20, batch_size=32
     comparison_fig.show()
 
 # Load and Test the Model
-def load_and_test_model(model_path, mean=0, std=1, num_centers=20):
+def load_and_test_model(model_path, mean=0, std=2.0, num_centers=20):
     model = RBFNN(input_dim=1, num_centers=num_centers)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -188,7 +188,7 @@ def load_and_test_model(model_path, mean=0, std=1, num_centers=20):
 
 if __name__ == "__main__":
     # Train the model and save it
-    train_rbfnn(save_path="rbfnn_model.pth")
+    train_rbfnn(save_path="models/rbfnn_model_1d.pth")
 
     # Load and test the saved model
-    load_and_test_model(model_path="rbfnn_model.pth")
+    load_and_test_model(model_path="models/rbfnn_model_1d.pth")
