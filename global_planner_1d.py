@@ -5,42 +5,6 @@ from casadi import *
 import matplotlib.pyplot as plt
 from plotly.subplots import make_subplots
 
-
-def gaussian(mu, sigma, x):
-    """
-    Gaussian function definition using CasADi, scaled to range between 0.5 and 1.
-    Args:
-    - mu: Mean of the Gaussian.
-    - sigma: Standard deviation of the Gaussian.
-    - x: Symbolic variable for the input.
-
-    Returns:
-    - Scaled Gaussian expression.
-    """
-    raw_gaussian = (1 / (sigma * sqrt(2 * pi))) * exp(-0.5 * ((x - mu) / sigma) ** 2)
-    max_gaussian = (1 / (sigma * sqrt(2 * pi)))  # Maximum value of the Gaussian
-    scaled_gaussian = 0.5 + 0.5 * (raw_gaussian / max_gaussian)  # Scale to range [0.5, 1]
-    return scaled_gaussian
-
-def generate_gaussian_function(x, sigma):
-    """
-    Creates a CasADi function to compute weighted Gaussian values for given x and weights.
-    Args:
-    - x: Array of x values (the centers of the Gaussians).
-    - sigma: Standard deviation of the Gaussians.
-
-    Returns:
-    - CasADi function that computes Gaussian values for a given input x.
-    - The centers and weights as numpy arrays for reference.
-    """
-    centers = np.array(x)  # Convert to numpy array for consistency
-    x_input = MX.sym('x')
-    weights = MX.sym('weights', len(centers))  # Symbolic weights
-    gaussian_exprs = [gaussian(mu, sigma, x_input) for mu in centers]
-    gaussian_exprs =  0.5 + weights * vertcat(*gaussian_exprs)
-    gaussians_func = Function('gaussians_func', [x_input, weights], [gaussian_exprs])
-    return gaussians_func, centers
-
 def generate_max_value_function(gaussians_func, dim):
     """
     Wraps the Gaussian function to output the maximum value among all outputs.
@@ -75,9 +39,8 @@ def maximize_with_opti(max_func, l4c_nn_f, centers, weights, sigma, lb, ub, step
     # Decision variable
     x = opti.variable()
     X = []
-    opti.set_initial(x, 0)
+    x = 0
     Obj = []
-    
 
     w = opti.variable(len(centers))
     opti.subject_to(w ==  weights)
@@ -146,7 +109,7 @@ def main():
     print(f"Generated weights: {weights}")
 
     # Generate the Gaussian function with dynamic x and weights
-    l4c_nn_f = create_l4c_nn_f(n_points,device='cpu')
+    l4c_nn_f = create_l4c_nn_f(n_points, dev='cpu', input_dim=1, model_name='models/rbfnn_model_1d.pth')
 
     # Generate the maximum value function
     max_func = generate_max_value_function(l4c_nn_f, len(weights))
@@ -154,8 +117,6 @@ def main():
     b = bayes_func(len(centers))
 
     optimal_x_list, optimal_weights_list, max_value_list = maximize_with_opti(max_func,l4c_nn_f, centers, 1 - weights, sigma, lb, ub)
-    # Plot for each i-th tuple in the lists
-
     
     # Create a subplot structure with n rows
     fig = make_subplots(

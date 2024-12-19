@@ -69,11 +69,11 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps
     current_weights = weights #initialize the weights
     exploration_weight = 1 # Tune this parameter
     for i in range(steps):
-        y_z = gaussians_func(X[0, i+1], X[1, i+1], centers)+ 0.5
-        current_weights = bayes_f(current_weights, y_z)
+        z_k = gaussians_func(X[0, i+1], X[1, i+1], centers)+ 0.5
+        current_weights = bayes_f(current_weights, z_k)
         dist = 1+log10((f_Z(X[0, i+1], X[1, i+1])+1))
 
-        obj += -mmax(y_z*( 1 + 2*(weights-0.5)))
+        obj += -mmax(z_k*( 1 + 2*(weights-0.5)))
     opti.minimize(obj)  # Minimize the objective
 
     options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level": 5, "sb": "no", "mu_strategy": "monotone"}} #reduced print level
@@ -131,8 +131,8 @@ def main():
         vx0 = U[ 0 ]
         vy0 = U[ 1 ]
 
-        y_z = gaussians_func(x0, y0, centers).full().flatten() + 0.5
-        weights = bayes_f(weights, DM(y_z))
+        z_k = gaussians_func(x0, y0, centers).full().flatten() + 0.5
+        weights = bayes_f(weights, DM(z_k))
         print(weights)
         print(f"Iteration {iteration}: x={x0:.2f}, y={y0:.2f}, Entropy = {entropy_f(weights).full().flatten()[0]}")
 
@@ -150,9 +150,9 @@ def main():
     z_vals = np.zeros((100, 100))
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
-            y_z = gaussians_func(x,y,centers)+ 0.5
-            bayes = bayes_f(y_z, weights)
-            z_vals[j, i] = -mmax(-log10(10*(f_Z(x,y)+1))*( 1 + 20*(weights-0.5)))+  + sum1(y_z * (1- 2*(weights-0.5))) #mmax(gaussians_func(x, y, centers).full().flatten() + 0.5)
+            z_k = gaussians_func(x,y,centers)+ 0.5
+            bayes = bayes_f(z_k, weights)
+            z_vals[j, i] = -mmax(-log10(10*(f_Z(x,y)+1))*( 1 + 20*(weights-0.5)))+  + sum1(z_k * (1- 2*(weights-0.5))) #mmax(gaussians_func(x, y, centers).full().flatten() + 0.5)
 
     # Create the figure
     fig = go.Figure()
@@ -172,9 +172,9 @@ def main():
     # Add the trajectory as a 3D line
     z_traj_all = []
     for frame_num, (x, y) in enumerate(all_trajectories):
-        y_z = gaussians_func(x[0],y[0],centers)+ 0.5
-        bayes = bayes_f(y_z, weights)
-        z_traj_all.append((-mmax(-log10(10*(f_Z(x[0],y[0])+1))*( 1 + 20*(weights-0.5)))+  + sum1(y_z * (1- 2*(weights-0.5)))).full())
+        z_k = gaussians_func(x[0],y[0],centers)+ 0.5
+        bayes = bayes_f(z_k, weights)
+        z_traj_all.append((-mmax(-log10(10*(f_Z(x[0],y[0])+1))*( 1 + 20*(weights-0.5)))+  + sum1(z_k * (1- 2*(weights-0.5)))).full())
     print(np.array(all_trajectories).shape)
     fig.add_trace(
         go.Scatter3d(
@@ -204,9 +204,9 @@ def main():
     z_vals = np.zeros((100, 100))
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
-            y_z = gaussians_func(x,y,centers)+ 0.5
-            bayes = bayes_f(y_z, weights)
-            z_vals[j, i] = mmax(y_z ) #mmax(gaussians_func(x, y, centers).full().flatten() + 0.5)
+            z_k = gaussians_func(x,y,centers)+ 0.5
+            bayes = bayes_f(z_k, weights)
+            z_vals[j, i] = mmax(z_k ) #mmax(gaussians_func(x, y, centers).full().flatten() + 0.5)
 
     # Create the figure
     fig = go.Figure()
@@ -226,9 +226,9 @@ def main():
     # Add the trajectory as a 3D line
     z_traj_all = []
     for frame_num, (x, y) in enumerate(all_trajectories):
-        y_z = gaussians_func(x[0],y[0],centers)+ 0.5
-        bayes = bayes_f(y_z, weights)
-        z_traj_all.append((mmax(y_z)).full())
+        z_k = gaussians_func(x[0],y[0],centers)+ 0.5
+        bayes = bayes_f(z_k, weights)
+        z_traj_all.append((mmax(z_k)).full())
     print(np.array(all_trajectories).shape)
     fig.add_trace(
         go.Scatter3d(

@@ -5,32 +5,6 @@ import torch.nn.functional as F
 import numpy as np
 from tools import *
 
-# Define the Radial Basis Function Layer
-class RBFLayer(torch.nn.Module):
-    def __init__(self, input_dim, num_centers):
-        super(RBFLayer, self).__init__()
-        self.centers = torch.nn.Parameter(torch.randn(num_centers, input_dim))
-        self.log_sigmas = torch.nn.Parameter(torch.zeros(num_centers))  # Log scale for stability
-
-    def forward(self, x):
-        x = x.unsqueeze(1)  # Add a dimension to allow broadcasting
-        centers = self.centers.unsqueeze(0)  # Add a dimension for broadcasting
-        distances = torch.sum((x - centers) ** 2, dim=-1)  # Squared Euclidean distance
-        
-        sigmas = torch.exp(self.log_sigmas)  # Convert log_sigma to sigma
-        return torch.exp(-distances / (2 * sigmas ** 2))
-
-# Define the RBFNN Model
-class RBFNN(torch.nn.Module):
-    def __init__(self, input_dim, num_centers, output_dim=1):
-        super(RBFNN, self).__init__()
-        self.rbf_layer = RBFLayer(input_dim, num_centers)
-        self.linear_layer = torch.nn.Linear(num_centers, output_dim)
-
-    def forward(self, x):
-        rbf_output = self.rbf_layer(x)
-        return self.linear_layer(rbf_output)
-
 # Training function
 def train_rbfnn_2d(mean=torch.tensor([0.0, 0.0]), std=1.0, num_centers=20, lr=1e-3, epochs=10, batch_size=32, save_path="rbfnn_model_2d.pth"):
     x_data, y_label = generate_fake_dataset(100, False, n_input=2)

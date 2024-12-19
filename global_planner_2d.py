@@ -4,23 +4,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tools import *
 
-def distance_function(trees_p):
-
-    x_sym = MX.sym('x_')
-    y_sym = MX.sym('y_')
-
-    distances_expr = []
-    for k in range(len(trees_p)):
-        dx = x_sym - trees_p[k, 0]
-        dy = y_sym - trees_p[k, 1]
-        dist = dx**2 + dy**2
-        distances_expr.append(dist)
-
-    distances_ca = vertcat(*distances_expr)
-
-    return Function('f_Z', [x_sym, y_sym], [distances_ca])
-
-
 def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0= 0.0, y0=0.0):
     """
     Uses CasADi's Opti to minimize the entropy .
@@ -32,7 +15,7 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0
 
     bayes_f = bayes_func(len(centers))
     entropy_f = entropy_func(len(centers))
-    distance_f = distance_function(centers)
+    distance_f = dist_f(centers)
 
     # Decision variables
     x = opti.variable()
@@ -50,10 +33,10 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0
         opti.subject_to((x >= (lb[0] -2)) <= ub[0]+2)
         opti.subject_to((y >= (lb[1] -2)) <= ub[1]+2)
 
-        g = gaussians_func(x, y, centers)
+        z_k = gaussians_func(x, y, centers)
         
-        Obj.append( -mmax(( (1 - weights) * gaussians_func(x, y, centers)+0.5))*mmax(-(1+distance_f(x,y))*(1- weights)**-2))
-        W.append(bayes_f(gaussians_func(x, y, centers) + 0.5 , (weights if i == 0 else W[-1]))) 
+        Obj.append( -mmax(( (1 - weights) * z_k +0.5))*mmax(-(1+distance_f(x,y))*(1- weights)**-2))
+        W.append(bayes_f(z_k + 0.5 , (weights if i == 0 else W[-1])))
 
         X.append(x)
         Y.append(y)
@@ -69,7 +52,7 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0
 
     sol = opti.solve()
 
-    return sol.value(X),  sol.value(Y)
+    return sol.value(X[-1]),  sol.value(Y[-1])
 
 def main():
     # Parameters
@@ -88,14 +71,14 @@ def main():
     print(f"Generated centers: {centers}")
     print(f"Generated weights: {weights}")
 
-    gaussians_func = create_l4c_nn_f(len(centers))
+    gaussians_func = create_l4c_nn_f(len(centers), model_name='models/rbfnn_model_2d.pth')
     bayes_f = bayes_func(len(centers))
-    distance_f = distance_function(centers)
+    distance_f = dist_f(centers)
     
     gaussians_func_min = create_l4c_nn_f_min(len(centers))
 
-    x_steps = []
-    y_steps = []
+    x_steps = [0.01]
+    y_steps = [0.01]
     z_steps = weights
 
     i = 0
@@ -105,10 +88,10 @@ def main():
         optimal_point_x,optimal_point_y = maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps , x_steps[-1], y_steps[-1])
         x_steps = horzcat(x_steps, optimal_point_x)
         y_steps = horzcat(y_steps, optimal_point_y)
-        weights = bayes_f(gaussians_func_min(optimal_point_x, optimal_point_y, centers) + 0.5, weights)
+        weights = bayes_f(gaussians_func(optimal_point_x, optimal_point_y, centers) + 0.5, weights)
         z_steps = horzcat(z_steps, weights)
         print("x,y: ", optimal_point_x, optimal_point_y)
-        print("sum: ",sum1(weights))
+        print("sum: ", sum1(weights))
         i += 1
     
     x_steps = x_steps.full().flatten()
@@ -120,13 +103,15 @@ def main():
     y_grid = np.linspace(lb[1] - 2.5, ub[1] + 2.5, 100)
     z_vals = np.zeros((100, 100))
     for i, x in enumerate(x_grid):
-        for j, y in enumerate(y_grid): 
-            z_vals[j, i] = mmax(( (1 - z_steps[-1,:]) * gaussians_func(x, y, centers)+0.5))*mmax(-(1+distance_f(x,y))*(1- z_steps[-1,:])**-2)
-    
+        for j, y in enumerate(y_grid):
+            z_k = gaussians_func(x, y, centers)
+            z_vals[j, i] =   mmax(( (1 - weights) * z_k +0.5))*mmax(-(1+distance_f(x,y))*(1- weights)**-2).full().flatten()
+
     Z = []
     xy_pairs = zip(x_steps[:-1], y_steps[:-1])  # Combine x_steps and y_steps into pairs
     for x, y in xy_pairs:
-        Z = vertcat(Z, mmax(( (1 - z_steps[-1,:]) * gaussians_func(x, y, centers)+0.5))*mmax(-(1+distance_f(x,y))*(1- z_steps[-1,:])**-1 ))
+            z_k = gaussians_func(x, y, centers)
+            Z = vertcat(Z,  mmax(( (1 - weights) * z_k +0.5))*mmax(-(1+distance_f(x,y))*(1- weights)**-2))
     Z = Z.full().flatten()
 
     # Create the figure
@@ -136,8 +121,8 @@ def main():
     fig.add_trace(
         go.Surface(
             z=z_vals,
-            x=x_grid,
-            y=y_grid,
+            x=x_grid.flatten(),
+            y=y_grid.flatten(),
             colorscale='Viridis',
             showscale=True
         )
@@ -145,9 +130,9 @@ def main():
 
     fig.add_trace(
         go.Scatter3d(
-            x=x_steps,
-            y=y_steps,
-            z=Z,
+            x=x_steps.flatten(),
+            y=y_steps.flatten(),
+            z=Z.flatten(),
             mode='markers+lines',
             marker=dict(color='red', size=5),
             line=dict(color='blue', width=2),
