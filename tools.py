@@ -3,12 +3,87 @@ from trainRBF import *
 import l4casadi as l4c
 from casadi import *
 
-# Define the Gaussian function
-def gaussian__ca(x, mean=0, std=1):
-    return 0.5 + 0.5 * exp(-((x - mean) ** 2) / (2 * std**2))
+def gaussian_np(x, mu, sig=1/np.sqrt(2*np.pi), norm=True):
+    a = 1 if not norm else (sig * np.sqrt(2 * np.pi))
+    return a * (1.0 / (np.sqrt(2.0 * np.pi) * sig) * np.exp(-np.power((x - mu) / sig, 2.0) / 2))
 
 
-def create_l4c_nn_f(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=20), model_name="rbfnn_model_2d.pth", dev="cpu"):
+def sigmoid_np(x, alpha=10.0):
+    return 1 / (1 + np.exp(-alpha * x))
+
+
+def norm_sigmoid_np(x, thresh=6, delta=0.5, alpha=10.0):
+    x_min = thresh - delta
+    x_max = thresh + delta
+    y_min = 0.0
+    y_max = 1.0
+    
+    normalized_x = ((x - x_min) - (x_max - x_min) / 2) / (x_max - x_min)
+    normalized_y = sigmoid_np(normalized_x, alpha)
+    mapped_y = y_min + (normalized_y * (y_max - y_min))
+    
+    return mapped_y
+
+
+def drone_objects_distances_numpy(drone_pos, trees_pos):
+    return np.linalg.norm(trees_pos - drone_pos, axis=1)
+
+
+def fov_weight_fun_numpy(drone_pos, trees_pos, thresh_distance=5):
+    sig = 1.5
+    thresh = 0.7
+    delta = 0.1
+    alpha = 1.0
+
+    # Calculate distance between the drone and each tree
+    distances = drone_objects_distances_numpy(drone_pos[:2], trees_pos)
+
+    # Calculate direction from drone to each tree
+    theta = drone_pos[2]
+    drone_dir = np.array([np.cos(theta), np.sin(theta)])
+    light_direction = np.array([1, 0])
+    tree_directions = trees_pos - drone_pos[:2]
+
+    # Normalize the tree direction vector
+    norm_factor = np.linalg.norm(tree_directions, axis=1, keepdims=True)
+    norm_tree_directions = tree_directions / norm_factor  # Normalize the tree directions
+
+    # Compute vector alignment between drone direction and tree directions
+    vect_alignment = np.dot(norm_tree_directions, drone_dir)
+    vect_light_alignment = np.dot(light_direction, drone_dir)
+
+    # Apply sigmoid and Gaussian functions
+    alignment_score = norm_sigmoid_np(((vect_alignment + 1) / 2) ** 4, thresh=thresh, delta=delta, alpha=alpha)
+    light_score = norm_sigmoid_np(((vect_light_alignment + 1) / 2) ** 2, thresh=thresh, delta=delta, alpha=alpha)
+    distance_score = gaussian_np(distances, mu=thresh_distance, sig=sig)
+    
+    result = np.minimum(distance_score * light_score * 0.5, 1.0)
+    return result
+
+
+def generate_fake_dataset(num_samples, is_polar, n_input=2):
+    synthetic_X = []
+    synthetic_Y = []
+    tree_pos = np.zeros((1, 2))
+    
+    # Define ranges for drone position (X, Y) and yaw
+    x = np.linspace(-8, 8, num_samples)
+    y = np.linspace(-8, 8, num_samples)
+
+    X, Y = np.meshgrid(x, y)
+    # Iterate over the grid to vary the drone's position and yaw
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            drone_pos = np.array([X[i, j], Y[i, j]])
+            yaw = np.arctan2(Y[i, j], X[i, j])
+            value = fov_weight_fun_numpy(np.hstack((drone_pos, yaw)), tree_pos, 3)
+            synthetic_X.append([X[i, j], Y[i, j], yaw] if n_input == 3 else [X[i, j], Y[i, j]])
+            synthetic_Y.append(value)
+    
+    return torch.Tensor(np.array(synthetic_X)), torch.Tensor(np.array(synthetic_Y))
+
+
+def create_l4c_nn_f(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=20), model_name="models/rbfnn_model_2d_syntehtic.pth", dev="cpu"):
 
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
@@ -33,7 +108,8 @@ def create_l4c_nn_f(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=
     output = l4c_model(diff_)
     return Function('F_single', [drone_statex, drone_statey, trees_lambda], [output])
 
-def create_l4c_nn_f_min(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=20), model_name="rbfnn_model_2d.pth", device="cpu"):
+
+def create_l4c_nn_f_min(trees_number, loaded_model = RBFNN(input_dim=2, num_centers=20), model_name="models/rbfnn_model_2d_syntehtic.pth", device="cpu"):
 
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
@@ -57,11 +133,12 @@ def create_l4c_nn_f_min(trees_number, loaded_model = RBFNN(input_dim=2, num_cent
     diff_ = repmat(drone_state1, trees_lambda.shape[0], 1) - trees_lambda
     casadi_quad_approx_sym_out = l4c_model(diff_)
 
-    casadi_quad_approx_sym_out = horzcat(casadi_quad_approx_sym_out, MX.zeros(casadi_quad_approx_sym_out.shape[0]))
+    casadi_quad_approx_sym_out = horzcat(casadi_quad_approx_sym_out, 0.5* MX.ones(casadi_quad_approx_sym_out.shape[0]))
     output = []
     for i  in range(casadi_quad_approx_sym_out.shape[0]):
         output = vertcat(output, mmax(casadi_quad_approx_sym_out[i,:]))
     return Function('F_single', [drone_statex, drone_statey, trees_lambda], [output])
+
 
 def bayes_func(shape_):
     """
@@ -80,23 +157,6 @@ def bayes_func(shape_):
     output = numerator / denominator
 
     return Function('bayes_func', [lambda_k, y_z], [output])
-
-
-def _entropy_func(dim):
-    """
-    Calculates the entropy of a probability distribution.
-
-    Args:
-        lambda_: Probability distribution (CasADi MX or DM object).
-
-    Returns:
-        Entropy value (CasADi MX or DM object).
-    """
-    # Adding a small epsilon to avoid log(0)
-    lambda__ = MX.sym('lambda__', dim)  # To avoid log(0) issues
-    output =  -sum1((lambda__ * log10(lambda__) / log10(2) + (1-lambda__) * log10(1-lambda__) / log10(2)))
-    return Function('entropy_f', [lambda__], [output])
-
 
 
 def entropy_func(dim):
@@ -125,75 +185,3 @@ def entropy_func(dim):
 
     output =  -sum1((lambda_min__ * log10(lambda_min__ + 1e-10) / log10(2) + one_minus_lambda__* log10(one_minus_lambda__) / log10(2)))
     return Function('entropy_f', [lambda__], [output])
-
-
-def gaussian_2d(mu, sigma, x, y):
-    """
-    2D Gaussian function definition using CasADi, scaled to range between 0.5 and 1.
-    Args:
-    - mu: Mean of the Gaussian (2D vector).
-    - sigma: Standard deviation of the Gaussian.
-    - x, y: Symbolic variables for the inputs.
-
-    Returns:
-    - Scaled Gaussian expression.
-    """
-    raw_gaussian = (1 / (2 * pi * sigma**2)) * exp(
-        -0.5 * ((x - mu)**2 + (y - mu)**2) / sigma**2
-    )
-    max_gaussian = 1 / (2 * pi * sigma**2)  # Maximum value of the Gaussian
-    scaled_gaussian = 0.5 + 0.5 * (raw_gaussian / max_gaussian)  # Scale to range [0.5, 1]
-    return scaled_gaussian
-
-
-def generate_gaussian_function_2d(centers, sigma):
-    """
-    Creates a CasADi function to compute weighted 2D Gaussian values for given (x, y) and weights.
-    Args:
-    - centers: Array of 2D Gaussian centers.
-    - sigma: Standard deviation of the Gaussians.
-
-    Returns:
-    - CasADi function that computes Gaussian values for a given (x, y).
-    - The centers and weights as numpy arrays for reference.
-    """
-    x_input = MX.sym('x')
-    y_input = MX.sym('y')
-    weights = MX.sym('weights', len(centers))  # Symbolic weights
-
-    gaussian_exprs = [
-        gaussian_2d(mu, sigma, x_input, y_input) for mu in centers
-    ]
-    gaussian_exprs = sum(weights[i] * gaussian_exprs[i] for i in range(len(centers)))
-    gaussians_func = Function('gaussians_func', [x_input, y_input, weights], [gaussian_exprs])
-    return gaussians_func
-
-
-
-def smooth_radial_bounds_function_casadi(max_value, min_value, max_distance):
-    """
-    Smooth radial function implemented in CasADi.
-    Decreases from max_value at the center to min_value at the borders.
-    
-    Returns:
-        A CasADi function that computes the radial function.
-    """
-    # Define symbolic variables
-    x = MX.sym("x")
-    y = MX.sym("y")
-
-    # Compute squared distance from the origin
-    r_squared = (x)**2 + (y)**2
-    r = r_squared**0.5
-
-    # Normalize distance to the range [0, 1]
-    r_normalized = r / max_distance
-    r_normalized = MX.fmin(MX.fmax(r_normalized, 0), 1)  # Clip to [0, 1]
-
-    # Smooth transition from max_value to min_value
-    value = min_value + (max_value - min_value) * (1 - r_normalized**2)
-
-    # Create the CasADi function
-    return Function("smooth_radial_bounds_function", 
-                    [x, y], 
-                    [value])
