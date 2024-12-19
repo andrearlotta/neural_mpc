@@ -169,7 +169,7 @@ def create_l4c_nn_f(trees_number,input_dim=2 , model_name="models/rbfnn_model_2d
     return Function('F_single', [drone_statex, drone_statey, trees_lambda] if input_dim>1 else [drone_statex, trees_lambda], [output])
 
 
-def create_l4c_nn_f_min(trees_number, input_dim=2, model_name="models/rbfnn_model_2d_syntehtic.pth", device="cpu"):
+def create_l4c_nn_f_min(trees_number, input_dim=2, model_name="models/rbfnn_model_2d_synthetic.pth", device="cpu"):
     loaded_model = RBFNN(input_dim=input_dim, num_centers=20)
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")

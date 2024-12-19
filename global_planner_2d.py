@@ -35,24 +35,23 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0
 
         z_k = gaussians_func(x, y, centers)
         
-        Obj.append( -mmax(( (1 - weights) * z_k +0.5))*mmax(-(1+distance_f(x,y))*(1- weights)**-2))
         W.append(bayes_f(z_k + 0.5 , (weights if i == 0 else W[-1])))
-
+        Obj.append(entropy_f(W[-1]))
         X.append(x)
         Y.append(y)
         if i < steps -1 :
             x = opti.variable()
             y = opti.variable()
 
-    opti.minimize(sum2(hcat(Obj[1:])))
+    opti.minimize(sum2(hcat(Obj)))
     
     # Solver options
-    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":5, "sb": "no", "mu_strategy":"monotone"}}
+    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":5, "sb": "no", "mu_strategy":"monotone", "tol":1e-3}}
     opti.solver('ipopt', options)
 
     sol = opti.solve()
 
-    return sol.value(X[-1]),  sol.value(Y[-1])
+    return sol.value(X[1]),  sol.value(Y[1])
 
 def main():
     # Parameters
@@ -71,9 +70,10 @@ def main():
     print(f"Generated centers: {centers}")
     print(f"Generated weights: {weights}")
 
-    gaussians_func = create_l4c_nn_f(len(centers), model_name='models/rbfnn_model_2d.pth')
+    gaussians_func = create_l4c_nn_f(len(centers), model_name='models/rbfnn_model_2d_synthetic.pth')
     bayes_f = bayes_func(len(centers))
     distance_f = dist_f(centers)
+    entropy_f = entropy_func(len(centers))
     
     gaussians_func_min = create_l4c_nn_f_min(len(centers))
 
@@ -99,19 +99,20 @@ def main():
     z_steps = z_steps.T.full()
 
     # Visualization
-    x_grid = np.linspace(lb[0] - 2.5, ub[0] + 2.5, 100)
-    y_grid = np.linspace(lb[1] - 2.5, ub[1] + 2.5, 100)
-    z_vals = np.zeros((100, 100))
+    grid_dim = 100
+    x_grid = np.linspace(lb[0] - 2.5, ub[0] + 2.5, grid_dim)
+    y_grid = np.linspace(lb[1] - 2.5, ub[1] + 2.5, grid_dim)
+    z_vals = np.zeros((grid_dim, grid_dim))
     for i, x in enumerate(x_grid):
         for j, y in enumerate(y_grid):
             z_k = gaussians_func(x, y, centers)
-            z_vals[j, i] =   mmax(( (1 - weights) * z_k +0.5))*mmax(-(1+distance_f(x,y))*(1- weights)**-2).full().flatten()
+            z_vals[j, i] =   entropy_f(z_k).full().flatten()
 
     Z = []
     xy_pairs = zip(x_steps[:-1], y_steps[:-1])  # Combine x_steps and y_steps into pairs
     for x, y in xy_pairs:
             z_k = gaussians_func(x, y, centers)
-            Z = vertcat(Z,  mmax(( (1 - weights) * z_k +0.5))*mmax(-(1+distance_f(x,y))*(1- weights)**-2))
+            Z = vertcat(Z,  entropy_f(z_k))
     Z = Z.full().flatten()
 
     # Create the figure

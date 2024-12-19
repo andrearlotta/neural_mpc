@@ -3,4 +3,3 @@ __pycache__/*
 rootfinder.py
 global_planner_1d.py
 *.pth
-models/*

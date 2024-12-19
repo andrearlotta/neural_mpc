@@ -87,7 +87,6 @@ def maximize_with_opti(max_func, l4c_nn_f, centers, weights, sigma, lb, ub, step
     print(opti.value(sumsqr(W-1)))
     for i in range(steps):
         max_value.append(0.5 +max_func(optimal_x[i], centers, 1 - weights[:,i]).full().flatten()[0])
-        #acquired_data.append(l4c_nn_f(optimal_x[i], centers).full().flatten())
     return optimal_x.T, 1 - weights.T, max_value
 
 def main():

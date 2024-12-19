@@ -17,7 +17,7 @@ for i in range(1):
     # Generate random 2D Gaussian centers
     trees_p = np.array([np.random.uniform(lb, ub) for _ in range(n_trees)])
     
-    l4c_nn_f = create_l4c_nn_f(n_trees, dev='cpu', model_name='models/rbfnn_model_2d.pth')
+    l4c_nn_f = create_l4c_nn_f(n_trees, dev='cpu', model_name='models/rbfnn_model_2d_synthetic.pth')
     gaussian_2d_f = gaussian_2d_casadi(0.0,2.0,0.45)
     # Analytical Function Rootfinding Example
     X = MX.sym('x', 1)  # Define symbolic variable
@@ -77,7 +77,7 @@ for i in range(1):
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
             z_k =  l4c_nn_f(x, y, trees_p) 
-            z_vals[j, i] = mmax((l4c_nn_f(x,y, trees_p) + 0.5)*(-(1+f_Z(x,y)))).full().flatten()
+            z_vals[j, i] =  (mmax(l4c_nn_f(x,y, trees_p)+0.5)+(mmax(-(1+log10(0.001*f_Z(x,y)+1))*(1- 2*(b0-0.5))**-2))).full().flatten()
 
     fig_a = go.Figure()
 
