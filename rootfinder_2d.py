@@ -77,7 +77,7 @@ for i in range(1):
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
             z_k =  l4c_nn_f(x, y, trees_p) 
-            z_vals[j, i] =  (mmax(l4c_nn_f(x,y, trees_p)+0.5)+(mmax(-(1+log10(0.001*f_Z(x,y)+1))*(1- 2*(b0-0.5))**-2))).full().flatten()
+            z_vals[j, i] =  ((mmax(-(1+log10(0.001*f_Z(x,y)+1))*(1- 2*(b0-0.5))**-2))).full().flatten()
 
     fig_a = go.Figure()
 
@@ -92,7 +92,7 @@ for i in range(1):
     )
 
     fig_a.update_layout(
-        title="Plot A: LogSumExp-based Measurements with Tree Positions",
+        title="Plot A: Proposed Attractive function",
         xaxis_title="res (varying between -10 and 10)",
         yaxis_title="Measurement Value",
         template="plotly",
@@ -100,6 +100,58 @@ for i in range(1):
     )
     fig_a.show()
 
+    for i, x in enumerate(x_vals):
+        for j, y in enumerate(y_vals):
+            z_k =  l4c_nn_f(x, y, trees_p) 
+            z_vals[j, i] =  (mmax(z_k+0.5) + mmax(-(1+log10(0.001*f_Z(x,y)+1))*(1- 2*(b0-0.5))**-2)).full().flatten()
+
+    fig_a = go.Figure()
+
+    fig_a.add_trace(
+        go.Surface(
+            z=z_vals,
+            x=x_vals,
+            y=y_vals,
+            colorscale='Viridis',
+            showscale=True
+        )
+    )
+
+    fig_a.update_layout(
+        title="Plot C: Bayes Functions + Attractive Function",
+        xaxis_title="res (varying between -10 and 10)",
+        yaxis_title="Measurement Value",
+        template="plotly",
+        showlegend=True
+    )
+    fig_a.show()
+
+    for i, x in enumerate(x_vals):
+        for j, y in enumerate(y_vals):
+            z_k =  l4c_nn_f(x, y, trees_p) 
+            z_vals[j, i] = mmax(l4c_nn_f(x,y, trees_p)+0.5).full().flatten()
+
+    fig_a = go.Figure()
+
+    fig_a.add_trace(
+        go.Surface(
+            z=z_vals,
+            x=x_vals,
+            y=y_vals,
+            colorscale='Viridis',
+            showscale=True
+        )
+    )
+
+    fig_a.update_layout(
+        title="Plot B: Bayes Function",
+        xaxis_title="res (varying between -10 and 10)",
+        yaxis_title="Measurement Value",
+        template="plotly",
+        showlegend=True
+    )
+    fig_a.show()
+    
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
             z_k =  l4c_nn_f(x, y, trees_p) 
@@ -118,7 +170,7 @@ for i in range(1):
     )
 
     fig_a.update_layout(
-        title="Plot A: LogSumExp-based Measurements with Tree Positions",
+        title="Plot D: Entropy Function",
         xaxis_title="res (varying between -10 and 10)",
         yaxis_title="Measurement Value",
         template="plotly",
