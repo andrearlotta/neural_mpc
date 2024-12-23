@@ -42,7 +42,7 @@ def distance_function(trees_p, max_dist=2):
     # Create a CasADi function for evaluating distances
     return Function('f_Z', [x_sym, y_sym], [distances_ca])
 
-def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0=0.0, y0=0.0, vx0=0.0, vy0=0.0, warmstart=False):
+def maximize_with_opti_2d(gaussians_func, centers, lb, ub, x0, y0, vx0, vy0, weights, steps=10):
     """Uses CasADi's Opti to minimize entropy."""
     opti = Opti()
     
@@ -51,12 +51,13 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0
     entropy_f = entropy_func(len(centers))
     f_Z = distance_function(centers)
 
+    X0 = opti.parameter(2 + len(centers))
+    
     X = opti.variable(2, steps + 1)  # State trajectory
     U = opti.variable(2, steps)  # Control inputs
-    
-    if warmstart: opti.set_initial(U,hcat([vx0, vy0]).T)  # Initialize initial state
 
-    opti.subject_to( X[:, 0] ==  [x0, y0])
+
+    opti.subject_to( X[:, 0] ==  X0[:2])
 
     for i in range(steps):
         opti.subject_to((lb[0]-5 <= X[0, i + 1]) <= ub[0]+5)
@@ -67,26 +68,43 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0
 
     # Objective function: Minimize the entropy
     obj = 0
-    current_weights = weights #initialize the weights
+    current_weights = X0[2:] #initialize the weights
+    w0 =  X0[2:]
     exploration_weight = 1 # Tune this parameter
     for i in range(steps):
         z_k = gaussians_func(X[0, i+1], X[1, i+1], centers)+ 0.5
         current_weights = bayes_f(current_weights, z_k)
-        dist =  mmax(-(1+log10(0.001*f_Z(X[0, i+1], X[1, i+1])+1))*(1e-6+ 1- 2*(weights-0.5))**-2)
+        dist =  mmax(-(1+log10(0.001*f_Z(X[0, i+1], X[1, i+1])+1))*(1e-6+ 1- 2*(w0-0.5))**-2)
         transition = smooth_transition(-dist)
-        obj += -(10*sum1(current_weights*(1- 2*(weights-0.5))) * (1-transition)  + transition * 0.1*dist)
+        obj += -(10*sum1(current_weights*(1- 2*(w0-0.5))) * (1-transition)  + transition * 0.1*dist)
     opti.minimize(obj)  # Minimize the objective
 
     options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0, "sb": "no", "mu_strategy": "monotone", "tol":1e-3}} #reduced print level
     opti.solver('ipopt', options)
+    
+    opti.set_value(X0, vertcat([x0],[y0], weights))
 
     start_time = time.time()
     sol = opti.solve()
+
     duration = time.time() - start_time
 
-    optimal_trajectory = sol.value(X)
-    return optimal_trajectory, sol.value(U), duration
+    inputs = [X0, opti.x,opti.lam_g]
+    outputs = [U[:,0], X, opti.x,opti.lam_g]
 
+
+    mpc_step = opti.to_function('mpc_step',inputs,outputs)
+    u = sol.value(U[:,0])
+    x = sol.value(opti.x)
+    X_ = sol.value(X)
+    lam = sol.value(opti.lam_g)
+
+
+    print(type(u))
+    print(type(x))
+    print(type(X_))
+    return mpc_step, u, X_, x, lam
+    
 def main():
     # Parameters
     n_points = 100
@@ -120,32 +138,37 @@ def main():
     durations = [] #log iteration durations
     os.makedirs("frames", exist_ok=True)
 
+    mpc_step, u, x_, x, lam = maximize_with_opti_2d(gaussians_func, centers,lb, ub, x0, y0, vx0, vy0, weights,steps)
+    
     for iteration in range(10000):
+
         weights_history.append(weights.full().flatten().tolist())
         entropy_history.append(entropy_f(weights).full().flatten().tolist()[0])
-
-        optimal_trajectory, U, duration = maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps, x0, y0, vx0, vy0, warmstart=iteration)
-
-        durations.append(duration)  # Log the duration
-
-        x_steps = optimal_trajectory[0, :]
-        y_steps = optimal_trajectory[1, :]
+        x_steps = x_[0,:]
+        y_steps = x_[1,:]
         all_trajectories.append((x_steps, y_steps))
 
         x0 = x_steps[1]
         y0 = y_steps[1]
-        vx0 = U[ 0 ]
-        vy0 = U[ 1 ]
+        vx0 = u[ 0 ]
+        vy0 = u[ 1 ]
 
         z_k = np.round(gaussians_func(x0, y0, centers).full().flatten() + 0.5, 2)
+
         weights = bayes_f(weights, DM(z_k))
-        print(weights)
+        
         print(f"Iteration {iteration}: x={x0:.2f}, y={y0:.2f}, Entropy = {entropy_f(weights).full().flatten()[0]}")
 
         if np.all(np.abs(weights.full() - 1) < 1e-2):
             print(f"Converged at iteration {iteration}")
             break
         print(f"Iteration {iteration}: x={x0:.2f}, y={y0:.2f}, Weights sum = {sum1(weights).full().flatten()}") #log the position and weight sum
+        u, x_, x, lam = mpc_step(vertcat([x0], [y0], weights), x, lam)
+        u   = u.full()
+        x_  = x_.full()
+
+
+
 
 
     # Calculate Z values for the surface plot (using the Gaussian function)
