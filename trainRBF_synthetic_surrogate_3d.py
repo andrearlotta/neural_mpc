@@ -6,16 +6,16 @@ import numpy as np
 from tools import *
 
 # Training function
-def train_rbfnn_2d(mean=torch.tensor([0.0, 0.0]), std=1.0, num_centers=20, lr=1e-3, epochs=10, batch_size=32, save_path="rbfnn_model_2d.pth"):
-    x_data, y_label = generate_fake_dataset(100, False, n_input=2)
+def train_rbfnn_3d(num_centers=5, lr=1e-2, epochs=50, batch_size=16, save_path="rbfnn_model_2d.pth"):
+    x_data, y_label = generate_fake_dataset(250, False, n_input=3)
 
     dataset = TensorDataset(x_data, y_label)
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    model = RBFNN(input_dim=2, num_centers=num_centers)
+    model = RBFNN3d(input_dim=3, num_centers=num_centers)
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
+    print( torch.cuda.is_available())
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
@@ -39,26 +39,19 @@ def train_rbfnn_2d(mean=torch.tensor([0.0, 0.0]), std=1.0, num_centers=20, lr=1e
     print(f"Model saved to {save_path}")
 
 # Test the model and visualize results in 2D
-def test_rbfnn_2d(model_path, mean=torch.tensor([0.0, 0.0]), std=1.0, num_centers=20):
-    model = RBFNN(input_dim=2, num_centers=num_centers)
+def test_rbfnn_3d(model_path, num_centers=20):
+    model = RBFNN3d(input_dim=3, num_centers=num_centers)
     model.load_state_dict(torch.load(model_path))
     model.eval()
 
-    x1 = torch.linspace(-6, 6, 100)
-    x2 = torch.linspace(-6, 6, 100)
-    grid_x1, grid_x2 = torch.meshgrid(x1, x2, indexing='ij')
-    x_test = torch.stack([grid_x1.flatten(), grid_x2.flatten()], dim=1)
-    y_test = model(x_test).detach().numpy().reshape(100, 100)
 
-    grid, ground_truth = generate_fake_dataset(100, False, n_input=2)
+    grid, ground_truth = generate_fake_dataset(100, False, n_input=3)
     Z_truth = ground_truth.numpy().reshape(100, 100)
-
-    X = grid_x1.numpy()
-    Y = grid_x2.numpy()
-
+    y_test = model(grid).detach().numpy().reshape(100, 100)
     fig = go.Figure()
-    fig.add_trace(go.Surface(z=Z_truth, x=X, y=Y, colorscale='Viridis', name='Ground Truth'))
-    fig.add_trace(go.Surface(z=y_test, x=X, y=Y, colorscale='Blues', name='Predicted'))
+    print(grid.shape)
+    fig.add_trace(go.Scatter3d(z=Z_truth.flatten(), x=grid[:,0], y=grid[:,1], name='Ground Truth'))
+    fig.add_trace(go.Scatter3d(z=y_test.flatten(), x=grid[:,0], y=grid[:,1], name='Predicted'))
 
     fig.update_layout(
         title="Ground Truth vs Predicted (2D)",
@@ -72,7 +65,7 @@ def test_rbfnn_2d(model_path, mean=torch.tensor([0.0, 0.0]), std=1.0, num_center
 
 if __name__ == "__main__":
     # Train the model and save it
-    train_rbfnn_2d(save_path="models/rbfnn_model_2d_synthetic.pth")
+    train_rbfnn_3d(save_path="models/rbfnn_model_3d_synthetic.pth", num_centers=1)
 
     # Test the model
-    test_rbfnn_2d(model_path="models/rbfnn_model_2d_synthetic.pth")
+    test_rbfnn_3d(model_path="models/rbfnn_model_3d_synthetic.pth", num_centers=1)

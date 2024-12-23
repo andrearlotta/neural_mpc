@@ -46,7 +46,7 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0
     opti.minimize(sum2(hcat(Obj)))
     
     # Solver options
-    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":5, "sb": "no", "mu_strategy":"monotone", "tol":1e-3}}
+    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":5, "sb": "no", "mu_strategy":"monotone"}}
     opti.solver('ipopt', options)
 
     sol = opti.solve()

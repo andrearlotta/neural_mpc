@@ -57,7 +57,7 @@ for i in range(1):
     bayes_f = bayes_func(len(trees_p))
 
     b0 = np.array([np.random.uniform(0.5, 0.9) for _ in range(n_trees)]) 
-    opti.minimize(- mmax((l4c_nn_f(x,y, trees_p) + 0.5)*(-(1+f_Z(x,y)))) )
+    opti.minimize(- mmax((l4c_nn_f(x,y,trees_p) + 0.5)*(-(1+f_Z(x,y)))) )
 
     # Solver options
     options = {"ipopt": {"hessian_approximation": "limited-memory","mu_strategy":"adaptive"}}
@@ -77,7 +77,7 @@ for i in range(1):
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
             z_k =  l4c_nn_f(x, y, trees_p) 
-            z_vals[j, i] =  ((mmax(-(1+log10(0.001*f_Z(x,y)+1))*(1- 2*(b0-0.5))**-2))).full().flatten()
+            z_vals[j, i] = mmax(-(1+log10(0.001*f_Z(x,y)+1))*(1e-6+ 1- 2*(b0-0.5))**-2)
 
     fig_a = go.Figure()
 
@@ -128,8 +128,10 @@ for i in range(1):
 
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
-            z_k =  l4c_nn_f(x, y, trees_p) 
-            z_vals[j, i] = mmax(l4c_nn_f(x,y, trees_p)+0.5).full().flatten()
+            z_k =  l4c_nn_f(x, y, trees_p)
+            dist =mmax(-(log10(0.001*f_Z(x,y)+1))*(1e-6+ 1- 2*(b0-0.5))**-2)
+            transition = smooth_transition(mmin(f_Z(x,y)))
+            z_vals[j, i] =  ((1-transition)*sum1(z_k*(1- 2*(b0-0.5)))+ transition*dist).full().flatten()
 
     fig_a = go.Figure()
 

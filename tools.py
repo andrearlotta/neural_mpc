@@ -6,6 +6,22 @@ import torch.nn.functional as F
 import numpy as np
 
 
+def generate_tree_positions(grid_size, spacing):
+    """Generate tree positions in a grid."""
+    x_positions = np.arange(0, grid_size[0]*spacing, spacing)
+    y_positions = np.arange(0, grid_size[1]*spacing, spacing)
+    xv, yv = np.meshgrid(x_positions, y_positions)
+    tree_positions = np.vstack([xv.ravel(), yv.ravel()]).T
+    return tree_positions
+
+def get_domain(tree_positions):
+    """Return the domain (bounding box) of the tree positions."""
+    x_min = np.min(tree_positions[:, 0])
+    x_max = np.max(tree_positions[:, 0])
+    y_min = np.min(tree_positions[:, 1])
+    y_max = np.max(tree_positions[:, 1])
+    return [x_min,y_min], [x_max, y_max]
+
 def dist_f(trees_p):
     # Definire variabili simboliche
     x_sym = MX.sym('x_')
@@ -117,7 +133,7 @@ def fov_weight_fun_numpy(drone_pos, trees_pos, thresh_distance=5):
     light_score = norm_sigmoid_np(((vect_light_alignment + 1) / 2) ** 2, thresh=thresh, delta=delta, alpha=alpha)
     distance_score = gaussian_np(distances, mu=thresh_distance, sig=sig)
     
-    result = np.minimum(distance_score * light_score * 0.5, 1.0)
+    result = np.minimum(distance_score * light_score * alignment_score * 0.5, 1.0)
     return result
 
 
@@ -135,7 +151,7 @@ def generate_fake_dataset(num_samples, is_polar, n_input=2):
     for i in range(X.shape[0]):
         for j in range(X.shape[1]):
             drone_pos = np.array([X[i, j], Y[i, j]])
-            yaw = np.arctan2(Y[i, j], X[i, j])
+            yaw = np.arctan2(Y[i, j], X[i, j]) if n_input == 2 else (np.random.rand() -0.5)*4*np.pi
             value = fov_weight_fun_numpy(np.hstack((drone_pos, yaw)), tree_pos, 3)
             synthetic_X.append([X[i, j], Y[i, j], yaw] if n_input == 3 else [X[i, j], Y[i, j]])
             synthetic_Y.append(value)
@@ -143,7 +159,7 @@ def generate_fake_dataset(num_samples, is_polar, n_input=2):
     return torch.Tensor(np.array(synthetic_X)), torch.Tensor(np.array(synthetic_Y))
 
 
-def create_l4c_nn_f(trees_number,input_dim=2 , model_name="models/rbfnn_model_2d_syntehtic.pth", dev="cpu"):
+def create_l4c_nn_f(trees_number,input_dim=2 , model_name="models/rbfnn_model_2d_synthetic.pth", dev="cpu"):
     loaded_model = RBFNN(input_dim=input_dim, num_centers=20)
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
@@ -160,6 +176,7 @@ def create_l4c_nn_f(trees_number,input_dim=2 , model_name="models/rbfnn_model_2d
         f_(x)
         df_(x)
 
+    # = MX.sym('param')
     drone_statex = MX.sym('drone_pos_x')
     if input_dim>1: drone_statey = MX.sym('drone_pos_y')
     drone_state1 = horzcat(drone_statex, drone_statey) if input_dim>1 else drone_statex
@@ -245,18 +262,17 @@ def entropy_func(dim):
 
     output =  -sum1((lambda_min__ * log10(lambda_min__ + 1e-10) / log10(2) + one_minus_lambda__* log10(one_minus_lambda__) / log10(2)))
     return Function('entropy_f', [lambda__], [output])
-
 # Define the Radial Basis Function Layer
 class RBFLayer(torch.nn.Module):
     def __init__(self, input_dim, num_centers):
         """
         Radial Basis Function Layer.
         Parameters:
-            input_dim (int): Dimension of the input (2 for 2D).
+            input_dim (int): Dimension of the input.
             num_centers (int): Number of RBF centers.
         """
         super(RBFLayer, self).__init__()
-        self.centers = torch.nn.Parameter(torch.randn(num_centers, input_dim))
+        self.centers = torch.nn.Parameter(torch.rand(num_centers, input_dim))
         self.log_sigmas = torch.nn.Parameter(torch.zeros(num_centers))  # Log scale for stability
 
     def forward(self, x):
@@ -276,14 +292,52 @@ class RBFNN(torch.nn.Module):
         """
         Radial Basis Function Neural Network.
         Parameters:
-            input_dim (int): Dimension of the input (2 for 2D).
+            input_dim (int): Dimension of the input (2 or 3).
             num_centers (int): Number of RBF centers.
             output_dim (int): Dimension of the output.
         """
         super(RBFNN, self).__init__()
-        self.rbf_layer = RBFLayer(input_dim, num_centers)
-        self.linear_layer = torch.nn.Linear(num_centers, output_dim)
+        self.input_dim = input_dim
+        self.rbf_layer = RBFLayer(2, num_centers)
+        self.linear_layer = torch.nn.Linear(num_centers if input_dim<3 else num_centers + 2, output_dim)
+        #self.linear_layer1 = torch.nn.Linear(64, output_dim)
+
 
     def forward(self, x):
-        rbf_output = self.rbf_layer(x)
+        if x.shape[-1] == 3:  # Check if the input has 3 dimensions
+            # Replace the angle with its sin and cos values
+            sin_cos = torch.cat([torch.sin(x[..., -1:]), torch.cos(x[..., -1:])], dim=-1)
+        rbf_output = self.rbf_layer(x) if self.input_dim < 3 else torch.cat([self.rbf_layer(x[..., :-1]), sin_cos])
         return self.linear_layer(rbf_output)
+
+
+class RBFNN3d(torch.nn.Module):
+    def __init__(self, input_dim, num_centers, output_dim=1):
+        """
+        Radial Basis Function Neural Network.
+        Parameters:
+            input_dim (int): Dimension of the input (2 or 3).
+            num_centers (int): Number of RBF centers.
+            output_dim (int): Dimension of the output.
+        """
+        super(RBFNN3d, self).__init__()
+        self.input_dim = input_dim
+        self.rbf_layer = RBFLayer(input_dim if input_dim < 3 else input_dim - 1, num_centers)
+        self.linear_layer = torch.nn.Linear(num_centers + (2 if input_dim == 3 else 0), 64)
+        self.linear_layer1 = torch.nn.Linear(64, output_dim)
+
+    def forward(self, x):
+        if x.shape[-1] == 3:  # Check if the input has 3 dimensions
+            # Replace the angle with its sin and cos values
+            sin_cos = torch.cat([torch.sin(x[..., -1:]), torch.cos(x[..., -1:])], dim=-1)
+            rbf_output = torch.cat([self.rbf_layer(x[..., :-1]), sin_cos], dim=-1)
+        else:
+            rbf_output = self.rbf_layer(x)
+        
+        x = self.linear_layer(rbf_output)
+        x = torch.sigmoid(x)  # Apply Sigmoid activation here
+        return self.linear_layer1(x)
+
+
+def smooth_transition(x, transition_point=10, steepness=0.5):
+    return 1 / (1 + exp(-steepness * (x - transition_point)))

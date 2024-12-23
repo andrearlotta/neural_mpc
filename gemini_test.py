@@ -3,6 +3,7 @@ from casadi import *
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tools import *
+import time
 
 T = 1.0
 N = 5
@@ -41,7 +42,7 @@ def distance_function(trees_p, max_dist=2):
     # Create a CasADi function for evaluating distances
     return Function('f_Z', [x_sym, y_sym], [distances_ca])
 
-def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps=10, x0=0.0, y0=0.0, vx0=0.0, vy0=0.0, warmstart=False):
+def maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps=10, x0=0.0, y0=0.0, vx0=0.0, vy0=0.0, warmstart=False):
     """Uses CasADi's Opti to minimize entropy."""
     opti = Opti()
     
@@ -60,8 +61,8 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps
     for i in range(steps):
         opti.subject_to((lb[0]-5 <= X[0, i + 1]) <= ub[0]+5)
         opti.subject_to((lb[1]-5 <= X[1, i + 1]) <= ub[1]+5)
-        opti.subject_to((-5 <= U[0, i]) <= 5)
-        opti.subject_to((-5 <= U[1, i]) <= 5)
+        opti.subject_to((-10 <= U[0, i]) <= 10)
+        opti.subject_to((-10 <= U[1, i]) <= 10)
         opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))  # State update using kinematic model
 
     # Objective function: Minimize the entropy
@@ -71,33 +72,35 @@ def maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps
     for i in range(steps):
         z_k = gaussians_func(X[0, i+1], X[1, i+1], centers)+ 0.5
         current_weights = bayes_f(current_weights, z_k)
-        dist = 1+log10((f_Z(X[0, i+1], X[1, i+1])+1))
-
-        obj += -mmax(z_k*( 1 + 2*(weights-0.5)))
+        dist =  mmax(-(1+log10(0.001*f_Z(X[0, i+1], X[1, i+1])+1))*(1e-6+ 1- 2*(weights-0.5))**-2)
+        transition = smooth_transition(-dist)
+        obj += -(10*sum1(current_weights*(1- 2*(weights-0.5))) * (1-transition)  + transition * 0.1*dist)
     opti.minimize(obj)  # Minimize the objective
 
-    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level": 5, "sb": "no", "mu_strategy": "monotone"}} #reduced print level
+    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0, "sb": "no", "mu_strategy": "monotone", "tol":1e-3}} #reduced print level
     opti.solver('ipopt', options)
 
+    start_time = time.time()
     sol = opti.solve()
+    duration = time.time() - start_time
 
     optimal_trajectory = sol.value(X)
-    return optimal_trajectory, sol.value(U)
+    return optimal_trajectory, sol.value(U), duration
 
 def main():
     # Parameters
     n_points = 100
     np.random.seed(2)
-    sigma = 1.0
     lb = [-100, -100]
     ub = [100, 100]
     max_iterations = 100  # Maximum number of MPC iterations
 
     # Generate random 2D Gaussian centers
-    centers = np.array([np.random.uniform(lb, ub) for _ in range(n_points)])
-    weights = DM.ones(n_points) * 0.5
+    centers = generate_tree_positions ([10,10],8) #np.array([np.random.uniform(lb, ub) for _ in range(n_points)])
+    lb, ub = get_domain(centers)
+    weights = DM.ones(len(centers)) * 0.5
 
-    gaussians_func = create_l4c_nn_f(len(centers))
+    gaussians_func = create_l4c_nn_f(len(centers), dev='cuda')
     bayes_f = bayes_func(len(centers))
     steps = N
     F_ = kin_model(T=T, N=steps)
@@ -114,13 +117,16 @@ def main():
     all_trajectories = []
     weights_history = []
     entropy_history = [] #log the entropy
+    durations = [] #log iteration durations
     os.makedirs("frames", exist_ok=True)
 
-    for iteration in range(1000):
+    for iteration in range(10000):
         weights_history.append(weights.full().flatten().tolist())
         entropy_history.append(entropy_f(weights).full().flatten().tolist()[0])
 
-        optimal_trajectory, U = maximize_with_opti_2d(gaussians_func, centers, weights, sigma, lb, ub, steps, x0, y0, vx0, vy0, warmstart=iteration)
+        optimal_trajectory, U, duration = maximize_with_opti_2d(gaussians_func, centers, weights, lb, ub, steps, x0, y0, vx0, vy0, warmstart=iteration)
+
+        durations.append(duration)  # Log the duration
 
         x_steps = optimal_trajectory[0, :]
         y_steps = optimal_trajectory[1, :]
@@ -131,7 +137,7 @@ def main():
         vx0 = U[ 0 ]
         vy0 = U[ 1 ]
 
-        z_k = gaussians_func(x0, y0, centers).full().flatten() + 0.5
+        z_k = np.round(gaussians_func(x0, y0, centers).full().flatten() + 0.5, 2)
         weights = bayes_f(weights, DM(z_k))
         print(weights)
         print(f"Iteration {iteration}: x={x0:.2f}, y={y0:.2f}, Entropy = {entropy_f(weights).full().flatten()[0]}")
@@ -195,6 +201,12 @@ def main():
     fig_entropy.update_layout(title="Entropy over Iterations", xaxis_title="Iteration", yaxis_title="Entropy")
     fig_entropy.show()
 
+    # Plot iteration durations
+    fig_durations = go.Figure()
+    fig_durations.add_trace(go.Scatter(y=durations, mode='lines+markers'))
+    fig_durations.update_layout(title="Optimizer Duration per Iteration", xaxis_title="Iteration", yaxis_title="Duration (seconds)")
+    fig_durations.show()
+
 
     # Calculate Z values for the surface plot (using the Gaussian function)
     x_vals = np.linspace(lb[0] - 2.5, ub[0] + 2.5, 100)
@@ -250,5 +262,3 @@ def main():
     fig_entropy.show()
 if __name__ == "__main__":
     main()
-
-
