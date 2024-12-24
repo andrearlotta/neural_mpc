@@ -62,25 +62,27 @@ def maximize_with_opti_2d(gaussians_func, centers, lb, ub, x0, y0, vx0, vy0, wei
     for i in range(steps):
         opti.subject_to((lb[0]-5 <= X[0, i + 1]) <= ub[0]+5)
         opti.subject_to((lb[1]-5 <= X[1, i + 1]) <= ub[1]+5)
-        opti.subject_to((-10 <= U[0, i]) <= 10)
-        opti.subject_to((-10 <= U[1, i]) <= 10)
+        opti.subject_to((-5 <= U[0, i]) <= 5)
+        opti.subject_to((-5 <= U[1, i]) <= 5)
         opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))  # State update using kinematic model
 
     # Objective function: Minimize the entropy
     obj = 0
     current_weights = X0[2:] #initialize the weights
     w0 =  X0[2:]
+
     exploration_weight = 1 # Tune this parameter
     for i in range(steps):
         z_k = gaussians_func(X[0, i+1], X[1, i+1], centers)+ 0.5
         current_weights = bayes_f(current_weights, z_k)
-        dist =  mmax(-(1+log10(0.001*f_Z(X[0, i+1], X[1, i+1])+1))*(1e-6+ 1- 2*(w0-0.5))**-2)
-        transition = smooth_transition(-dist)
-        obj += -(10*sum1(current_weights*(1- 2*(w0-0.5))) * (1-transition)  + transition * 0.1*dist)
+        #dist =  mmax(-(1+log10(0.001*f_Z(X[0, i+1], X[1, i+1])+1))*(1e-6+ 1- 2*(w0-0.5))**-2)
+        #transition = smooth_transition(mmin(f_Z(X[0, i+1], X[1, i+1])))
+        obj += -entropy_f(current_weights) #+ 1e-3*  sum1(U[:, i])
     opti.minimize(obj)  # Minimize the objective
 
-    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0, "sb": "no", "mu_strategy": "monotone", "tol":1e-3}} #reduced print level
+    options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0, "sb": "no", "mu_strategy": "monotone", "tol":1e-3, "max_iter":200}} #reduced print level
     opti.solver('ipopt', options)
+    
     
     opti.set_value(X0, vertcat([x0],[y0], weights))
 
@@ -114,7 +116,7 @@ def main():
     max_iterations = 100  # Maximum number of MPC iterations
 
     # Generate random 2D Gaussian centers
-    centers = generate_tree_positions ([10,10],8) #np.array([np.random.uniform(lb, ub) for _ in range(n_points)])
+    centers = generate_tree_positions ([2,2],8) #np.array([np.random.uniform(lb, ub) for _ in range(n_points)])
     lb, ub = get_domain(centers)
     weights = DM.ones(len(centers)) * 0.5
 
