@@ -134,7 +134,7 @@ def fov_weight_fun_numpy(drone_pos, trees_pos, thresh_distance=5):
     distance_score = gaussian_np(distances, mu=thresh_distance, sig=sig)
     
     result = np.minimum(distance_score * light_score * alignment_score * 0.5, 1.0)
-    return result
+    return result * 35
 
 
 def generate_fake_dataset(num_samples, is_polar, n_input=2):
@@ -159,8 +159,8 @@ def generate_fake_dataset(num_samples, is_polar, n_input=2):
     return torch.Tensor(np.array(synthetic_X)), torch.Tensor(np.array(synthetic_Y))
 
 
-def create_l4c_nn_f(trees_number,input_dim=2 , model_name="models/rbfnn_model_2d_synthetic.pth", dev="cpu"):
-    loaded_model = RBFNN(input_dim=input_dim, num_centers=20)
+def create_l4c_nn_f(loaded_model ,trees_number,model_name, input_dim=2 , dev="cpu"):
+    print(model_name)
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
     l4c_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device=dev)
