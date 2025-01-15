@@ -31,7 +31,7 @@ def dist_f(trees_p):
     for k in range(len(trees_p)):
         dx = x_sym - trees_p[k, 0]
         dy = y_sym - trees_p[k, 1]
-        dist = dx**2 + dy**2
+        dist = sqrt(dx**2 + dy**2)
         distances_expr.append(dist)
 
     distances_ca = vertcat(*distances_expr)
@@ -42,7 +42,24 @@ def dist_f(trees_p):
     Z_expr = distances_ca
 
     # Creare una funzione CasADi per valutare Z
-    return Function('f_Z', [x_sym, y_sym], [Z_expr])
+
+
+
+    # Find the index of the nearest tree
+    min_dist_expr = MX.sym('min_dist')
+    min_index_expr = MX.sym('min_index')
+    
+    # Initialize with the first distance
+    min_dist_expr = distances_expr[0]
+    min_index_expr = 0
+    
+    # Loop through the distances to find the minimum
+    for k in range(1, len(distances_expr)):
+        min_dist_expr = if_else(distances_expr[k] < min_dist_expr, distances_expr[k], min_dist_expr)
+        min_index_expr = if_else(distances_expr[k] < min_dist_expr, k, min_index_expr)
+
+    # Creare una funzione CasADi per valutare Z e l'indice dell'albero più vicino
+    return Function('f_Z', [x_sym, y_sym], [distances_ca, min_index_expr])
 
 def gaussian_2d_casadi(mean, std, max_val=0.45):
     """
@@ -159,7 +176,7 @@ def generate_fake_dataset(num_samples, is_polar, n_input=2):
     return torch.Tensor(np.array(synthetic_X)), torch.Tensor(np.array(synthetic_Y))
 
 
-def create_l4c_nn_f(loaded_model ,trees_number,model_name, input_dim=2 , dev="cpu"):
+def create_l4c_nn_f(loaded_model ,trees_number,model_name, input_dim=2 , dev="cpu", synthetic=True):
     print(model_name)
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
@@ -183,6 +200,7 @@ def create_l4c_nn_f(loaded_model ,trees_number,model_name, input_dim=2 , dev="cp
     trees_lambda = MX.sym('trees_lambda', trees_number,input_dim)
     diff_ = repmat(drone_state1, trees_lambda.shape[0], 1) - trees_lambda
     output = l4c_model(diff_)
+    output += 0.5  if synthetic else 0.0
     return Function('F_single', [drone_statex, drone_statey, trees_lambda] if input_dim>1 else [drone_statex, trees_lambda], [output])
 
 
@@ -262,6 +280,90 @@ def entropy_func(dim):
 
     output =  -sum1((lambda_min__ * log10(lambda_min__ + 1e-10) / log10(2) + one_minus_lambda__* log10(one_minus_lambda__) / log10(2)))
     return Function('entropy_f', [lambda__], [output])
+
+
+import os, csv
+
+def find_latest_folder(base_dir):
+    """Finds the latest dated folder in the base directory."""
+    # List all subdirectories in the base_dir
+    subdirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    
+    # Sort the directories by their modified time in reverse (latest first)
+    latest_folder = max(subdirs, key=lambda d: os.path.getmtime(os.path.join(base_dir, d)))
+    return os.path.join(base_dir, latest_folder)
+
+# Utility Function
+def load_surrogate_database(polar, fixed_view, n_input, test_size=0.0, augmented_data=True):
+    polar = polar
+
+    # Paths
+    base_dir = os. getcwd()+'/datasets/'
+    print(base_dir)
+    base_dir = os.path.join(base_dir, "polar" if polar else "cartesian")
+    base_dir = os.path.join(base_dir, "fixed_view" if fixed_view else "variable_view")
+    output_csv_filename = 'SurrogateDatasetCNN_Filtered.csv'
+
+    latest_dataset_folder = find_latest_folder(base_dir=base_dir)
+    # Step 4: Create output CSV file inside the latest folder
+    DATA_PATH = os.path.join(latest_dataset_folder, output_csv_filename)
+    print(DATA_PATH)
+    print(DATA_PATH)
+    X = []  
+    Y = []
+    with open(DATA_PATH, 'r') as infile:
+        data = csv.reader(infile)
+        next(data)  # Skip the header
+        for row in data:
+            a, b, c, value = map(float, row)
+            X.append([a,b, (np.deg2rad(c) % 2* np.pi + np.pi % 2* np.pi) - np.pi ] if n_input == 3 else [a,b,c])
+            Y.append(value)
+
+    X = torch.FloatTensor(X)
+    Y = torch.FloatTensor(Y)
+    x_data = torch.zeros_like(X[:,:2])
+    x_data[:,0] = X[:,0] * np.cos(X[:,1])
+    x_data[:,1] = X[:,0] * np.sin(X[:,1])
+    X = x_data.type(torch.Tensor) 
+    if not augmented_data: return X, Y
+
+    augmented_X, augmented_Y = generate_surrogate_augmented_data(X, int(len(X) *0.2),  False, n_input)
+    # Concatenate augmented data to the original data
+    X = torch.cat((X, augmented_X), dim=0)
+    Y = torch.cat((Y, augmented_Y), dim=0)
+    return X, Y
+
+import random
+
+def generate_surrogate_augmented_data(X, num_samples, polar, n_input):
+    x_min = np.abs(X[:, 0]).min() if polar else (np.sqrt(X[:, 0]**2 + X[:, 1]**2)).min()
+    x_max = np.abs(X[:, 0]).max() if polar else None
+    yaw_values = [30, -30, 60, -60, 90, -90, 180, -180]
+    
+    synthetic_X = []
+    synthetic_Y = []
+    
+    for _ in range(num_samples):
+        #choice = random.choice([1, 2])
+        #if choice == 1:
+        # Generate synthetic data in the range (0, rho_min) and (0, phi_min)
+        theta = random.uniform(-np.pi, np.pi)
+        r = random.uniform(0, x_min)
+        a = r       if  polar else r * np.cos(theta) 
+        b = theta   if  polar else r * np.sin(theta)
+        #random.uniform(-2*np.pi, 2*np.pi)
+        #else:
+        #    # Generate synthetic data in the range (rho_max, rho_max+some_value) and (5, phi_max)
+        #    a = random.uniform(x_max, x_max + 5)    if polar else random.uniform(x_max, x_max + 5) * np.cos(random.uniform(-np.pi, np.pi))
+        #    b = random.uniform(-np.pi, np.pi)       if polar else random.uniform(x_max, x_max + 5) * np.sin(random.uniform(-np.pi, np.pi))
+        #    
+        c = np.radians(random.choice(yaw_values))
+        value = 0.5
+        synthetic_X.append([a, b, c] if n_input ==3 else [a, b])
+        synthetic_Y.append(value)
+
+    return torch.FloatTensor(synthetic_X), torch.FloatTensor(synthetic_Y)
+
 # Define the Radial Basis Function Layer
 class RBFLayer(torch.nn.Module):
     def __init__(self, input_dim, num_centers):
