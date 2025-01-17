@@ -129,7 +129,7 @@ for i in range(1):
     for i, x in enumerate(x_vals):
         for j, y in enumerate(y_vals):
             z_k =  l4c_nn_f(x, y, trees_p)
-            dist =mmax(-(log10(0.001*f_Z(x,y)+1))*(1e-6+ 1- 2*(b0-0.5))**-2)
+            dist =mmax(-(1+log10(0.001*f_Z(x,y)+1))*(1e-6+ 1- 2*(b0-0.5))**-2)
             transition = smooth_transition(mmin(f_Z(x,y)))
             z_vals[j, i] =  ((1-transition)*sum1(z_k*(1- 2*(b0-0.5)))+ transition*dist).full().flatten()
 

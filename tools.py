@@ -177,7 +177,6 @@ def generate_fake_dataset(num_samples, is_polar, n_input=2):
 
 
 def create_l4c_nn_f(loaded_model ,trees_number,model_name, input_dim=2 , dev="cpu", synthetic=True):
-    print(model_name)
     loaded_model.load_state_dict(torch.load(model_name))
     loaded_model.eval()  # Set the model to evaluation mode_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device="cuda")
     l4c_model = l4c.L4CasADi(loaded_model, generate_jac_jac=True, batched=True, device=dev)
@@ -193,7 +192,6 @@ def create_l4c_nn_f(loaded_model ,trees_number,model_name, input_dim=2 , dev="cp
         f_(x)
         df_(x)
 
-    # = MX.sym('param')
     drone_statex = MX.sym('drone_pos_x')
     if input_dim>1: drone_statey = MX.sym('drone_pos_y')
     drone_state1 = horzcat(drone_statex, drone_statey) if input_dim>1 else drone_statex
