@@ -3,3 +3,9 @@ __pycache__*
 rootfinder.py
 global_planner_1d.py
 *env
+runs/*
+main.ipynb
+plots/
+saved_models/*
+entropy_reduction_mpc.py
+saved_models_*

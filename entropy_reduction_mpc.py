@@ -77,7 +77,7 @@ def maximize_with_opti_2d(gaussians_func, centers, lb, ub, x0, y0, vx0, vy0, wei
         current_weights = bayes_f(current_weights, z_k)
         #dist =  mmax(-(1+log10(0.001*f_Z(X[0, i+1], X[1, i+1])+1))*(1e-6+ 1- 2*(w0-0.5))**-2)
         #transition = smooth_transition(mmin(f_Z(X[0, i+1], X[1, i+1])))
-        obj += -entropy_f(current_weights) #+ 1e-3*  sum1(U[:, i])
+        obj += entropy_f(current_weights) #+ 1e-3*  sum1(U[:, i])
     opti.minimize(obj)  # Minimize the objective
 
     options = {"ipopt": {"hessian_approximation": "limited-memory", "print_level":0, "sb": "no", "mu_strategy": "monotone", "tol":1e-3, "max_iter":200}} #reduced print level
@@ -109,14 +109,11 @@ def maximize_with_opti_2d(gaussians_func, centers, lb, ub, x0, y0, vx0, vy0, wei
     
 def main():
     # Parameters
-    n_points = 100
     np.random.seed(2)
-    lb = [-100, -100]
-    ub = [100, 100]
     max_iterations = 100  # Maximum number of MPC iterations
 
     # Generate random 2D Gaussian centers
-    centers = generate_tree_positions ([2,2],8) #np.array([np.random.uniform(lb, ub) for _ in range(n_points)])
+    centers = generate_tree_positions ([10,10],8) #np.array([np.random.uniform(lb, ub) for _ in range(n_points)])
     lb, ub = get_domain(centers)
     weights = DM.ones(len(centers)) * 0.5
 
@@ -138,8 +135,7 @@ def main():
     weights_history = []
     entropy_history = [] #log the entropy
     durations = [] #log iteration durations
-    os.makedirs("frames", exist_ok=True)
-
+    
     mpc_step, u, x_, x, lam = maximize_with_opti_2d(gaussians_func, centers,lb, ub, x0, y0, vx0, vy0, weights,steps)
     
     for iteration in range(10000):
