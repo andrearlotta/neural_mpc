@@ -12,7 +12,7 @@ def generate_tree_positions(grid_size, spacing):
     y_positions = np.arange(0, grid_size[1]*spacing, spacing)
     xv, yv = np.meshgrid(x_positions, y_positions)
     tree_positions = np.vstack([xv.ravel(), yv.ravel()]).T
-    return tree_positions
+    return tree_positions + 0.1
 
 def get_domain(tree_positions):
     """Return the domain (bounding box) of the tree positions."""
