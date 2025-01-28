@@ -9,3 +9,4 @@ plots/
 saved_models/*
 entropy_reduction_mpc.py
 saved_models_*
+scripts/*
