@@ -1,8 +1,7 @@
-numpy
-matplotlib
-plotly
-torch>=2.0        # For machine learning models and training (PyTorch)
-scikit-build>=0.17
-cmake>=3.27
-ninja>=1.11
-casadi>=3.6.3       # For optimization and symbolic computation
+casadi==3.6.7
+l4casadi==2.0.0
+matplotlib==3.1.2
+numpy==1.17.4
+plotly==5.18.0
+torch==2.5.1
+torch.egg==info
