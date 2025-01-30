@@ -2,7 +2,6 @@ _l4c_generated/*
 __pycache__*
 rootfinder.py
 global_planner_1d.py
-*env
 runs/*
 main.ipynb
 plots/
@@ -11,3 +10,9 @@ entropy_reduction_mpc.py
 saved_models_*
 scripts/*
 _models/*
+ros/.catkin_tools
+ros/devel
+ros/logs
+ros/pyenv
+ros/build
+scripts.zip

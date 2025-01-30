@@ -1,9 +1,6 @@
 [submodule "ros/src/yolov7-ros"]
 	path = ros/src/yolov7-ros
 	url = git@github.com:andrearlotta/yolov7-ros.git
-[submodule "l4casadi"]
-	path = l4casadi
-	url = https://github.com/Tim-Salzmann/l4casadi.git
 [submodule "ros/src/ROS-TCP-Endpoint"]
 	path = ros/src/ROS-TCP-Endpoint
 	url = https://github.com/Unity-Technologies/ROS-TCP-Endpoint.git
