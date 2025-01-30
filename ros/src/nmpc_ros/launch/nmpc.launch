@@ -1,0 +1,10 @@
+<launch>
+
+  <include file="$(find ros_tcp_endpoint)/launch/endpoint.launch"/>
+  <!--include file="$(find yolov7_ros)/launch/yolov7.launch"/-->
+
+  <!-- Launch data_association_node.py -->
+  <node name="data_association_node" pkg="nmpc_ros" type="data_association_node.py" output="screen"/>
+  <!-- Launch nmpc.py -->
+  <node name="main_node" pkg="nmpc_ros" type="nmpc_ros_node.py" output="screen"/>
+</launch>
