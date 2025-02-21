@@ -18,8 +18,9 @@ from scipy.stats import norm
 hidden_size = 64
 hidden_layers = 3
 nn_input_dim = 3
-T = 1.0
-N = 5
+
+N = 20
+T = 0.25 * N
 dt = T / N
 nx = 3  # Represents [x, y, theta] (position/heading); state X is 6-D ([pos; vel])
 
@@ -111,161 +112,134 @@ def entropy(p):
     p = ca.fmin(p, 1 - 1e-6)
     return (-p*ca.log10(p) - (1 - p)* (ca.log10(1 - p))) / ca.log10(2)
 
+
 # =============================================================================
-# MPC Optimization Function
+# Modified MPC Optimization Function
 # =============================================================================
+
 def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     """
-    Set up and solve the MPC optimization problem with the following modifications:
-      - The robot moves according to the kinematic model.
-      - Only positions and translational velocities are constrained (orientation is free).
-      - A collision-avoidance (inequality) constraint ensures the robot stays a safe
-        distance from each tree.
-      - The objective now includes an entropy term that rewards the reduction in belief 
-        uncertainty between the initial and final steps.
+    Set up and solve the MPC optimization problem.
     
-    The objective minimizes:
-      1. Attraction to the nearest tree that has a belief (Bayes value) lower than 0.9.
-      2. The misalignment between the robot's heading and the direction toward that tree.
-      3. Control effort.
-      4. Final entropy (to maximize the reduction between initial and final entropy).
+    The main objective is to reduce uncertainty (i.e. minimize the final entropy
+    of the belief distribution) while satisfying the kinematic, control, and 
+    collision-avoidance constraints.
     """
-    # Dimensions: state is 6-D; control is 3-D.
-    n_state = nx * 2   # 6
-    n_control = nx     # 3
-
+    # --- Basic Dimensions ---
+    nx = 3                   # Split factor: state is 2*nx (6-D) and control is nx (3-D)
+    n_state = nx * 2         # 6-dimensional state: e.g. [x, y, theta, vx, vy, omega]
+    n_control = nx           # 3-dimensional control: e.g. [ax, ay, alpha]
+        # --- Create the Optimization Problem ---
     opti = ca.Opti()
-    F_ = kin_model()  # Kinematic model function
+    F_ = kin_model()  # kinematic model function
 
     # Decision variables:
     X = opti.variable(n_state, steps + 1)
     U = opti.variable(n_control, steps)
-
-    # Parameter vector: initial state and tree beliefs
-    P0 = opti.parameter(n_state + trees.shape[0])
-    opti.subject_to(X[:, 0] == P0[: n_state])
-    # In this formulation, we use the current belief as a parameter (constant over the horizon)
-    lambda_param = P0[n_state:]
-
-    # Convert tree positions to a CasADi DM for convenience.
-    trees_dm = ca.DM(trees)
-    num_trees = trees_dm.size1()
-
-    # ---------------------------
-    # Weights and Safety Parameters (tuned)
-    # ---------------------------
-    w_orient  = 5*1e-3     # Weight for orientation misalignment
-    w_control = 1e-6    # Weight for translational control effort
-    w_ang     = 1e-8    # Weight for angular control effort
-    w_attr    = 1e-2    # Weight for attraction cost
-    w_entropy = 1.0    # Weight for final entropy reduction term
-
-    safe_distance = 1.5  # Minimum allowed distance from any tree
+    
+    # Parameter vector: initial state and tree beliefs.
+    # (Removed the unused entropy_horizon; dimension is now n_state + num_trees)
+    num_trees = trees.shape[0]
+    P0 = opti.parameter(n_state + num_trees)
+    X0 = P0[: n_state]
+    lambda_0 = P0[n_state:]
+    # Initialize belief evolution.
+    lambda_evol = [lambda_0]
+    
+    # Convert tree positions to a CasADi DM.
+    trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
+    
+    # --- Weights and Safety Parameters ---
+    w_control = 1e-2         # Control effort weight
+    w_ang = 1e-3        # Angular control weight
+    w_entropy = 1e1        # Weight for the final entropy (reduce uncertainty)
+    w_g_k = 1e1 
+    safe_distance = 1e0    # Safety margin (meters)
 
     # Initialize the objective.
     obj = 0
 
-    # Create a list to hold the evolution of the belief.
-    # lambda_evol[0] is the initial belief.
-    lambda_evol = [lambda_param]
-
+    # Initial condition constraint.
+    opti.subject_to(X[:, 0] == X0)
+    
+    # --- Loop Over the Prediction Horizon ---
     for i in range(steps):
-        # --- Constrain the State and Input ---
-        opti.subject_to(opti.bounded(lb[0] - 3.0, X[0, i + 1], ub[0] + 3.0))
-        opti.subject_to(opti.bounded(lb[1] - 3.0, X[1, i + 1], ub[1] + 3.0))
-        opti.subject_to(opti.bounded(-3, X[3, i + 1], 3))
-        opti.subject_to(opti.bounded(-3, X[4, i + 1], 3))
-        opti.subject_to(opti.bounded(-3.14/2, X[-1, i], 3.14/2))
-        # No constraints on orientation (X[2]) or angular velocity (X[5])
-        opti.subject_to(opti.bounded(-3, U[0:2, i], 3))
-        opti.subject_to(opti.bounded(-3.14, U[-1, i], 3.14))
+        # --- State and Input Bounds ---
+        opti.subject_to(opti.bounded(lb[0], X[0, i + 1], ub[0]))
+        opti.subject_to(opti.bounded(lb[1], X[1, i + 1], ub[1]))
+        
+        opti.subject_to(opti.bounded(-5.0, X[3, i + 1], 5.0))
+        opti.subject_to(opti.bounded(-5.0, X[4, i + 1], 5.0))
+        opti.subject_to(opti.bounded(-3.14/20, X[5, i + 1], 3.14/20))
+        opti.subject_to(opti.bounded(-5.0, U[0:2, i], 5.0))
+        opti.subject_to(opti.bounded(-3.14/18, U[2, i], 3.14/18))
         
         # --- Dynamics Constraint ---
         opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
-
-        # --- Obstacle Avoidance Constraint ---
+        
+        # --- Collision Avoidance Constraint ---
         # Ensure the robot remains at least safe_distance away from every tree.
-        delta = X[0:2, i+1] - trees_dm.T  # (2 x num_trees)
+        delta = X[:2, i+1] - trees_dm.T  # (2 x num_trees)
         # Squared distances for each tree
         sq_dists = ca.diag(ca.mtimes(delta.T, delta))
         # The closest tree must be at least safe_distance away.
-        opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
-        
-        # --- Neural Network Prediction & Bayesian Update ---
-        relative_pos_bayes = ca.repmat(X[0:2, i+1].T, num_trees, 1) - trees_dm
-        heading_bayes = ca.repmat(X[2, i+1], num_trees, 1)
-        nn_input = ca.horzcat(relative_pos_bayes, heading_bayes)
-        g_out = g_nn(nn_input)
-        z_k = ca.fmax(g_out, 0.5)  # Ensure a minimum confidence level
-        # Update the belief using the Bayesian update rule.
-        lambda_next = bayes(lambda_evol[-1], z_k)
-        lambda_evol.append(lambda_next)
-        obj += w_entropy * ca.sum1(entropy(lambda_next ))
-        
-        # --- Attraction & Orientation Cost ---
-        pos_i = X[0:2, i + 1]   # current (x, y)
-        theta_i = X[2, i + 1]   # current orientation
-        theta_i_wrapped = ca.atan2(ca.sin(theta_i), ca.cos(theta_i))  # Wrap to [-π, π)
-        cost_list = []
-        d_threshold = 5.0  # threshold distance (in meters) for attraction activation
-        
-        for j in range(num_trees):
-            tree_j = trees_dm[j, :].T
-            rel_ij = tree_j - pos_i          # vector from robot to tree j
-            d_ij = ca.norm_2(rel_ij)           # Euclidean distance
-            theta_des = ca.atan2(rel_ij[1], rel_ij[0])  # desired heading angle toward tree j
-            orient_error = 1 - ca.cos(theta_i_wrapped - theta_des)  # misalignment cost
-            
-            # Penalty: high if the belief for this tree is high (i.e., tree is "certain").
-            penalty = 1e6 * (0.5 + 0.5 * ca.tanh(100 * (lambda_evol[-1][j] - 0.95)))
-            
-            # Attraction multiplier: activates more when farther than d_threshold.
-            attraction_multiplier = 0.5 * (1 + ca.tanh(10 * (d_ij - d_threshold)))
-            
-            cost_j =  w_attr* d_ij + w_orient * orient_error  + penalty
-            cost_list.append(cost_j)
-        cost_vec = ca.vertcat(*cost_list)
-        # Use the minimum cost among trees.
-        step_cost = ca.mmin(cost_vec)
-        obj += step_cost
+        opti.subject_to(ca.mmin(sq_dists) > safe_distance)
 
         # --- Control Effort Regularization ---
         obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
+    
+    nn_batch = []
+    for i in range(trees_dm.shape[0]):
+        # Ensure the robot remains at least safe_distance away from every tree.
+        delta = X[:2,1:] - trees_dm[i,:].T
+        # --- Neural Network Prediction & Belief Update ---
+        heading = X[2,1:]
+        nn_batch.append(ca.horzcat(delta.T, heading.T))
 
-    # Set the overall objective.
+    g_out = g_nn(ca.vcat([*nn_batch]))
+    print(g_out.shape)
+    z_k = ca.fmax(g_out, 0.5)  # threshold the NN output
+
+    for i in range(steps):
+        lambda_next = bayes(lambda_evol[-1], z_k[i::steps])
+        lambda_evol.append(lambda_next)
+    
+    # Penalize the final entropy to promote uncertainty reduction.
+    obj += w_g_k * - ca.sum1( entropy(lambda_evol[0]) * (z_k[steps-1::steps]))
+    entropy_value = ca.sum1(entropy(lambda_evol[-1]))
+    obj += w_entropy * entropy_value
+    #Set the overall objective.
     opti.minimize(obj)
-
-    # ---------------------------
-    # Solver Options and Problem Solve
-    # ---------------------------
+    
+    # --- Solver Options and Solve ---
     options = {
         "ipopt": {
             "tol": 1e-3,
-            "warm_start_init_point": "no",
+            "warm_start_init_point": "yes",
             "hessian_approximation": "limited-memory",
             "print_level": 0,
             "sb": "no",
             "mu_strategy": "monotone",
-            "max_iter": 1000
+            "max_iter": 3000
         }
     }
     opti.solver("ipopt", options)
-
-    # Set the parameter values.
+    
+    # Set the parameter values: ensure x0 is (6,1) and lambda_vals is (num_trees,1).
     opti.set_value(P0, ca.vertcat(x0, lambda_vals))
+    
     sol = opti.solve()
-
-    # Create the MPC step function for warm starting.
+    
+    # Create the MPC step function for warm starting future iterations.
     inputs = [P0, opti.x, opti.lam_g]
     outputs = [U[:, 0], X, opti.x, opti.lam_g]
     mpc_step = opti.to_function("mpc_step", inputs, outputs)
-
+    
     return (mpc_step,
             ca.DM(sol.value(U[:, 0])),
             ca.DM(sol.value(X)),
             ca.DM(sol.value(opti.x)),
-            ca.DM(sol.value(opti.lam_g)))
-
+            ca.DM(sol.value(opti.lam_g))) 
 # =============================================================================
 # Simulation Function
 # =============================================================================
@@ -274,6 +248,7 @@ def run_simulation():
     bridge = BridgeClass(SENSORS)
     trees_pos = np.array(bridge.call_server({"trees_poses": None})["trees_poses"])
     lb, ub = get_domain(trees_pos)
+
     # Initialize belief as a column vector.
     lambda_k = ca.reshape(ca.DM.ones(len(trees_pos)) * 0.5, (len(trees_pos), 1))
     mpc_horizon = N
@@ -288,20 +263,20 @@ def run_simulation():
     g_nn = l4c.L4CasADi(model, batched=True, device='cuda')
     
     # Initialize robot state: assume update_robot_state() returns [x, y, theta].
-    vx_k = ca.DM.ones(nx)  * 1e-4
+    vx_k = ca.DM.zeros(nx)
     # Logging containers.
     all_trajectories = []
     lambda_history = []
     entropy_history = []
     durations = []
 
-    sim_time = 200  # Total simulation time in seconds
+    sim_time = 10000  # Total simulation time in seconds
     mpciter = 0
 
     # ---------------------------
     # Main MPC Loop
     # ---------------------------
-    while mpciter * T < 500:
+    while mpciter * T < sim_time:
         print('Step:', mpciter)
         print('Observe and update state')
         new_data = bridge.get_data()
@@ -315,34 +290,63 @@ def run_simulation():
         lambda_k = bayes(lambda_k, z_k)
         print("Current state x_k:", x_k)
         print("Lambda: ", lambda_k)
+
+        # Define the lambda threshold.
+        lambda_threshold = 0.9
+
+        # Compute distances from the robot to each tree.
+        x_robot = np.array(x_k[:2].full().flatten())
+        distances = np.linalg.norm(trees_pos - x_robot, axis=1)
+        lambda_np = np.array(lambda_k.full().flatten())
+
+        # Filter indices where lambda is below the threshold.
+        valid_indices = np.where(lambda_np < lambda_threshold)[0]
+
+        # Select the nearest 4 trees among the valid ones.
+        num_nearest = 4
+        if valid_indices.size > 0:
+            sorted_valid_indices = valid_indices[np.argsort(distances[valid_indices])]
+            selected_indices = sorted_valid_indices[:num_nearest]
+        else:
+            selected_indices = np.array([], dtype=int)
+
+        # Build the masked lambda array:
+        # Set all values to a high value (1e4), then restore the lambda value for the selected trees.
+        lambda_mpc_np = np.full_like(lambda_np, 1e4)
+        lambda_mpc_np[selected_indices] = lambda_np[selected_indices]
+
+        lambda_mpc = ca.reshape(ca.DM(lambda_mpc_np), (len(trees_pos), 1))
+        print(lambda_mpc)
+
         start_time = time.time()
         if mpciter == 0:
             # Initialize MPC.
-            mpc_step, u, x_, x_dec, lam = mpc_opt(g_nn, trees_pos, lb, ub, x_k, lambda_k, mpc_horizon)
+            mpc_step, u, x_traj, x_dec, lam = mpc_opt(g_nn, trees_pos, lb, ub, x_k, lambda_mpc, mpc_horizon)
         else:
             # Warm-start MPC.
-            u, x_, x_dec, lam = mpc_step(ca.vertcat(x_k, lambda_k), x_dec, lam)
+            u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambda_mpc), x_dec, lam)
         durations.append(time.time() - start_time)
+
 
         # ---------------------------
         # Publish Data and Apply Control
         # ---------------------------
         bridge.pub_data({
-            "predicted_path": x_[:nx, 1:], 
+            "predicted_path": x_traj[:nx, 1:], 
             "tree_markers": {"trees_pos": trees_pos, "lambda": lambda_k.full().flatten()}
         })
         
-        bridge.pub_data({"cmd_pose": x_[:nx, 1]})
-        time.sleep(T)
+        bridge.pub_data({"cmd_pose": F_(x_k, u[0,:])})
+        time.sleep(T/N)
 
         # Update velocity component from the predicted trajectory.
-        vx_k = x_[nx:, 1]
+        vx_k = x_traj[nx:, 1]
 
         # Compute and log overall entropy.
         entropy_k = ca.sum1(entropy(ca.fmin(lambda_k, 1 - 1e-3))).full().flatten()[0]
         lambda_history.append(lambda_k.full().flatten().tolist())
         entropy_history.append(entropy_k)
-        all_trajectories.append(x_[:nx, :].full())
+        all_trajectories.append(x_traj[:nx, :].full())
 
         mpciter += 1
         print(entropy_k)
