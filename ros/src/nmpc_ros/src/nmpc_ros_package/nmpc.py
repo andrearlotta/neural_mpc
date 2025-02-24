@@ -19,9 +19,9 @@ hidden_size = 64
 hidden_layers = 3
 nn_input_dim = 3
 
-N = 20
-T = 0.25 * N
-dt = T / N
+N =30
+dt = 0.5
+T = dt * N
 nx = 3  # Represents [x, y, theta] (position/heading); state X is 6-D ([pos; vel])
 
 # ---------------------------
@@ -152,7 +152,7 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     # --- Weights and Safety Parameters ---
     w_control = 1e-2         # Control effort weight
     w_ang = 1e-3        # Angular control weight
-    w_entropy = 1e1        # Weight for the final entropy (reduce uncertainty)
+    w_entropy = 1e0      # Weight for the final entropy (reduce uncertainty)
     w_g_k = 1e1 
     safe_distance = 1e0    # Safety margin (meters)
 
@@ -161,20 +161,20 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
 
     # Initial condition constraint.
     opti.subject_to(X[:, 0] == X0)
-    
+
     # --- Loop Over the Prediction Horizon ---
     for i in range(steps):
         # --- State and Input Bounds ---
-        opti.subject_to(opti.bounded(lb[0], X[0, i + 1], ub[0]))
-        opti.subject_to(opti.bounded(lb[1], X[1, i + 1], ub[1]))
-        
+        opti.subject_to(opti.bounded(lb[0] - 3.5 , X[0, i + 1], ub[0] + 3.5))
+        opti.subject_to(opti.bounded(lb[1] - 3.5 , X[1, i + 1], ub[1] + 3.5))
+
+        opti.subject_to(opti.bounded(- 6*np.pi , X[2, i + 1], +  6*np.pi))
         opti.subject_to(opti.bounded(-5.0, X[3, i + 1], 5.0))
         opti.subject_to(opti.bounded(-5.0, X[4, i + 1], 5.0))
         opti.subject_to(opti.bounded(-3.14/20, X[5, i + 1], 3.14/20))
-        opti.subject_to(opti.bounded(-5.0, U[0:2, i], 5.0))
-        opti.subject_to(opti.bounded(-3.14/18, U[2, i], 3.14/18))
+        opti.subject_to(opti.bounded(-3.0, U[0:2, i], 3.0))
+        opti.subject_to(opti.bounded(-3.14/10, U[2, i], 3.14/10))
         
-        # --- Dynamics Constraint ---
         opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
         
         # --- Collision Avoidance Constraint ---
@@ -183,10 +183,10 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         # Squared distances for each tree
         sq_dists = ca.diag(ca.mtimes(delta.T, delta))
         # The closest tree must be at least safe_distance away.
-        opti.subject_to(ca.mmin(sq_dists) > safe_distance)
+        #opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
 
         # --- Control Effort Regularization ---
-        obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
+        #obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
     
     nn_batch = []
     for i in range(trees_dm.shape[0]):
@@ -205,8 +205,8 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         lambda_evol.append(lambda_next)
     
     # Penalize the final entropy to promote uncertainty reduction.
-    obj += w_g_k * - ca.sum1( entropy(lambda_evol[0]) * (z_k[steps-1::steps]))
-    entropy_value = ca.sum1(entropy(lambda_evol[-1]))
+    #obj += w_g_k * - ca.sum1( entropy(lambda_evol[0]) * (z_k[steps-1::steps]))
+    entropy_value = 100*ca.sum1(entropy(ca.vcat(*[lambda_evol[1:]])) - entropy(ca.vcat(*[lambda_evol[:-1]])))/num_trees
     obj += w_entropy * entropy_value
     #Set the overall objective.
     opti.minimize(obj)
@@ -214,12 +214,12 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     # --- Solver Options and Solve ---
     options = {
         "ipopt": {
-            "tol": 1e-3,
+            "tol": 1e-4,
             "warm_start_init_point": "yes",
             "hessian_approximation": "limited-memory",
-            "print_level": 0,
+            "print_level": 5,
             "sb": "no",
-            "mu_strategy": "monotone",
+            "mu_strategy": "adaptive",
             "max_iter": 3000
         }
     }
@@ -321,10 +321,10 @@ def run_simulation():
         start_time = time.time()
         if mpciter == 0:
             # Initialize MPC.
-            mpc_step, u, x_traj, x_dec, lam = mpc_opt(g_nn, trees_pos, lb, ub, x_k, lambda_mpc, mpc_horizon)
+            mpc_step, u, x_traj, x_dec, lam = mpc_opt(g_nn, trees_pos, lb, ub, x_k, lambda_k, mpc_horizon)
         else:
             # Warm-start MPC.
-            u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambda_mpc), x_dec, lam)
+            u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambda_k), x_dec, lam)
         durations.append(time.time() - start_time)
 
 
@@ -359,9 +359,15 @@ def run_simulation():
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-def plot_animated_trajectory_and_entropy_2d(g_nn, all_trajectories, entropy_history, lambda_history, trees, lb, ub, computation_durations):
-    print(np.array(all_trajectories).shape)
+def plot_animated_trajectory_and_entropy_2d( all_trajectories, entropy_history, lambda_history, trees, lb, ub, computation_durations):
     
+    model = MultiLayerPerceptron(input_dim=nn_input_dim) 
+    # Note: Adjust 'weights_only' if needed by your model saving logic.
+    model.load_state_dict(torch.load(get_latest_best_model(), weights_only=True))
+    model.eval()
+    g_nn = l4c.L4CasADi(model, name='plotting_f', batched=True, device='cuda')
+    
+
     # Extract trajectory data
     x_trajectory = np.array([traj[0] for traj in all_trajectories])
     y_trajectory = np.array([traj[1] for traj in all_trajectories])
