@@ -19,7 +19,7 @@ hidden_size = 64
 hidden_layers = 3
 nn_input_dim = 3
 
-N =30
+N =20
 dt = 0.5
 T = dt * N
 nx = 3  # Represents [x, y, theta] (position/heading); state X is 6-D ([pos; vel])
@@ -119,17 +119,14 @@ def entropy(p):
 
 def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     """
-    Set up and solve the MPC optimization problem.
-    
-    The main objective is to reduce uncertainty (i.e. minimize the final entropy
-    of the belief distribution) while satisfying the kinematic, control, and 
-    collision-avoidance constraints.
+    Set up and solve the MPC optimization problem with an added objective to attract
+    the agent towards low-entropy trees when entropy reduction is insufficient.
     """
     # --- Basic Dimensions ---
     nx = 3                   # Split factor: state is 2*nx (6-D) and control is nx (3-D)
-    n_state = nx * 2         # 6-dimensional state: e.g. [x, y, theta, vx, vy, omega]
-    n_control = nx           # 3-dimensional control: e.g. [ax, ay, alpha]
-        # --- Create the Optimization Problem ---
+    n_state = nx * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
+    n_control = nx           # 3-dimensional control: [ax, ay, alpha]
+    # --- Create the Optimization Problem ---
     opti = ca.Opti()
     F_ = kin_model()  # kinematic model function
 
@@ -138,7 +135,6 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     U = opti.variable(n_control, steps)
     
     # Parameter vector: initial state and tree beliefs.
-    # (Removed the unused entropy_horizon; dimension is now n_state + num_trees)
     num_trees = trees.shape[0]
     P0 = opti.parameter(n_state + num_trees)
     X0 = P0[: n_state]
@@ -148,13 +144,13 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     
     # Convert tree positions to a CasADi DM.
     trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
-    
+
     # --- Weights and Safety Parameters ---
-    w_control = 1e-2         # Control effort weight
-    w_ang = 1e-3        # Angular control weight
-    w_entropy = 1e0      # Weight for the final entropy (reduce uncertainty)
-    w_g_k = 1e1 
-    safe_distance = 1e0    # Safety margin (meters)
+    w_control = 1e-7         # Control effort weight
+    w_ang = 1e-8             # Angular control weight
+    w_entropy = 1e0          # Weight for final entropy
+    w_attract = 1e-4        # Weight for low-entropy attraction (tuned parameter)
+    safe_distance = 1e0      # Safety margin (meters)
 
     # Initialize the objective.
     obj = 0
@@ -164,11 +160,10 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
 
     # --- Loop Over the Prediction Horizon ---
     for i in range(steps):
-        # --- State and Input Bounds ---
-        opti.subject_to(opti.bounded(lb[0] - 3.5 , X[0, i + 1], ub[0] + 3.5))
-        opti.subject_to(opti.bounded(lb[1] - 3.5 , X[1, i + 1], ub[1] + 3.5))
-
-        opti.subject_to(opti.bounded(- 6*np.pi , X[2, i + 1], +  6*np.pi))
+        # State and Input Bounds
+        opti.subject_to(opti.bounded(lb[0] - 3.5, X[0, i + 1], ub[0] + 3.5))
+        opti.subject_to(opti.bounded(lb[1] - 3.5, X[1, i + 1], ub[1] + 3.5))
+        opti.subject_to(opti.bounded(-6*np.pi, X[2, i + 1], 6*np.pi))
         opti.subject_to(opti.bounded(-5.0, X[3, i + 1], 5.0))
         opti.subject_to(opti.bounded(-5.0, X[4, i + 1], 5.0))
         opti.subject_to(opti.bounded(-3.14/20, X[5, i + 1], 3.14/20))
@@ -177,17 +172,18 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         
         opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
         
+        # Control effort regularization (uncomment if needed)
+        obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
+        
         # --- Collision Avoidance Constraint ---
         # Ensure the robot remains at least safe_distance away from every tree.
         delta = X[:2, i+1] - trees_dm.T  # (2 x num_trees)
         # Squared distances for each tree
         sq_dists = ca.diag(ca.mtimes(delta.T, delta))
         # The closest tree must be at least safe_distance away.
-        #opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
+        opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
 
-        # --- Control Effort Regularization ---
-        #obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
-    
+    # --- Neural Network Predictions & Belief Updates ---
     nn_batch = []
     for i in range(trees_dm.shape[0]):
         # Ensure the robot remains at least safe_distance away from every tree.
@@ -197,29 +193,38 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         nn_batch.append(ca.horzcat(delta.T, heading.T))
 
     g_out = g_nn(ca.vcat([*nn_batch]))
-    print(g_out.shape)
     z_k = ca.fmax(g_out, 0.5)  # threshold the NN output
 
     for i in range(steps):
         lambda_next = bayes(lambda_evol[-1], z_k[i::steps])
         lambda_evol.append(lambda_next)
     
-    # Penalize the final entropy to promote uncertainty reduction.
-    #obj += w_g_k * - ca.sum1( entropy(lambda_evol[0]) * (z_k[steps-1::steps]))
+    # --- Entropy Minimization Objective ---
     entropy_value = 100*ca.sum1(entropy(ca.vcat(*[lambda_evol[1:]])) - entropy(ca.vcat(*[lambda_evol[:-1]])))/num_trees
     obj += w_entropy * entropy_value
-    #Set the overall objective.
+
+    # --- Attraction to Low-Entropy Trees ---
+    entropy_0 = entropy(lambda_0)  # Initial entropy per tree
+    attract_term = 0
+    epsilon_dist = 1e-3  # Avoid division by zero
+    
+    dist_weights = ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1] )**2) + epsilon_dist) for i in range(steps)])
+    attract_term = ca.sum1(ca.vcat([entropy_0 for i in range(steps)])/dist_weights.T)
+   
+    obj += -w_attract * attract_term  # Negative weight to maximize attraction
+
+    # --- Solve the Optimization ---
     opti.minimize(obj)
     
     # --- Solver Options and Solve ---
     options = {
         "ipopt": {
-            "tol": 1e-4,
+            "tol": 1e-2,
             "warm_start_init_point": "yes",
             "hessian_approximation": "limited-memory",
             "print_level": 5,
             "sb": "no",
-            "mu_strategy": "adaptive",
+            "mu_strategy": "monotone",
             "max_iter": 3000
         }
     }
