@@ -146,11 +146,11 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
 
     # --- Weights and Safety Parameters ---
-    w_control = 1e-7         # Control effort weight
-    w_ang = 1e-8             # Angular control weight
-    w_entropy = 1e0          # Weight for final entropy
-    w_attract = 1e-4        # Weight for low-entropy attraction (tuned parameter)
-    safe_distance = 1e0      # Safety margin (meters)
+    w_control = 1e-3         # Control effort weight
+    w_ang = 1e-6             # Angular control weight
+    w_entropy = 1e0         # Weight for final entropy
+    w_attract = 5.0        # Weight for low-entropy attraction (tuned parameter)
+    safe_distance = 1.0      # Safety margin (meters)
 
     # Initialize the objective.
     obj = 0
@@ -166,9 +166,9 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         opti.subject_to(opti.bounded(-6*np.pi, X[2, i + 1], 6*np.pi))
         opti.subject_to(opti.bounded(-5.0, X[3, i + 1], 5.0))
         opti.subject_to(opti.bounded(-5.0, X[4, i + 1], 5.0))
-        opti.subject_to(opti.bounded(-3.14/20, X[5, i + 1], 3.14/20))
-        opti.subject_to(opti.bounded(-3.0, U[0:2, i], 3.0))
-        opti.subject_to(opti.bounded(-3.14/10, U[2, i], 3.14/10))
+        opti.subject_to(opti.bounded(-3.14/4, X[5, i + 1], 3.14/4))
+        opti.subject_to(opti.bounded(-20.0, U[0:2, i], 20.0))
+        opti.subject_to(opti.bounded(-3.14/2, U[2, i], 3.14/2))
         
         opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
         
@@ -177,7 +177,7 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         
         # --- Collision Avoidance Constraint ---
         # Ensure the robot remains at least safe_distance away from every tree.
-        delta = X[:2, i+1] - trees_dm.T  # (2 x num_trees)
+        delta = X[:2, i+1] - trees_dm.T
         # Squared distances for each tree
         sq_dists = ca.diag(ca.mtimes(delta.T, delta))
         # The closest tree must be at least safe_distance away.
@@ -200,18 +200,10 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         lambda_evol.append(lambda_next)
     
     # --- Entropy Minimization Objective ---
-    entropy_value = 100*ca.sum1(entropy(ca.vcat(*[lambda_evol[1:]])) - entropy(ca.vcat(*[lambda_evol[:-1]])))/num_trees
-    obj += w_entropy * entropy_value
-
-    # --- Attraction to Low-Entropy Trees ---
-    entropy_0 = entropy(lambda_0)  # Initial entropy per tree
-    attract_term = 0
     epsilon_dist = 1e-3  # Avoid division by zero
-    
-    dist_weights = ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1] )**2) + epsilon_dist) for i in range(steps)])
-    attract_term = ca.sum1(ca.vcat([entropy_0 for i in range(steps)])/dist_weights.T)
-   
-    obj += -w_attract * attract_term  # Negative weight to maximize attraction
+    dist_vector = ca.sum1(ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1] )**2) + epsilon_dist -1) for i in range(steps)]).T)
+    entropy_value = ca.sum1((entropy(lambda_evol[-1]) - entropy(lambda_evol[0]))) * (w_entropy + w_attract/dist_vector)
+    obj += entropy_value
 
     # --- Solve the Optimization ---
     opti.minimize(obj)
@@ -219,7 +211,7 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     # --- Solver Options and Solve ---
     options = {
         "ipopt": {
-            "tol": 1e-2,
+            "tol": 5*1e-1,
             "warm_start_init_point": "yes",
             "hessian_approximation": "limited-memory",
             "print_level": 5,
@@ -355,7 +347,7 @@ def run_simulation():
 
         mpciter += 1
         print(entropy_k)
-        if entropy_k < 1.5:
+        if entropy_k < 1.0:
             break
 
     return all_trajectories, entropy_history, lambda_history, durations, g_nn, trees_pos, lb, ub
