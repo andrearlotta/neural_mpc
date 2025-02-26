@@ -14,11 +14,9 @@ import tf
 import tf.transformations as tf_trans
 import message_filters
 
-def weight_value(n_elements, mean_score, midpoint=10, steepness=3):
+def weight_value(n_elements, mean_score, midpoint=5, steepness=.25):
     # Sigmoidal weighting based on number of elements
-    weight = 1 / (1 + np.exp(-steepness * (n_elements - midpoint)))
-    
-    return weight * mean_score + (1 - weight) * 0.5
+    return  (mean_score-0.5) * (0.5+0.5 *np.tanh(steepness* (n_elements-midpoint))) + 0.5
 
 class DataAssociationNode:
     def __init__(self):
@@ -155,11 +153,24 @@ class DataAssociationNode:
 
         associated_fruits = self.associate_fruits_to_trees(transformed_fruit_positions)
 
+        # Get drone position in the map frame (assuming drone frame is "base_link")
+        try:
+            (drone_trans, drone_rot) = self.tf_listener.lookupTransform('map', 'drone_base_link', rospy.Time())
+            drone_x, drone_y = drone_trans[0], drone_trans[1]
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn("Could not get drone position, skipping distance check.")
+            drone_x, drone_y = None, None
         tree_scores = np.ones(len(self.tree_poses)) * 0.5
+        # Update tree scores only if the drone is close enough (<7.5m)
         for i, fruits in associated_fruits.items():
-            if fruits:
-                fruit_indices = np.where((transformed_fruit_positions[:, None] == fruits).all(-1).any(-1))[0]
-                tree_scores[i] = weight_value(len(fruit_indices), np.mean([fruit_scores[j] for j in fruit_indices]))
+            if fruits and drone_x is not None:
+                tree_x, tree_y = self.tree_poses[i]
+                distance = np.sqrt((drone_x - tree_x)**2 + (drone_y - tree_y)**2)
+                if distance < 8:
+                    # Get indices of fruits corresponding to this tree
+                    fruit_indices = np.where((transformed_fruit_positions[:, None] == fruits).all(-1).any(-1))[0]
+                    tree_scores[i] = weight_value(len(fruit_indices), np.mean([fruit_scores[j] for j in fruit_indices]))
+
 
         # Publish tree scores
         scores_msg = Float32MultiArray()
