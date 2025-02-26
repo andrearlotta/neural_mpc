@@ -19,8 +19,8 @@ hidden_size = 64
 hidden_layers = 3
 nn_input_dim = 3
 
-N =20
-dt = 0.5
+N =10
+dt = 0.25
 T = dt * N
 nx = 3  # Represents [x, y, theta] (position/heading); state X is 6-D ([pos; vel])
 
@@ -146,9 +146,9 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
 
     # --- Weights and Safety Parameters ---
-    w_control = 1e-3         # Control effort weight
-    w_ang = 1e-6             # Angular control weight
-    w_entropy = 1e0         # Weight for final entropy
+    w_control = 1e-2         # Control effort weight
+    w_ang = 1e-7             # Angular control weight
+    w_entropy = 10.0         # Weight for final entropy
     w_attract = 5.0        # Weight for low-entropy attraction (tuned parameter)
     safe_distance = 1.0      # Safety margin (meters)
 
@@ -167,8 +167,8 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         opti.subject_to(opti.bounded(-5.0, X[3, i + 1], 5.0))
         opti.subject_to(opti.bounded(-5.0, X[4, i + 1], 5.0))
         opti.subject_to(opti.bounded(-3.14/4, X[5, i + 1], 3.14/4))
-        opti.subject_to(opti.bounded(-20.0, U[0:2, i], 20.0))
-        opti.subject_to(opti.bounded(-3.14/2, U[2, i], 3.14/2))
+        opti.subject_to(opti.bounded(-10.0, U[0:2, i], 10.0))
+        opti.subject_to(opti.bounded(-3.14, U[2, i], 3.14))
         
         opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
         
@@ -200,9 +200,9 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         lambda_evol.append(lambda_next)
     
     # --- Entropy Minimization Objective ---
-    epsilon_dist = 1e-3  # Avoid division by zero
-    dist_vector = ca.sum1(ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1] )**2) + epsilon_dist -1) for i in range(steps)]).T)
-    entropy_value = ca.sum1((entropy(lambda_evol[-1]) - entropy(lambda_evol[0]))) * (w_entropy + w_attract/dist_vector)
+    epsilon_dist = 1e-3 # Avoid division by zero
+    dist_vector = ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1] )**2) + epsilon_dist)]).T
+    entropy_value = w_entropy *ca.sum1(entropy(lambda_evol[-1]) - entropy(lambda_evol[0]))  - w_attract*ca.sum1((1.0-2.0*(lambda_evol[0]-0.5))**2/dist_vector)
     obj += entropy_value
 
     # --- Solve the Optimization ---
