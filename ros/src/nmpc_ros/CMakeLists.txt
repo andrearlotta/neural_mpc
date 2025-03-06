@@ -76,7 +76,6 @@ catkin_install_python(PROGRAMS
   nmpc_ros_node.py
   data_association_node.py
   baseline_node.py
-  baseline_2_node.py
   nmpc_ros_node_decay.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
