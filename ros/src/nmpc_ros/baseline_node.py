@@ -30,9 +30,10 @@ class PIDController:
 class Logger:
     def __init__(self, trajectory_type, filename='performance_metrics.csv'):
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        timestamp = time.strftime("%Y%m%d_%H%M%S")  # Current timestamp
+        self.timestamp = time.strftime("%Y%m%d_%H%M%S")  # Current timestamp
         # Create a filename that includes trajectory type and timestamp
-        self.filename = os.path.join(os.path.join(script_dir, "baselines"),f"{trajectory_type}_{timestamp}_{filename}")
+        self.filename = os.path.join(os.path.join(script_dir, "baselines"),
+                                     f"{trajectory_type}_{self.timestamp}_{filename}")
 
         self.csv_file = open(self.filename, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
@@ -42,6 +43,13 @@ class Logger:
         self.performance_data = []
         self.start_time = None
         self.total_distance = 0
+
+        # Open an additional CSV file to log injected velocity commands.
+        self.velocity_filename = os.path.join(os.path.join(script_dir, "baselines"),
+                                              f"{trajectory_type}_{self.timestamp}_velocity_commands.csv")
+        self.velocity_csv_file = open(self.velocity_filename, 'w', newline='')
+        self.velocity_csv_writer = csv.writer(self.velocity_csv_file)
+        self.velocity_csv_writer.writerow(['Time (s)', 'Tag', 'x_velocity', 'y_velocity', 'yaw_velocity'])
 
     def record_performance(self, wp_index, execution_time, distance, wp_to_wp_time, entropy_reduction=None, position=None):
         log_entry = {
@@ -56,13 +64,18 @@ class Logger:
         self.csv_writer.writerow([wp_index, position, execution_time, distance, wp_to_wp_time, entropy_reduction])
         self.csv_file.flush()
 
+    def log_velocity(self, x_vel, y_vel, yaw_vel, tag):
+        current_time = time.time() - self.start_time if self.start_time is not None else 0
+        self.velocity_csv_writer.writerow([current_time, tag, x_vel, y_vel, yaw_vel])
+        self.velocity_csv_file.flush()
+
     def start_logging(self):
         self.start_time = time.time()
 
     def add_distance(self, distance):
         self.total_distance += distance
 
-    def finalize_performance_metrics(self):
+    def finalize_performance_metrics(self, final_entropy=None, final_bayes=None):
         total_time = time.time() - self.start_time if self.start_time is not None else 0
         # Compute average waypoint-to-waypoint time if available.
         wp_times = [data['Waypoint-to-Waypoint Time'] for data in self.performance_data]
@@ -72,7 +85,12 @@ class Logger:
         self.csv_writer.writerow(['Total Execution Time (s)', total_time])
         self.csv_writer.writerow(['Total Distance (m)', self.total_distance])
         self.csv_writer.writerow(['Average Waypoint-to-Waypoint Time (s)', avg_wp_time])
+        if final_entropy is not None:
+            self.csv_writer.writerow(['Final Entropy', final_entropy])
+        if final_bayes is not None:
+            self.csv_writer.writerow(['Final Bayes Values', final_bayes])
         self.csv_file.close()
+        self.velocity_csv_file.close()
 
         print(f"Total Execution Time: {total_time:.2f} s")
         print(f"Total Distance: {self.total_distance:.2f} m")
@@ -80,9 +98,9 @@ class Logger:
 
 
 class TrajectoryGenerator:
-    def __init__(self):
+    def __init__(self, trajectory_type):
         # Get trajectory mode and initialize Logger only once.
-        trajectory_type = rospy.get_param('~trajectory_mode', 'tree_to_tree')
+        self.trajectory_type = trajectory_type
         self.logger = Logger(trajectory_type)
         
         # New history lists for storing poses and bayesian (lambda) values
@@ -124,20 +142,8 @@ class TrajectoryGenerator:
 
     def calculate_entropy(self, lambda_values):
         """Simple entropy calculation based on lambda values."""
-        # Using base-2 logarithm.
         lambda_values = np.fmin(lambda_values, 1 - 1e-6)
         return -np.sum(lambda_values * np.log2(lambda_values) + (1 - lambda_values) * np.log2(1 - lambda_values))
-
-    def polynomial_time_scaling_3rd_order(self, x0, xT, v0, vT, T):
-        A = np.array([
-            [0,      0,   0, 1],
-            [T**3, T**2,   T, 1],
-            [0,      0,   1, 0],
-            [3*T**2, 2*T, 1, 0]
-        ])
-        b = np.array([x0, xT, v0, vT])
-        coeffs = np.linalg.solve(A, b)
-        return coeffs[::-1]
 
     def normalize_angle(self, angle):
         while angle > math.pi:
@@ -151,7 +157,6 @@ class TrajectoryGenerator:
         Compute a motion vector for the drone that steers it toward the goal but 
         deviates tangentially when near obstacles (trees).
         """
-        # Attractive vector: from current to goal.
         att_vector = goal_position - current_position
         att_magnitude = np.linalg.norm(att_vector)
         if att_magnitude < 1e-6:
@@ -169,12 +174,10 @@ class TrajectoryGenerator:
             diff = current_position - tree
             d = np.linalg.norm(diff)
             if d < ray_activation:
-                # Compute angle between the attractive direction and the direction away from the tree.
                 angle = np.arccos(np.clip(np.dot(att_unit, -diff / d), -1.0, 1.0))
-                if angle < np.pi / 4:  # less than 45 degrees
+                if angle < np.pi / 4:
                     unsafe = True
                     u = diff / d
-                    # Two tangent directions to the avoidance circle.
                     tangent1 = np.array([-u[1], u[0]])
                     tangent2 = np.array([u[1], -u[0]])
                     chosen_tangent = tangent1 if np.dot(tangent1, att_unit) > np.dot(tangent2, att_unit) else tangent2
@@ -190,12 +193,10 @@ class TrajectoryGenerator:
             return combined / combined_norm
 
     def calculate_attractive_force(self, current_position, goal_position):
-        """Calculate the attractive force toward the goal."""
         distance = np.linalg.norm(goal_position - current_position)
         return self.attractive_gain * (goal_position - current_position) / distance
 
     def calculate_repulsive_force(self, current_position, tree_positions):
-        """Calculate the repulsive force from all trees (legacy method)."""
         repulsive_force = np.zeros(2)
         for tree in tree_positions:
             tree = np.array(tree)
@@ -217,11 +218,10 @@ class TrajectoryGenerator:
         while not rospy.is_shutdown():
             state = np.array(self.bridge.update_robot_state()).flatten()
             self.x, self.y, self.theta = state
-            # Record the current pose and bayesian (lambda) values history.
             self.pose_history.append([self.x, self.y, self.theta])
             self.lambda_history.append(self.lambda_values.copy())
             self.entropy_history.append(self.calculate_entropy(self.lambda_values))
-            self.time_history.append( time.time() - self.logger.start_time)
+            self.time_history.append(time.time() - self.logger.start_time)
             
             current_position = np.array([self.x, self.y])
             if np.linalg.norm(current_position - goal_position) < tolerance:
@@ -238,10 +238,23 @@ class TrajectoryGenerator:
             x_output = self.pid_controller_x.update(velocity[0])
             y_output = self.pid_controller_y.update(velocity[1])
             yaw_output = self.pid_controller_yaw.update(yaw_error)
+            
+            # Log the injected velocities.
+            self.logger.log_velocity(x_output, y_output, yaw_output, tag="move_to_waypoint")
 
             cmd_pose = np.array([self.x + x_output, self.y + y_output, self.theta + yaw_output]).reshape(-1, 1)
             self.bridge.pub_data({"cmd_pose": cmd_pose})
 
+            if observe:
+                new_data = self.bridge.get_data()
+                while new_data["tree_scores"] is None:
+                    new_data = self.bridge.get_data()
+                z_k = new_data["tree_scores"].flatten()
+    
+                self.lambda_values = self.bayes(self.lambda_values, z_k)
+                self.bridge.pub_data({
+                    "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
+                })
             self.rate.sleep()
 
         execution_time = time.time() - start_time
@@ -256,27 +269,21 @@ class TrajectoryGenerator:
         center_x, center_y = self.tree_positions[tree_idx]
         start_time = time.time()
 
-        # Get initial position and calculate the starting angle.
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         phi = math.atan2(self.y - center_y, self.x - center_x)
         radius = np.sqrt((self.x - center_x)**2 + (self.y - center_y)**2)
         delta_phi = 3 * math.pi / 180  # Angular increment (in radians)
 
-        while (time.time() - start_time) < self.max_observe_time:
-            if self.lambda_values[tree_idx] >= 1.0:
-                print(f"Tree {tree_idx} confidence saturated: λ = {self.lambda_values[tree_idx]:.2f}")
-                break
-
+        while (time.time() - start_time) < self.max_observe_time and self.lambda_values[tree_idx] < 1.0:
             desired_x = center_x + radius * math.cos(phi)
             desired_y = center_y + radius * math.sin(phi)
             desired_theta = phi + math.pi  # Face the tree center
 
             self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
-            # Record the current pose and bayesian (lambda) values at this observation step.
             self.pose_history.append([self.x, self.y, self.theta])
             self.lambda_history.append(self.lambda_values.copy())
             self.entropy_history.append(self.calculate_entropy(self.lambda_values))
-            self.time_history.append( time.time() - self.logger.start_time)
+            self.time_history.append(time.time() - self.logger.start_time)
 
             x_error = desired_x - self.x
             y_error = desired_y - self.y
@@ -285,16 +292,18 @@ class TrajectoryGenerator:
             x_output = self.pid_controller_x.update(x_error)
             y_output = self.pid_controller_y.update(y_error)
             yaw_output = self.pid_controller_yaw.update(yaw_error)
+            
+            # Log the injected velocities for tree observation.
+            self.logger.log_velocity(x_output, y_output, yaw_output, tag=f"observe_tree_{tree_idx}")
 
             cmd_pose = np.array([self.x + x_output, self.y + y_output, self.theta + yaw_output]).reshape(-1, 1)
             self.bridge.pub_data({"cmd_pose": cmd_pose})
 
-            # Update lambda using sensor data.
             new_data = self.bridge.get_data()
             while new_data["tree_scores"] is None:
                 new_data = self.bridge.get_data()
             z_k = new_data["tree_scores"]
-            self.lambda_values[tree_idx] = self.bayes(self.lambda_values[tree_idx], z_k[tree_idx])
+            self.lambda_values[tree_idx] = self.bayes(self.lambda_values[tree_idx].flatten(), z_k[tree_idx].flatten())
             self.bridge.pub_data({
                 "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
             })
@@ -312,10 +321,6 @@ class TrajectoryGenerator:
         return numerator / denominator
 
     def generate_mower_trajectory(self, spacing=1.0, margin=1.0):
-        """
-        Original lawn mower (back-and-forth) trajectory that covers the entire
-        area containing the trees.
-        """
         if len(self.tree_positions) == 0:
             return []
 
@@ -325,7 +330,6 @@ class TrajectoryGenerator:
         y_max = np.max(self.tree_positions[:, 1]) + margin
 
         waypoints = []
-        # Generate rows along the y-axis with the specified spacing.
         y_vals = np.arange(y_min, y_max, spacing)
         for i, y in enumerate(y_vals):
             if i % 2 == 0:
@@ -337,18 +341,13 @@ class TrajectoryGenerator:
         return waypoints
 
     def generate_mower_path_between_rows(self, margin=1.0):
-        """
-        New mower path generator that attempts to fly between the rows of trees.
-        It clusters trees by their y coordinate and computes gaps between rows.
-        """
         if len(self.tree_positions) == 0:
             return []
-
-        # Sort trees by their y coordinate.
+        current_pos = np.array(self.bridge.update_robot_state()).flatten()[:2]
         sorted_trees = self.tree_positions[self.tree_positions[:, 1].argsort()]
         rows = []
         current_row = [sorted_trees[0]]
-        threshold = 0.5  # Adjust based on expected row spacing
+        threshold = 0.5
         for tree in sorted_trees[1:]:
             if abs(tree[1] - current_row[-1][1]) < threshold:
                 current_row.append(tree)
@@ -358,11 +357,9 @@ class TrajectoryGenerator:
         if current_row:
             rows.append(np.array(current_row))
 
-        # Fallback if only one row is detected.
         if len(rows) < 2:
             return self.generate_mower_trajectory(margin=margin)
 
-        # Compute gap y-values between consecutive rows.
         gaps = []
         for i in range(len(rows) - 1):
             y_avg_1 = np.mean(rows[i][:, 1])
@@ -372,32 +369,36 @@ class TrajectoryGenerator:
 
         x_min = np.min(self.tree_positions[:, 0]) - margin
         x_max = np.max(self.tree_positions[:, 0]) + margin
+
         waypoints = []
-        for i, gap in enumerate(gaps):
-            if i % 2 == 0:
-                waypoints.append([x_min, gap])
-                waypoints.append([x_max, gap])
-            else:
-                waypoints.append([x_max, gap])
-                waypoints.append([x_min, gap])
+        waypoints.append(current_pos)
+        robot_x = current_pos[0]
+        robot_y = current_pos[1]
+        if abs(robot_x - x_min) <= abs(robot_x - x_max):
+            start_side = x_min
+        else:
+            start_side = x_max
+
+        waypoints.append([start_side, robot_y])
+        current_side = start_side
+        for gap in gaps:
+            waypoints.append([current_side, gap])
+            other_side = x_max if current_side == x_min else x_min
+            waypoints.append([other_side, gap])
+            current_side = other_side
+
         return waypoints
 
     def generate_tree_to_tree_path(self):
-        """
-        Mower-like path generator that creates an ordered list of tree indices.
-        Prioritizes trees on the same row (based on y-coordinate) before resorting
-        to a full nearest-neighbor search.
-        """
         if len(self.tree_positions) == 0:
             return []
 
         tree_indices = list(range(len(self.tree_positions)))
         current_pos = np.array([self.x, self.y])
         path = []
-        same_row_tol = 1e-2  # Tolerance for considering trees to be on the same row
+        same_row_tol = 1e-2
 
         while tree_indices:
-            # Filter for trees on the same row as current_pos.
             same_row_indices = [
                 idx for idx in tree_indices 
                 if abs(self.tree_positions[idx][1] - current_pos[1]) < same_row_tol
@@ -421,10 +422,6 @@ class TrajectoryGenerator:
         return path
 
     def get_bayes_value(self, position):
-        """
-        Placeholder helper: returns the lambda value of the tree nearest to the given position.
-        For mower waypoints far from any tree, a default value of 0.5 is returned.
-        """
         if len(self.tree_positions) == 0:
             return 0.5
         distances = np.linalg.norm(self.tree_positions - np.array(position), axis=1)
@@ -432,7 +429,6 @@ class TrajectoryGenerator:
         return self.lambda_values[nearest_index]
 
     def plot_path(self, path, tree_positions):
-        """Plot the trees and trajectory path using Plotly."""
         tree_x = [tree[0] for tree in tree_positions]
         tree_y = [tree[1] for tree in tree_positions]
         path_x = [point[0] for point in path]
@@ -440,7 +436,6 @@ class TrajectoryGenerator:
 
         fig = go.Figure()
 
-        # Plot trees.
         fig.add_trace(go.Scatter(
             x=tree_x, y=tree_y,
             mode='markers',
@@ -448,7 +443,6 @@ class TrajectoryGenerator:
             name='Trees'
         ))
 
-        # Plot trajectory.
         fig.add_trace(go.Scatter(
             x=path_x, y=path_y,
             mode='lines+markers',
@@ -456,7 +450,6 @@ class TrajectoryGenerator:
             name='Trajectory'
         ))
 
-        # Plot start and end points.
         fig.add_trace(go.Scatter(
             x=[path_x[0]], y=[path_y[0]],
             mode='markers',
@@ -470,7 +463,6 @@ class TrajectoryGenerator:
             name='End'
         ))
 
-        # Annotate trees.
         for i, tree in enumerate(tree_positions):
             fig.add_annotation(
                 x=tree[0], y=tree[1],
@@ -488,14 +480,41 @@ class TrajectoryGenerator:
 
         fig.show()
 
+    def save_plot_data_csv(self, trajectory_type):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        baselines_dir = os.path.join(script_dir, "baselines")
+        if not os.path.exists(baselines_dir):
+            os.makedirs(baselines_dir)
+        filename = os.path.join(baselines_dir, f"{trajectory_type}_{self.logger.timestamp}_plot_data.csv")
+        with open(filename, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            tree_positions_flat = self.tree_positions.flatten().tolist()
+            writer.writerow(["tree_positions"] + tree_positions_flat)
+            
+            header = ["time", "x", "y", "theta", "entropy"]
+            if len(self.lambda_history) > 0:
+                num_trees = len(self.lambda_history[0])
+                header += [f"lambda_{i}" for i in range(num_trees)]
+            writer.writerow(header)
+            
+            for i in range(len(self.time_history)):
+                time_val = self.time_history[i]
+                x, y, theta = self.pose_history[i]
+                entropy = self.entropy_history[i]
+                lambda_vals = list(self.lambda_history[i])
+                row = [time_val, x, y, theta, entropy] + lambda_vals
+                writer.writerow(row)
+        print(f"Plot data saved to {filename}")
+    
     def plot_animated_trajectory_and_entropy_2d(self, trajectory_type):
-        # Extract trajectory data
+        self.save_plot_data_csv(trajectory_type)
+        
         x_trajectory = np.array([traj[0] for traj in self.pose_history])
         y_trajectory = np.array([traj[1] for traj in self.pose_history])
-        theta_trajectory = np.array([traj[2] for traj in self.pose_history])  # Drone orientation (yaw)
+        theta_trajectory = np.array([traj[2] for traj in self.pose_history])
         self.pose_history = np.array(self.pose_history)
         lambda_history = np.array(self.lambda_history)
-        time_history = np.array(self.time_history)  # Assumi che time_history sia una lista di tempi
+        time_history = np.array(self.time_history)
 
         x_min = np.min(self.tree_positions[:, 0])
         x_max = np.max(self.tree_positions[:, 0])
@@ -503,15 +522,103 @@ class TrajectoryGenerator:
         y_max = np.max(self.tree_positions[:, 1])
         lb, ub = [x_min, y_min], [x_max, y_max]
 
-        # Create a subplot with 1 row and 2 columns
-        fig = make_subplots(
+        fig_static = make_subplots(
             rows=1, cols=2,
             column_widths=[0.7, 0.3],
             specs=[[{"type": "scatter"}, {"type": "scatter"}]]
         )
 
-        # Add an (initially empty) trace for the drone trajectory.
-        fig.add_trace(
+        fig_static.add_trace(
+            go.Scatter(
+                x=x_trajectory,
+                y=y_trajectory,
+                mode="lines+markers",
+                name="Drone Trajectory",
+                line=dict(color="orange", width=4),
+                marker=dict(size=5, color="orange")
+            ),
+            row=1, col=1
+        )
+
+        for i in range(self.tree_positions.shape[0]):
+            fig_static.add_trace(
+                go.Scatter(
+                    x=[self.tree_positions[i, 0]],
+                    y=[self.tree_positions[i, 1]],
+                    mode="markers+text",
+                    marker=dict(
+                        size=10,
+                        color=[2 * (sampled_lambda_history[-1][i] - 0.5)],
+                        colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
+                        cmin=0,
+                        cmax=1,
+                        showscale=False
+                    ),
+                    name=f"Tree {i}: {lambda_history[-1][i]:.2f}",
+                    text=[str(i)],
+                    textposition="top center"
+                ),
+                row=1, col=1
+            )
+
+        fig_static.add_trace(
+            go.Scatter(
+                x=time_history,
+                y=self.entropy_history,
+                mode="lines+markers",
+                name="Sum of Entropies",
+                line=dict(color="blue", width=2),
+                marker=dict(size=5, color="blue")
+            ),
+            row=1, col=2
+        )
+
+        fig_static.update_layout(
+            title=f"Complete Drone Trajectory and Sum of Entropies: {trajectory_type} baseline ",
+            xaxis=dict(title="X Position", range=[lb[0] - 3, ub[0] + 3]),
+            yaxis=dict(title="Y Position", range=[lb[1] - 3, ub[1] + 3]),
+            xaxis2=dict(title="Time (s)"),
+            yaxis2=dict(title="Sum of Entropies"),
+        )
+
+        arrow_length = 0.5
+        arrow_annotations = []
+        for x0, y0, theta in zip(x_trajectory, y_trajectory, theta_trajectory):
+            x1 = x0 + arrow_length * np.cos(theta)
+            y1 = y0 + arrow_length * np.sin(theta)
+            arrow_annotations.append(
+                go.layout.Annotation(
+                    x=x1,
+                    y=y1,
+                    xref="x", yref="y",
+                    ax=x0,
+                    ay=y0,
+                    axref="x", ayref="y",
+                    showarrow=True,
+                    arrowhead=3,
+                    arrowwidth=1.5,
+                    arrowcolor="orange"
+                )
+            )
+        fig_static.update_layout(annotations=arrow_annotations)
+        fig_static.show()
+
+        sample_rate = 10
+        sampled_indices = range(0, len(self.entropy_history), sample_rate)
+        sampled_time_history = time_history[sampled_indices]
+        sampled_entropy_history = np.array(self.entropy_history)[sampled_indices]
+        sampled_x_trajectory = x_trajectory[sampled_indices]
+        sampled_y_trajectory = y_trajectory[sampled_indices]
+        sampled_theta_trajectory = theta_trajectory[sampled_indices]
+        sampled_lambda_history = lambda_history[sampled_indices]
+
+        fig_animated = make_subplots(
+            rows=1, cols=2,
+            column_widths=[0.7, 0.3],
+            specs=[[{"type": "scatter"}, {"type": "scatter"}]]
+        )
+
+        fig_animated.add_trace(
             go.Scatter(
                 x=[],
                 y=[],
@@ -523,30 +630,28 @@ class TrajectoryGenerator:
             row=1, col=1
         )
 
-        # Add tree markers with text showing the tree number.
         for i in range(self.tree_positions.shape[0]):
-            fig.add_trace(
+            fig_animated.add_trace(
                 go.Scatter(
                     x=[self.tree_positions[i, 0]],
                     y=[self.tree_positions[i, 1]],
                     mode="markers+text",
                     marker=dict(
                         size=10,
-                        color="#FF0000",  # initial color (red)
-                        colorscale=[[0, "#FF0000"], [1, "#00FF00"]],  # red to green scale
+                        color="#FF0000",
+                        colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
                         cmin=0,
                         cmax=1,
                         showscale=False
                     ),
-                    name=f"Tree {i}: {lambda_history[0][i]:.2f}",
-                    text=[str(i)],        # Plot the tree number as text
+                    name=f"Tree {i}: {sampled_lambda_history[0][i]:.2f}",
+                    text=[str(i)],
                     textposition="top center"
                 ),
                 row=1, col=1
             )
 
-        # Add the sum of entropies plot to the second subplot.
-        fig.add_trace(
+        fig_animated.add_trace(
             go.Scatter(
                 x=[],
                 y=[],
@@ -558,11 +663,8 @@ class TrajectoryGenerator:
             row=1, col=2
         )
 
-        # Create frames for animation
         frames = []
-        annotation_list = []
-        for k in range(len(self.entropy_history)):
-            # Update tree markers with the current lambda values.
+        for k in range(len(sampled_entropy_history)):
             tree_data = []
             for i in range(self.tree_positions.shape[0]):
                 tree_data.append(
@@ -572,26 +674,22 @@ class TrajectoryGenerator:
                         mode="markers+text",
                         marker=dict(
                             size=10,
-                            # Simple linear mapping to set the color.
-                            color=[2 * (lambda_history[k][i] - 0.5)],
+                            color=[2 * (sampled_lambda_history[k][i] - 0.5)],
                             colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
                             cmin=0,
                             cmax=1,
                             showscale=False
                         ),
-                        name=f"Tree {i}: {lambda_history[k][i]:.2f}",
+                        name=f"Tree {i}: {sampled_lambda_history[k][i]:.2f}",
                         text=[str(i)],
                         textposition="top center"
                     )
                 )
 
-            # Update the entropy curves
-            sum_entropy_past = self.entropy_history[:k + 1]
-
-            # Compute drone trajectory arrows (orange) based on current orientation.
-            x_start_traj = x_trajectory[:k + 1]
-            y_start_traj = y_trajectory[:k + 1]
-            theta_traj = theta_trajectory[:k + 1]
+            sum_entropy_past = sampled_entropy_history[:k + 1]
+            x_start_traj = sampled_x_trajectory[:k + 1]
+            y_start_traj = sampled_y_trajectory[:k + 1]
+            theta_traj = sampled_theta_trajectory[:k + 1]
             x_end_traj = x_start_traj + 0.5 * np.cos(theta_traj)
             y_end_traj = y_start_traj + 0.5 * np.sin(theta_traj)
             list_of_actual_orientations = []
@@ -612,15 +710,13 @@ class TrajectoryGenerator:
                     )
                 )
                 list_of_actual_orientations.append(arrow)
-            annotation_list.append(list_of_actual_orientations.copy())
 
-            # Add a label to show the current time
             time_label = go.layout.Annotation(
                 dict(
-                    x=0.95,  # Posizione x (95% del grafico)
-                    y=0.95,  # Posizione y (95% del grafico)
+                    x=0.95,
+                    y=0.95,
                     xref="paper", yref="paper",
-                    text=f"Time: {time_history[k]:.2f} s",  # Mostra il tempo corrente
+                    text=f"Time: {sampled_time_history[k]:.2f} s",
                     showarrow=False,
                     font=dict(size=14, color="black"),
                     bgcolor="white",
@@ -629,21 +725,18 @@ class TrajectoryGenerator:
                 )
             )
 
-            # Create the frame with updated annotations
             frame = go.Frame(
                 data=[
-                    # Drone actual trajectory (orange)
                     go.Scatter(
-                        x=x_trajectory[:k + 1],
-                        y=y_trajectory[:k + 1],
+                        x=sampled_x_trajectory[:k + 1],
+                        y=sampled_y_trajectory[:k + 1],
                         mode="lines+markers",
                         line=dict(color="orange", width=4),
                         marker=dict(size=5, color="orange")
                     ),
-                    *tree_data,  # Updated tree markers
-                    # Past entropy
+                    *tree_data,
                     go.Scatter(
-                        x=time_history[:k + 1],  # Usa time_history come valori x
+                        x=sampled_time_history[:k + 1],
                         y=sum_entropy_past,
                         mode="lines+markers",
                         line=dict(color="blue", width=2),
@@ -651,19 +744,17 @@ class TrajectoryGenerator:
                     ),
                 ],
                 name=f"Frame {k}",
-                layout=dict(annotations=[*annotation_list[-1], time_label])  # Aggiungi annotazioni e label del tempo
+                layout=dict(annotations=[*list_of_actual_orientations, time_label])
             )
             frames.append(frame)
 
-        # Add frames to the figure.
-        fig.frames = frames
+        fig_animated.frames = frames
 
-        # Update layout with animation controls and slider.
-        fig.update_layout(
+        fig_animated.update_layout(
             title=f"Drone Trajectory and Sum of Entropies: {trajectory_type} baseline ",
             xaxis=dict(title="X Position", range=[lb[0] - 3, ub[0] + 3]),
             yaxis=dict(title="Y Position", range=[lb[1] - 3, ub[1] + 3]),
-            xaxis2=dict(title="Time (s)"),  # Aggiorna il titolo dell'asse x
+            xaxis2=dict(title="Time (s)"),
             yaxis2=dict(title="Sum of Entropies"),
             updatemenus=[
                 dict(
@@ -691,7 +782,7 @@ class TrajectoryGenerator:
                 "xanchor": "left",
                 "currentvalue": {
                     "font": {"size": 20},
-                    "prefix": "Frame:",
+                    "prefix": "Frame Time: ",
                     "visible": True,
                     "xanchor": "right"
                 },
@@ -707,10 +798,10 @@ class TrajectoryGenerator:
                             {
                                 "frame": {"duration": 50, "redraw": True},
                                 "mode": "immediate",
-                                "layout": {"annotations": f.layout.annotations}  # Update annotations for each frame
+                                "layout": {"annotations": f.layout.annotations}
                             }
                         ],
-                        "label": str(k),
+                        "label": f"{sampled_time_history[k]:.2f} s",
                         "method": "animate",
                     }
                     for k, f in enumerate(frames)
@@ -718,23 +809,20 @@ class TrajectoryGenerator:
             }]
         )
 
-        # Show and save the figure.
-        fig.show()
-        timestamp = time.strftime("%Y%m%d_%H%M%S")  # Current timestamp
-        # Create a filename that includes trajectory type and timestamp
-        filename = os.path.join(f"{trajectory_type}_{timestamp}_", "baseline_results.html")
-        fig.write_html(filename)
-
+        fig_animated.show()
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        filename = os.path.join(os.path.join(script_dir, "baselines"),
+                                f"{trajectory_type}_{self.logger.timestamp}_baseline_results.html")
+        fig_animated.write_html(filename)
+    
     def run_greedy_trajectory(self):
         """
         Greedy approach: iteratively choose the nearest candidate (based on a bayes value)
         from a combined list of mower waypoints and tree positions.
-        When within an observation threshold of a tree candidate, start the observation phase.
         """
         self.logger.start_logging()
         mower_path = self.generate_mower_trajectory(spacing=1.0, margin=1.0)
 
-        # Create candidate list with bayes values.
         candidates = []
         for i, waypoint in enumerate(mower_path):
             bayes = self.get_bayes_value(waypoint)
@@ -753,7 +841,6 @@ class TrajectoryGenerator:
                 'bayes': bayes
             })
 
-        # (Optional) visualize.
         self.plot_path(mower_path, self.tree_positions)
 
         total_time = 0
@@ -762,7 +849,6 @@ class TrajectoryGenerator:
         observation_distance_threshold = 3.0
 
         while candidates:
-            # Sort candidates by bayes value and distance.
             candidates.sort(key=lambda c: (c['bayes'], np.linalg.norm(np.array(c['position']) - current_pos)))
             next_candidate = candidates[0]
             target = np.array(next_candidate['position'])
@@ -789,8 +875,10 @@ class TrajectoryGenerator:
                                                position=self.tree_positions[target_index])
 
             candidates.pop(0)
-
-        self.logger.finalize_performance_metrics()
+        
+        final_entropy = self.calculate_entropy(self.lambda_values)
+        final_bayes = self.lambda_values.tolist()
+        self.logger.finalize_performance_metrics(final_entropy, final_bayes)
         print("Drone trajectory complete (greedy approach)")
 
     def run_between_rows_trajectory(self):
@@ -809,7 +897,7 @@ class TrajectoryGenerator:
         for i, waypoint in enumerate(mower_path):
             target_x, target_y = waypoint
             print(f"Moving to between-row waypoint {i}: ({target_x:.2f}, {target_y:.2f})")
-            wp_time, entropy_reduction = self.move_to_waypoint(target_x, target_y, tolerance=3, observe=True)
+            wp_time, entropy_reduction = self.move_to_waypoint(target_x, target_y, tolerance=0.1, observe=True)
             total_time += wp_time
             step_distance = np.linalg.norm(np.array(waypoint) - prev_point)
             total_distance += step_distance
@@ -817,8 +905,9 @@ class TrajectoryGenerator:
             prev_point = np.array(waypoint)
             self.logger.record_performance(i, wp_time, total_distance, wp_time, entropy_reduction, position=waypoint)
             
-
-        self.logger.finalize_performance_metrics()
+        final_entropy = self.calculate_entropy(self.lambda_values)
+        final_bayes = self.lambda_values.tolist()
+        self.logger.finalize_performance_metrics(final_entropy, final_bayes)
         print("Between-rows trajectory complete")
 
     def run_tree_to_tree_trajectory(self):
@@ -847,14 +936,14 @@ class TrajectoryGenerator:
             prev_point = tree_pos
             self.logger.record_performance(f"T{idx}", wp_time, total_distance, wp_time, position=tree_pos)
             
-
             print(f"Observing tree {idx}...")
             observe_time = self.observe_tree(idx)
             total_time += observe_time
             self.logger.record_performance(f"T_obs_{idx}", observe_time, total_distance, observe_time, position=tree_pos)
             
-
-        self.logger.finalize_performance_metrics()
+        final_entropy = self.calculate_entropy(self.lambda_values)
+        final_bayes = self.lambda_values.tolist()
+        self.logger.finalize_performance_metrics(final_entropy, final_bayes)
         print("Tree-to-tree trajectory complete")
 
     def run(self):
@@ -862,10 +951,10 @@ class TrajectoryGenerator:
         Main method that runs the trajectory generation based on the specified mode.
         After completion, the trajectory and entropy reduction are plotted.
         """
-        mode = rospy.get_param('~trajectory_mode', 'tree_to_tree')
-        if mode == "between_rows":
+
+        if self.trajectory_type == "between_rows":
             self.run_between_rows_trajectory()
-        elif mode == "tree_to_tree":
+        elif self.trajectory_type == "tree_to_tree":
             self.run_tree_to_tree_trajectory()
         else:
             self.run_greedy_trajectory()
@@ -875,7 +964,8 @@ class TrajectoryGenerator:
 
 if __name__ == '__main__':
     try:
-        trajectory_generator = TrajectoryGenerator()
+        mode = rospy.get_param('~trajectory_mode', 'between_rows')
+        trajectory_generator = TrajectoryGenerator(mode)
         trajectory_generator.run()
     except rospy.ROSInterruptException:
         pass
