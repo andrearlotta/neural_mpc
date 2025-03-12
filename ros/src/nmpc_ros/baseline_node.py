@@ -110,13 +110,16 @@ class TrajectoryGenerator:
         self.time_history = []
 
         # Initialize PID controllers.
-        self.pid_controller_x = PIDController(kp=0.1, kd=0.1)
-        self.pid_controller_y = PIDController(kp=0.1, kd=0.1)
-        self.pid_controller_yaw = PIDController(kp=0.1, kd=0.1)
+        self.pid_controller_x = PIDController(kp=0.25, kd=0.1)
+        self.pid_controller_y = PIDController(kp=0.25, kd=0.1)
+        self.pid_controller_yaw = PIDController(kp=0.5, kd=0.1)
 
-        self.cruise_velocity = 0.5  # m/s
+        self.cruise_velocity = 5.0  # m/s
         self.circle_radius = 2.3    # Not used in mower trajectory
 
+        self.idx = None
+        self.is_mower = False
+        self.circle_tree = False
         # Bridge for robot state and sensor data.
         self.bridge = BridgeClass(SENSORS)
         # Get tree positions from the server.
@@ -132,13 +135,35 @@ class TrajectoryGenerator:
         self.repulsive_gain = 5.0        # Gain for the repulsive force (unused in new motion vector)
         self.attractive_gain = 1.0       # Gain for the attractive force (unused in new motion vector)
         self.max_repulsive_distance = 5.0  # Maximum distance for repulsive effect to take place
-        self.max_velocity = 1.0          # Maximum velocity of the robot
+        self.max_velocity = 5.0          # Maximum velocity of the robot
 
-        self.dt = 0.25
+        self.dt = 0.05
         self.rate = rospy.Rate(int(1/self.dt))  # Control loop rate
 
         # Maximum time allowed for observation around a tree (in seconds)
         self.max_observe_time = 30.0
+        self.rate = rospy.Rate(int(1 / self.dt))
+        self.measurement_timer = rospy.Timer(rospy.Duration(0.25), self.measurement_callback)
+
+    def measurement_callback(self, event):
+
+        if not (self.is_mower or self.circle_tree):
+            return
+        new_data = self.bridge.get_data()
+        if new_data is None or new_data.get("tree_scores") is None:
+            return
+        z_k = new_data["tree_scores"].flatten()
+
+        if self.is_mower:
+            self.lambda_values = self.bayes(self.lambda_values, z_k)
+        elif self.idx is not None:
+            self.lambda_values[self.idx] = self.bayes(self.lambda_values[self.idx], z_k[self.idx])
+            if self.lambda_values[self.idx]*1e3 >= 999: self.circle_tree = False
+
+        current_entropy = self.calculate_entropy(self.lambda_values)
+        self.bridge.pub_data({
+            "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
+        })
 
     def calculate_entropy(self, lambda_values):
         """Simple entropy calculation based on lambda values."""
@@ -162,7 +187,8 @@ class TrajectoryGenerator:
         if att_magnitude < 1e-6:
             return np.zeros(2)
         att_unit = att_vector / att_magnitude
-
+        if self.is_mower:
+            return att_unit * att_magnitude
         deviation = np.zeros(2)
         unsafe = False
         ray_activation = 3.5
@@ -175,18 +201,18 @@ class TrajectoryGenerator:
             d = np.linalg.norm(diff)
             if d < ray_activation:
                 angle = np.arccos(np.clip(np.dot(att_unit, -diff / d), -1.0, 1.0))
-                if angle < np.pi / 4:
+                if angle < np.pi / 3:
                     unsafe = True
                     u = diff / d
                     tangent1 = np.array([-u[1], u[0]])
                     tangent2 = np.array([u[1], -u[0]])
                     chosen_tangent = tangent1 if np.dot(tangent1, att_unit) > np.dot(tangent2, att_unit) else tangent2
-                    deviation += chosen_tangent * ray_avoidance - 2 * u
+                    deviation += chosen_tangent * ray_avoidance - 1.75 * u
 
         if not unsafe:
             return att_unit * att_magnitude
         else:
-            combined = att_unit + 3 * deviation
+            combined = att_unit + 3.5 * deviation
             combined_norm = np.linalg.norm(combined)
             if combined_norm < 1e-6:
                 return att_unit * att_magnitude
@@ -208,28 +234,23 @@ class TrajectoryGenerator:
         return repulsive_force
 
     def move_to_waypoint(self, target_x, target_y, tolerance=2.0, observe=False):
-        """
-        Move the robot toward the waypoint. Runs until the goal is reached (within tolerance)
-        and then returns the execution time (and entropy reduction if observe=True).
-        """
         goal_position = np.array([target_x, target_y])
         start_time = time.time()
 
         while not rospy.is_shutdown():
-            state = np.array(self.bridge.update_robot_state()).flatten()
-            self.x, self.y, self.theta = state
-            self.pose_history.append([self.x, self.y, self.theta])
+            current_state = np.array(self.bridge.update_robot_state()).flatten()
+            self.x, self.y, self.theta = current_state[:3]
+            self.pose_history.append(current_state[:3])
+            self.time_history.append(time.time() - self.logger.start_time)
             self.lambda_history.append(self.lambda_values.copy())
             self.entropy_history.append(self.calculate_entropy(self.lambda_values))
-            self.time_history.append(time.time() - self.logger.start_time)
-            
-            current_position = np.array([self.x, self.y])
-            if np.linalg.norm(current_position - goal_position) < tolerance:
+
+            if np.linalg.norm(current_state[:2] - goal_position) < tolerance:
                 break
 
-            motion_vector = self.calculate_motion_vector(current_position, goal_position)
-            desired_theta = math.atan2(goal_position[1] - current_position[1],
-                                       goal_position[0] - current_position[0])
+            motion_vector = self.calculate_motion_vector(current_state[:2], goal_position)
+            desired_theta = math.atan2(goal_position[1] - current_state[1],
+                                       goal_position[0] - current_state[0])
             yaw_error = self.normalize_angle(desired_theta - self.theta)
 
             # Scale the motion vector to the maximum velocity.
@@ -242,39 +263,29 @@ class TrajectoryGenerator:
             # Log the injected velocities.
             self.logger.log_velocity(x_output, y_output, yaw_output, tag="move_to_waypoint")
 
-            cmd_pose = np.array([self.x + x_output, self.y + y_output, self.theta + yaw_output]).reshape(-1, 1)
+            cmd_pose = np.array([self.x + x_output * self.dt, self.y + y_output* self.dt, self.theta + yaw_output* self.dt]).reshape(-1, 1)
             self.bridge.pub_data({"cmd_pose": cmd_pose})
-
-            if observe:
-                new_data = self.bridge.get_data()
-                while new_data["tree_scores"] is None:
-                    new_data = self.bridge.get_data()
-                z_k = new_data["tree_scores"].flatten()
-    
-                self.lambda_values = self.bayes(self.lambda_values, z_k)
-                self.bridge.pub_data({
-                    "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
-                })
             self.rate.sleep()
 
         execution_time = time.time() - start_time
         entropy_reduction = self.calculate_entropy(self.lambda_values) if observe else None
         return execution_time, entropy_reduction
 
-    def observe_tree(self, tree_idx):
+    def observe_tree(self):
         """
         Circle the tree from the current position and update lambda until it 
         reaches saturation (λ>=1.0) or until max_observe_time is reached.
         """
-        center_x, center_y = self.tree_positions[tree_idx]
+        self.circle_tree = True
+        center_x, center_y = self.tree_positions[self.idx]
         start_time = time.time()
 
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         phi = math.atan2(self.y - center_y, self.x - center_x)
         radius = np.sqrt((self.x - center_x)**2 + (self.y - center_y)**2)
-        delta_phi = 3 * math.pi / 180  # Angular increment (in radians)
+        delta_phi = self.dt * 20 * math.pi / 180  # Angular increment (in radians)
 
-        while (time.time() - start_time) < self.max_observe_time and self.lambda_values[tree_idx] < 1.0:
+        while (time.time() - start_time) < self.max_observe_time and self.circle_tree:
             desired_x = center_x + radius * math.cos(phi)
             desired_y = center_y + radius * math.sin(phi)
             desired_theta = phi + math.pi  # Face the tree center
@@ -294,28 +305,16 @@ class TrajectoryGenerator:
             yaw_output = self.pid_controller_yaw.update(yaw_error)
             
             # Log the injected velocities for tree observation.
-            self.logger.log_velocity(x_output, y_output, yaw_output, tag=f"observe_tree_{tree_idx}")
+            self.logger.log_velocity(x_output, y_output, yaw_output, tag=f"observe_tree_{self.idx}")
 
             cmd_pose = np.array([self.x + x_output, self.y + y_output, self.theta + yaw_output]).reshape(-1, 1)
             self.bridge.pub_data({"cmd_pose": cmd_pose})
-
-            new_data = self.bridge.get_data()
-            while new_data["tree_scores"] is None:
-                new_data = self.bridge.get_data()
-            z_k = new_data["tree_scores"]
-            self.lambda_values[tree_idx] = self.bayes(self.lambda_values[tree_idx].flatten(), z_k[tree_idx].flatten())
-            self.bridge.pub_data({
-                "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
-            })
-
             phi += delta_phi
             rospy.sleep(self.dt)
-
         return time.time() - start_time
 
     def bayes(self, lambda_prev, z):
         """Bayesian update for confidence (lambda)."""
-        z = np.clip(z, 0.5, 1.0 - 1e-6)
         numerator = lambda_prev * z
         denominator = numerator + (1 - lambda_prev) * (1 - z)
         return numerator / denominator
@@ -548,7 +547,7 @@ class TrajectoryGenerator:
                     mode="markers+text",
                     marker=dict(
                         size=10,
-                        color=[2 * (sampled_lambda_history[-1][i] - 0.5)],
+                        color=[2 * (lambda_history[-1][i] - 0.5)],
                         colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
                         cmin=0,
                         cmax=1,
@@ -821,17 +820,8 @@ class TrajectoryGenerator:
         from a combined list of mower waypoints and tree positions.
         """
         self.logger.start_logging()
-        mower_path = self.generate_mower_trajectory(spacing=1.0, margin=1.0)
 
         candidates = []
-        for i, waypoint in enumerate(mower_path):
-            bayes = self.get_bayes_value(waypoint)
-            candidates.append({
-                'type': 'mower',
-                'index': i,
-                'position': waypoint,
-                'bayes': bayes
-            })
         for i, tree in enumerate(self.tree_positions):
             bayes = self.get_bayes_value(tree)
             candidates.append({
@@ -840,9 +830,6 @@ class TrajectoryGenerator:
                 'position': tree,
                 'bayes': bayes
             })
-
-        self.plot_path(mower_path, self.tree_positions)
-
         total_time = 0
         total_distance = 0
         current_pos = np.array(self.bridge.update_robot_state()).flatten()[:2]
@@ -854,6 +841,7 @@ class TrajectoryGenerator:
             target = np.array(next_candidate['position'])
             target_type = next_candidate['type']
             target_index = next_candidate['index']
+            self.idx = next_candidate['index']
 
             print(f"Moving to {target_type} {target_index} at position: ({target[0]:.2f}, {target[1]:.2f}), bayes: {next_candidate['bayes']:.2f}")
             wp_time, entropy_reduction = self.move_to_waypoint(target[0], target[1],
@@ -869,7 +857,7 @@ class TrajectoryGenerator:
 
             if target_type == 'tree':
                 print(f"Observing tree {target_index}...")
-                observe_time = self.observe_tree(target_index)
+                observe_time = self.observe_tree()
                 total_time += observe_time
                 self.logger.record_performance(f"T_obs_{target_index}", observe_time, total_distance, observe_time,
                                                position=self.tree_positions[target_index])
@@ -926,6 +914,7 @@ class TrajectoryGenerator:
         prev_point = current_state
 
         for idx in tree_order:
+            self.idx = idx
             tree_pos = self.tree_positions[idx]
             print(f"Moving to tree {idx} at position: ({tree_pos[0]:.2f}, {tree_pos[1]:.2f})")
             wp_time, _ = self.move_to_waypoint(tree_pos[0], tree_pos[1], tolerance=3)
@@ -937,7 +926,7 @@ class TrajectoryGenerator:
             self.logger.record_performance(f"T{idx}", wp_time, total_distance, wp_time, position=tree_pos)
             
             print(f"Observing tree {idx}...")
-            observe_time = self.observe_tree(idx)
+            observe_time = self.observe_tree()
             total_time += observe_time
             self.logger.record_performance(f"T_obs_{idx}", observe_time, total_distance, observe_time, position=tree_pos)
             
@@ -953,6 +942,7 @@ class TrajectoryGenerator:
         """
 
         if self.trajectory_type == "between_rows":
+            self.is_mower = True
             self.run_between_rows_trajectory()
         elif self.trajectory_type == "tree_to_tree":
             self.run_tree_to_tree_trajectory()
@@ -964,7 +954,7 @@ class TrajectoryGenerator:
 
 if __name__ == '__main__':
     try:
-        mode = rospy.get_param('~trajectory_mode', 'between_rows')
+        mode = rospy.get_param('~trajectory_mode', 'greedy')
         trajectory_generator = TrajectoryGenerator(mode)
         trajectory_generator.run()
     except rospy.ROSInterruptException:
