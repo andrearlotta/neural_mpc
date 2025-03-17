@@ -1,28 +1,32 @@
+#!/usr/bin/env python
 import os
 import re
 import time
+import csv
+import math
+import rospy
 
 import casadi as ca
 import numpy as np
 import torch
+from scipy.stats import norm 
 
 from nmpc_ros_package.ros_com_lib.bridge_class import BridgeClass
 from nmpc_ros_package.ros_com_lib.sensors import SENSORS
 
 import l4casadi as l4c
-from scipy.stats import norm 
 
 # ---------------------------
-# Global Constants (defined early for use in the NN class)
+# Global Constants
 # ---------------------------
 hidden_size = 64
 hidden_layers = 3
 nn_input_dim = 3
 
-N =10
-dt = 0.25
+N = 5
+dt = 0.5
 T = dt * N
-nx = 3  # Represents [x, y, theta] (position/heading); state X is 6-D ([pos; vel])
+nx = 3  # Represents [x, y, theta]; state X is 6-D ([pos; vel])
 
 # ---------------------------
 # Simple Neural Network
@@ -91,15 +95,18 @@ def kin_model():
     """
     X = ca.MX.sym('X', nx * 2)  # 6 states
     U = ca.MX.sym('U', nx)      # 3 controls
-    X_next = X + dt * ca.vertcat(X[nx:], U)
-    return ca.Function('F', [X, U], [X_next])
+    rhs = ca.vertcat(X[nx:], U)
+    f = ca.Function('f', [X,U], [rhs])
+    intg_opts = {"number_of_finite_elements":1, "simplify":1}
+    intg = ca.integrator('intg', 'rk', {'x':X, 'p':U, 'ode':f(X,U)}, 0, dt, intg_opts)
+    xf = intg(x0=X, p=U)['xf']
+    return ca.Function('F', [X, U], [xf])
 
 def bayes(lambda_prev, z):
     """
     Bayesian update for belief:
        lambda_next = (lambda_prev * z) / (lambda_prev * z + (1 - lambda_prev) * (1 - z) + epsilon)
     """
-    z = ca.fmin(ca.fmax(z,0.5), 1 - 1e-6)
     prod = lambda_prev*z
     denom = prod + (1 - lambda_prev)* (1 - z)
     return prod / denom
@@ -107,26 +114,22 @@ def bayes(lambda_prev, z):
 def entropy(p):
     """
     Compute the binary entropy of a probability p.
-    Values are clipped to avoid log(0). Uses element-wise multiplication.
+    Values are clipped to avoid log(0).
     """
     p = ca.fmin(p, 1 - 1e-6)
-    return (-p*ca.log10(p) - (1 - p)* (ca.log10(1 - p))) / ca.log10(2)
-
+    return (-p*ca.log10(p) - (1 - p)*ca.log10(1 - p)) / ca.log10(2)
 
 # =============================================================================
 # Modified MPC Optimization Function
 # =============================================================================
-
 def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     """
     Set up and solve the MPC optimization problem with an added objective to attract
     the agent towards low-entropy trees when entropy reduction is insufficient.
     """
-    # --- Basic Dimensions ---
-    nx = 3                   # Split factor: state is 2*nx (6-D) and control is nx (3-D)
-    n_state = nx * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
-    n_control = nx           # 3-dimensional control: [ax, ay, alpha]
-    # --- Create the Optimization Problem ---
+    nx_local = 3                   # For clarity in this function
+    n_state = nx_local * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
+    n_control = nx_local           # 3-dimensional control: [ax, ay, angular_acc]
     opti = ca.Opti()
     F_ = kin_model()  # kinematic model function
 
@@ -138,18 +141,18 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     num_trees = trees.shape[0]
     P0 = opti.parameter(n_state + num_trees)
     X0 = P0[: n_state]
-    lambda_0 = P0[n_state:]
+    L0 = P0[n_state:]
     # Initialize belief evolution.
-    lambda_evol = [lambda_0]
+    lambda_evol = [L0]
     
     # Convert tree positions to a CasADi DM.
     trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
 
-    # --- Weights and Safety Parameters ---
+    # Weights and safety parameters.
     w_control = 1e-2         # Control effort weight
-    w_ang = 1e-7             # Angular control weight
-    w_entropy = 10.0         # Weight for final entropy
-    w_attract = 5.0        # Weight for low-entropy attraction (tuned parameter)
+    w_ang = 1e-4             # Angular control weight
+    w_entropy = 1e1          # Weight for final entropy
+    w_attract = 1e-2         # Weight for low-entropy attraction
     safe_distance = 1.0      # Safety margin (meters)
 
     # Initialize the objective.
@@ -158,32 +161,27 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
     # Initial condition constraint.
     opti.subject_to(X[:, 0] == X0)
 
-    # --- Loop Over the Prediction Horizon ---
-    for i in range(steps):
-        # State and Input Bounds
-        opti.subject_to(opti.bounded(lb[0] - 3.5, X[0, i + 1], ub[0] + 3.5))
-        opti.subject_to(opti.bounded(lb[1] - 3.5, X[1, i + 1], ub[1] + 3.5))
-        opti.subject_to(opti.bounded(-6*np.pi, X[2, i + 1], 6*np.pi))
-        opti.subject_to(opti.bounded(-5.0, X[3, i + 1], 5.0))
-        opti.subject_to(opti.bounded(-5.0, X[4, i + 1], 5.0))
-        opti.subject_to(opti.bounded(-3.14/4, X[5, i + 1], 3.14/4))
-        opti.subject_to(opti.bounded(-10.0, U[0:2, i], 10.0))
-        opti.subject_to(opti.bounded(-3.14, U[2, i], 3.14))
-        
-        opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
-        
-        # Control effort regularization (uncomment if needed)
-        obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
-        
-        # --- Collision Avoidance Constraint ---
-        # Ensure the robot remains at least safe_distance away from every tree.
-        delta = X[:2, i+1] - trees_dm.T
-        # Squared distances for each tree
+    # Loop over the prediction horizon.
+    for i in range(steps+1):
+        # State and input bounds.
+        opti.subject_to(opti.bounded(lb[0] - 3.,   X[0, i], ub[0] + 3.))
+        opti.subject_to(opti.bounded(lb[1] - 3.,   X[1, i], ub[1] + 3.))
+        opti.subject_to(opti.bounded(-6*np.pi,    X[2, i], +6*np.pi))
+
+        opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]), 4.0))
+        opti.subject_to(opti.bounded(-3.14/4,   X[5, i], 3.14 / 4))
+
+        if i < steps: opti.subject_to(opti.bounded(0.0, ca.sumsqr(U[0:2, i]), 8.0))
+        if i < steps: opti.subject_to(opti.bounded(-3.14/2, U[-1, i], 3.14/2))
+        if i < steps: obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
+
+        # Collision avoidance: ensure safety margin from trees.
+        delta = X[:2, i] - trees_dm.T
         sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-        # The closest tree must be at least safe_distance away.
         opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
 
-    # --- Neural Network Predictions & Belief Updates ---
+        if i < steps: opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
+        
     nn_batch = []
     for i in range(trees_dm.shape[0]):
         # Ensure the robot remains at least safe_distance away from every tree.
@@ -193,26 +191,42 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         nn_batch.append(ca.horzcat(delta.T, heading.T))
 
     g_out = g_nn(ca.vcat([*nn_batch]))
+    alpha = 20.0  # Steepness parameter.
     z_k = ca.fmax(g_out, 0.5)  # threshold the NN output
 
     for i in range(steps):
         lambda_next = bayes(lambda_evol[-1], z_k[i::steps])
         lambda_evol.append(lambda_next)
     
-    # --- Entropy Minimization Objective ---
-    epsilon_dist = 1e-3 # Avoid division by zero
-    dist_vector = ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1] )**2) + epsilon_dist)]).T
-    entropy_value = w_entropy *ca.sum1(entropy(lambda_evol[-1]) - entropy(lambda_evol[0]))  - w_attract*ca.sum1((1.0-2.0*(lambda_evol[0]-0.5))**2/dist_vector)
-    obj += entropy_value
+    epsilon_dist = 1e-3
+    #dist_vector = ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1])**2)+ epsilon_dist) for i in range(0,steps,2)]).T
+    # Compute entropy terms for the objective
+    entropy_future = entropy(ca.vcat([*lambda_evol[1:]])) #/ (5*(-ca.tanh(0.25*dist_vector)**2+ 1)+1)
 
-    # --- Solve the Optimization ---
+    #sum_per_step = ca.sum1(entropy_future)
+    # Compute softmax weights
+    #exp_sum = ca.exp(entropy_future)
+    #softmax_weights = exp_sum / sum_per_step
+
+    # Entropy term with softmax
+    entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)])*( entropy_future - ca.vcat([lambda_evol[0] for i in range(steps)])) )* w_entropy
+
+    # Attraction term
+
+    #dist_vector = ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1])**2) + epsilon_dist) for i in range(0,steps,2)]).T
+    #attraction_term = w_attract * ca.sum1(ca.tanh((1.0 - 2.0*(ca.vcat([lambda_evol[0] for i in range(steps)]) - 0.5)**2 / dist_vector)))
+
+    # Add terms to the objective
+    obj += entropy_term #- attraction_term
     opti.minimize(obj)
     
-    # --- Solver Options and Solve ---
+    # Solver options.
     options = {
         "ipopt": {
-            "tol": 5*1e-1,
-            "warm_start_init_point": "yes",
+            "tol": 1e-2,
+            "bound_relax_factor" :1e-4,
+            "bound_push" : 1e-6,
+            "warm_start_init_point": "no",
             "hessian_approximation": "limited-memory",
             "print_level": 5,
             "sb": "no",
@@ -220,14 +234,15 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
             "max_iter": 3000
         }
     }
+    
     opti.solver("ipopt", options)
     
-    # Set the parameter values: ensure x0 is (6,1) and lambda_vals is (num_trees,1).
+    # Set the parameter values.
     opti.set_value(P0, ca.vertcat(x0, lambda_vals))
     
     sol = opti.solve()
     
-    # Create the MPC step function for warm starting future iterations.
+    # Create the MPC step function for warm starting.
     inputs = [P0, opti.x, opti.lam_g]
     outputs = [U[:, 0], X, opti.x, opti.lam_g]
     mpc_step = opti.to_function("mpc_step", inputs, outputs)
@@ -237,8 +252,9 @@ def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
             ca.DM(sol.value(X)),
             ca.DM(sol.value(opti.x)),
             ca.DM(sol.value(opti.lam_g))) 
+
 # =============================================================================
-# Simulation Function
+# Simulation Function with Metrics Collection and CSV Generation
 # =============================================================================
 def run_simulation():
     F_ = kin_model()
@@ -253,102 +269,222 @@ def run_simulation():
     # ---------------------------
     # Load the Learned Neural Network Model
     # ---------------------------
-    model = MultiLayerPerceptron(input_dim=nn_input_dim) 
-    # Note: Adjust 'weights_only' if needed by your model saving logic.
+    model = MultiLayerPerceptron(input_dim=nn_input_dim)
     model.load_state_dict(torch.load(get_latest_best_model(), weights_only=True))
     model.eval()
     g_nn = l4c.L4CasADi(model, batched=True, device='cuda')
-    
+
     # Initialize robot state: assume update_robot_state() returns [x, y, theta].
-    vx_k = ca.DM.zeros(nx)
-    # Logging containers.
+    initial_state = bridge.update_robot_state()  # e.g., [x, y, theta]
+    vx_k = ca.DM.zeros(nx)  # velocity component: [vx, vy, omega]
+    x_k = ca.vertcat(ca.DM(initial_state), vx_k)
+
+    # Containers for simulation output.
     all_trajectories = []
     lambda_history = []
     entropy_history = []
     durations = []
 
-    sim_time = 10000  # Total simulation time in seconds
+    # ---------------------------
+    # Velocity Command Logging List
+    # ---------------------------
+    # This list will store rows of the form [time (s), tag, x_vel, y_vel, yaw_vel]
+    velocity_command_log = []
+
+    # ---------------------------
+    # New Lists to Record Plot Data
+    # ---------------------------
+    # These will be used to save the plot data (time, pose, entropy, lambda)
+    pose_history = []      # Each element is [x, y, theta]
+    time_history = []      # Each element is the simulation time at that step
+
+    # ---------------------------
+    # Metrics Tracking Initialization
+    # ---------------------------
+    sim_start_time = time.time()           # Start simulation time.
+    total_distance = 0.0
+    total_commands = 0
+    sum_vx = 0.0
+    sum_vy = 0.0
+    sum_yaw = 0.0
+    sum_trans_speed = 0.0
+    # Use initial position (first two elements of state) as previous position.
+    prev_x = float(x_k[0])
+    prev_y = float(x_k[1])
+
+    sim_time = 700  # Total simulation time (s)
     mpciter = 0
+    rate = rospy.Rate(int(1/dt))
+    warm_start = True
 
     # ---------------------------
     # Main MPC Loop
     # ---------------------------
-    while mpciter * T < sim_time:
+    while mpciter  < sim_time and not rospy.is_shutdown():
         print('Step:', mpciter)
         print('Observe and update state')
+
+        # Update state from sensor.
+        current_state = bridge.update_robot_state()  # returns [x, y, theta]
+        # Record the pose and current simulation time for the plot data.
+        current_sim_time = time.time() - sim_start_time
+        pose_history.append(current_state)
+        time_history.append(current_sim_time)
+
+        x_k = ca.vertcat(ca.DM(current_state), vx_k)
+
         new_data = bridge.get_data()
-        x_k = ca.vertcat(ca.DM(bridge.update_robot_state()), vx_k)
         while new_data["tree_scores"] is None:
             new_data = bridge.get_data()
-        print(new_data["tree_scores"])
+        print("Tree scores:", new_data["tree_scores"].flatten())
 
-        # Ensure tree_scores are a column vector.
+        # Update belief using tree scores.
         z_k = ca.reshape(ca.DM(new_data["tree_scores"]), (len(new_data["tree_scores"]), 1))
         lambda_k = bayes(lambda_k, z_k)
+        lambda_k = np.ceil(lambda_k*1000)/1000
         print("Current state x_k:", x_k)
-        print("Lambda: ", lambda_k)
+        print("Lambda:", lambda_k)
 
-        # Define the lambda threshold.
-        lambda_threshold = 0.9
+        bridge.pub_data({
+            "tree_markers": {"trees_pos": trees_pos, "lambda": lambda_k.full().flatten()}
+        })
 
-        # Compute distances from the robot to each tree.
-        x_robot = np.array(x_k[:2].full().flatten())
-        distances = np.linalg.norm(trees_pos - x_robot, axis=1)
-        lambda_np = np.array(lambda_k.full().flatten())
-
-        # Filter indices where lambda is below the threshold.
-        valid_indices = np.where(lambda_np < lambda_threshold)[0]
-
-        # Select the nearest 4 trees among the valid ones.
-        num_nearest = 4
-        if valid_indices.size > 0:
-            sorted_valid_indices = valid_indices[np.argsort(distances[valid_indices])]
-            selected_indices = sorted_valid_indices[:num_nearest]
-        else:
-            selected_indices = np.array([], dtype=int)
-
-        # Build the masked lambda array:
-        # Set all values to a high value (1e4), then restore the lambda value for the selected trees.
-        lambda_mpc_np = np.full_like(lambda_np, 1e4)
-        lambda_mpc_np[selected_indices] = lambda_np[selected_indices]
-
-        lambda_mpc = ca.reshape(ca.DM(lambda_mpc_np), (len(trees_pos), 1))
-        print(lambda_mpc)
-
-        start_time = time.time()
-        if mpciter == 0:
+        step_start_time = time.time()
+        if warm_start:
             # Initialize MPC.
             mpc_step, u, x_traj, x_dec, lam = mpc_opt(g_nn, trees_pos, lb, ub, x_k, lambda_k, mpc_horizon)
+            warm_start = False
         else:
             # Warm-start MPC.
             u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambda_k), x_dec, lam)
-        durations.append(time.time() - start_time)
+        durations.append(time.time() - step_start_time)
 
+        # ---------------------------
+        # Log the MPC Velocity Command
+        # ---------------------------
+        # Convert u (CasADi DM) to a NumPy array and flatten to extract individual velocity components.
+        u_np = np.array(u.full()).flatten()
+        velocity_command_log.append([current_sim_time, "MPC", u_np[0], u_np[1], u_np[2]])
 
         # ---------------------------
         # Publish Data and Apply Control
         # ---------------------------
         bridge.pub_data({
-            "predicted_path": x_traj[:nx, 1:], 
-            "tree_markers": {"trees_pos": trees_pos, "lambda": lambda_k.full().flatten()}
+            "predicted_path": x_traj[:nx, 1:],
         })
-        
-        bridge.pub_data({"cmd_pose": F_(x_k, u[0,:])})
-        time.sleep(T/N)
+        cmd_pose = F_( x_k, u[:, 0])
+        bridge.pub_data({"cmd_pose": cmd_pose})
 
-        # Update velocity component from the predicted trajectory.
+        # Update velocity from predicted trajectory.
         vx_k = x_traj[nx:, 1]
 
+        # ---------------------------
+        # Metrics Update
+        # ---------------------------
+        # Record velocity commands from vx_k.
+        vx_val = float(vx_k[0])
+        vy_val = float(vx_k[1])
+        yaw_val = float(vx_k[2])
+        sum_vx += vx_val
+        sum_vy += vy_val
+        sum_yaw += yaw_val
+        trans_speed = math.sqrt(vx_val**2 + vy_val**2)
+        sum_trans_speed += trans_speed
+        total_commands += 1
+
+        # Compute distance traveled from previous position to current.
+        curr_x = float(x_traj[0, 1])
+        curr_y = float(x_traj[1, 1])
+        distance_step = math.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+        total_distance += distance_step
+        prev_x, prev_y = curr_x, curr_y
+
         # Compute and log overall entropy.
-        entropy_k = ca.sum1(entropy(ca.fmin(lambda_k, 1 - 1e-3))).full().flatten()[0]
+        entropy_k = ca.sum1(entropy(lambda_k)).full().flatten()[0]
         lambda_history.append(lambda_k.full().flatten().tolist())
         entropy_history.append(entropy_k)
         all_trajectories.append(x_traj[:nx, :].full())
 
         mpciter += 1
-        print(entropy_k)
-        if entropy_k < 1.0:
+        print("Entropy:", entropy_k)
+        if entropy_k < 0.10:
             break
+        rate.sleep()
+
+    # ---------------------------
+    # Final Metrics Calculation
+    # ---------------------------
+    total_execution_time = time.time() - sim_start_time
+    avg_wp_time = total_execution_time / total_commands if total_commands > 0 else 0.0
+    avg_vx = sum_vx / total_commands if total_commands > 0 else 0.0
+    avg_vy = sum_vy / total_commands if total_commands > 0 else 0.0
+    avg_yaw = sum_yaw / total_commands if total_commands > 0 else 0.0
+    avg_trans_speed = sum_trans_speed / total_commands if total_commands > 0 else 0.0
+
+    # ---------------------------
+    # Save Performance Metrics to CSV Files
+    # ---------------------------
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    baselines_dir = os.path.join(script_dir, "baselines")
+    os.makedirs(baselines_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")  # Current timestamp
+    # Create a filename that includes trajectory type and timestamp
+    perf_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
+    with open(perf_csv, mode='w', newline='') as perf_file:
+        writer = csv.writer(perf_file)
+        writer.writerow([
+            "Total Execution Time (s)",
+            "Total Distance (m)",
+            "Average Waypoint-to-Waypoint Time (s)",
+            "Final Entropy",
+            "Total Commands"
+        ])
+        writer.writerow([
+            total_execution_time,
+            total_distance,
+            avg_wp_time,
+            entropy_history[-1] if entropy_history else "N/A",
+            total_commands
+        ])
+
+    # ---------------------------
+    # Save the Logged MPC Velocity Commands to CSV
+    # ---------------------------
+    vel_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
+    with open(vel_csv, mode='w', newline='') as vel_file:
+        writer = csv.writer(vel_file)
+        writer.writerow(["Time (s)", "Tag", "x_velocity (m/s)", "y_velocity (m/s)", "yaw_velocity (rad/s)"])
+        writer.writerows(velocity_command_log)
+
+    print(f"Performance metrics saved to {perf_csv}")
+    print(f"Velocity command log saved to {vel_csv}")
+
+    # ---------------------------
+    # Save the Plot Data to CSV
+    # ---------------------------
+    plot_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_plot_data.csv")
+    with open(plot_csv, mode='w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        # Write tree positions (flattened)
+        tree_positions_flat = trees_pos.flatten().tolist()
+        writer.writerow(["tree_positions"] + tree_positions_flat)
+
+        # Build header row for plot data: time, pose (x, y, theta), entropy, then lambda values.
+        header = ["time", "x", "y", "theta", "entropy"]
+        if lambda_history and len(lambda_history[0]) > 0:
+            num_trees = len(lambda_history[0])
+            header += [f"lambda_{i}" for i in range(num_trees)]
+        writer.writerow(header)
+
+        # Write each recorded data row.
+        for i in range(len(time_history)):
+            time_val = time_history[i]
+            x, y, theta = pose_history[i]
+            entropy_val = entropy_history[i]
+            lambda_vals = lambda_history[i]
+            row = [time_val, x, y, theta, entropy_val] + lambda_vals
+            writer.writerow(row)
+    print(f"Plot data saved to {plot_csv}")
 
     return all_trajectories, entropy_history, lambda_history, durations, g_nn, trees_pos, lb, ub
 
