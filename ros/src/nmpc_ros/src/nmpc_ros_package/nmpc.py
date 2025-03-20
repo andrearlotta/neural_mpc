@@ -68,6 +68,8 @@ class NeuralMPC:
 
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
+        self.trees_pos = np.array(self.bridge.call_server({"trees_poses": None})["trees_poses"])
+        self.lambda_k = ca.DM.ones(self.trees_pos.shape[0],1) * 0.5
 
     # ---------------------------
     # Sensor Callback Thread
@@ -76,7 +78,10 @@ class NeuralMPC:
         while not rospy.is_shutdown():
             data = self.bridge.get_data()
             if data["tree_scores"] is not None:
-                self.latest_trees_scores = data["tree_scores"].flatten()
+                self.latest_trees_scores = data["tree_scores"]
+                # Update belief using tree scores.
+                self.lambda_k = self.bayes(self.lambda_k, self.latest_trees_scores)
+                self.lambda_k = np.ceil(self.lambda_k*1000)/1000
             time.sleep(measurement_interval)
 
     def start_measurement_thread(self, measurement_interval=0.5):
@@ -239,8 +244,8 @@ class NeuralMPC:
         options = {
             "ipopt": {
                 "tol": 1e-2,
-                "bound_relax_factor": 1e-4,
-                "bound_push": 1e-6,
+                "bound_relax_factor": 1e-1,
+                "bound_push": 1e-8,
                 "warm_start_init_point": "yes",
                 "hessian_approximation": "limited-memory",
                 "print_level": 0,
@@ -271,11 +276,9 @@ class NeuralMPC:
     def run_simulation(self):
         F_ = self.kin_model(self.nx, self.dt)
         # Get tree positions from the server.
-        trees_pos = np.array(self.bridge.call_server({"trees_poses": None})["trees_poses"])
-        lb, ub = self.get_domain(trees_pos)
 
-        # Initialize belief as a column vector.
-        lambda_k = ca.reshape(ca.DM.ones(len(trees_pos)) * 0.5, (len(trees_pos), 1))
+        lb, ub = self.get_domain(self.trees_pos)
+
         self.mpc_horizon = self.N
 
         # Start sensor measurement thread.
@@ -322,7 +325,7 @@ class NeuralMPC:
         prev_x = float(x_k[0])
         prev_y = float(x_k[1])
 
-        sim_time = 1400  # Total simulation time in seconds
+        sim_time = 2800  # Total simulation time in seconds
         mpciter = 0
         rate = rospy.Rate(int(1/self.dt))
         warm_start = True
@@ -343,27 +346,19 @@ class NeuralMPC:
             while self.latest_trees_scores is None:
                 time.sleep(0.05)
 
-            print(self.latest_trees_scores)
-            new_data = self.latest_trees_scores
-            print("Tree scores:", new_data)
-
-            # Update belief using tree scores.
-            z_k = ca.reshape(ca.DM(new_data), (len(new_data), 1))
-            lambda_k = self.bayes(lambda_k, z_k)
-            lambda_k = np.ceil(lambda_k*1000)/1000
             print("Current state x_k:", x_k)
-            print("Lambda:", lambda_k)
+            print("Lambda:", self.lambda_k)
 
             self.bridge.pub_data({
-                "tree_markers": {"trees_pos": trees_pos, "lambda": lambda_k.full().flatten()}
+                "tree_markers": {"trees_pos": self.trees_pos, "lambda": self.lambda_k.full().flatten()}
             })
 
             step_start_time = time.time()
             if warm_start:
-                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, trees_pos, lb, ub, x_k, lambda_k, self.mpc_horizon)
+                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.mpc_horizon)
                 warm_start = False
             else:
-                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambda_k), x_dec, lam)
+                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k), x_dec, lam)
             durations.append(time.time() - step_start_time)
 
             # Log the MPC velocity command.
@@ -393,8 +388,8 @@ class NeuralMPC:
             total_distance += distance_step
             prev_x, prev_y = curr_x, curr_y
 
-            entropy_k = ca.sum1(self.entropy(lambda_k)).full().flatten()[0]
-            lambda_history.append(lambda_k.full().flatten().tolist())
+            entropy_k = ca.sum1(self.entropy(self.lambda_k)).full().flatten()[0]
+            lambda_history.append(self.lambda_k.full().flatten().tolist())
             entropy_history.append(entropy_k)
             all_trajectories.append(x_traj[:self.nx, :].full())
 
@@ -439,7 +434,7 @@ class NeuralMPC:
         vel_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
         with open(vel_csv, mode='w', newline='') as vel_file:
             writer = csv.writer(vel_file)
-            writer.writerow(["Time (s)", "Tag", "x_velocity (m/s)", "y_velocity (m/s)", "yaw_velocity (rad/s)"])
+            writer.writerow(["Time (s)", "Tag", "x_velocity", "y_velocity", "yaw_velocity"])
             writer.writerows(velocity_command_log)
 
         print(f"Performance metrics saved to {perf_csv}")
@@ -448,7 +443,7 @@ class NeuralMPC:
         plot_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_plot_data.csv")
         with open(plot_csv, mode='w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            tree_positions_flat = trees_pos.flatten().tolist()
+            tree_positions_flat = self.trees_pos.flatten().tolist()
             writer.writerow(["tree_positions"] + tree_positions_flat)
             header = ["time", "x", "y", "theta", "entropy"]
             if lambda_history and len(lambda_history[0]) > 0:
@@ -464,7 +459,7 @@ class NeuralMPC:
                 writer.writerow(row)
         print(f"Plot data saved to {plot_csv}")
 
-        return all_trajectories, entropy_history, lambda_history, durations, g_nn, trees_pos, lb, ub
+        return all_trajectories, entropy_history, lambda_history, durations, g_nn, self.trees_pos, lb, ub
 
     # ---------------------------
     # Plotting Function

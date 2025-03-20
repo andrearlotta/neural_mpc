@@ -10,7 +10,7 @@ from datetime import datetime
 def get_latest_file(mode, suffix):
     """
     Finds the latest CSV file for a given mode and file suffix.
-    For example, suffix might be "performance_metrics.csv" or "velocity_commands.csv".
+    For example, suffix might be "performance_metrics", "velocity_commands", or "velocity_metrics".
     """
     pattern = os.path.join('baselines', f"{mode}_*_{suffix}.csv")
     files = glob.glob(pattern)
@@ -25,7 +25,7 @@ def load_performance_metrics(file_path):
     with open(file_path, 'r') as f:
         reader = csv.reader(f)
         rows = list(reader)
-        
+
     for row in rows:
         if not row:
             continue
@@ -37,7 +37,6 @@ def load_performance_metrics(file_path):
             metrics['Average WP Time (s)'] = float(row[1])
         elif row[0] == 'Final Entropy':
             metrics['Final Entropy'] = float(row[1])
-            
     return metrics
 
 def load_velocity_data(file_path):
@@ -46,7 +45,33 @@ def load_velocity_data(file_path):
     df['Linear Velocity'] = np.sqrt(df['x_velocity']**2 + df['y_velocity']**2)
     return {
         'Mean Velocity (m/s)': df['Linear Velocity'].mean(),
-        'Std Velocity (m/s)': df['Linear Velocity'].std()
+        'Std Velocity (m/s)': df['Linear Velocity'].std(),
+        'Mean Angular Velocity (rad/s)': np.abs(df['yaw_velocity']).mean(),
+        'Std Angular Velocity (rad/s)': np.abs(df['yaw_velocity']).std()
+    }
+
+def load_velocity_metrics(file_path):
+    """
+    Computes execution time statistics from the velocity metrics CSV.
+    Skips the first line of data (after the header) and computes the average,
+    minimum, maximum, and standard deviation of the "Time (s)" column.
+    """
+    df = pd.read_csv(file_path)
+    # Skip the first data row.
+    df = df.iloc[1:]
+    # Ensure the Time column is float type.
+    df['Time (s)'] = df['Time (s)'].astype(float)
+    delta_t = np.array(df['Time (s)'][1:]) - np.array(df['Time (s)'][:-1])
+
+    avg_time = np.median(delta_t)
+    min_time = delta_t.min()
+    max_time = delta_t.max()
+    std_time = delta_t.std()
+    return {
+        'Average Execution Time (s)': avg_time,
+        'Min Execution Time (s)': min_time,
+        'Max Execution Time (s)': max_time,
+        'Std Execution Time (s)': std_time
     }
 
 def main():
@@ -58,9 +83,15 @@ def main():
         'Average WP Time (s)': [],
         'Mean Velocity (m/s)': [],
         'Std Velocity (m/s)': [],
-        'Final Entropy': []
+        'Mean Angular Velocity (rad/s)': [],
+        'Std Angular Velocity (rad/s)': [],
+        'Final Entropy': [],
+        'Average Execution Time (s)': [],
+        'Min Execution Time (s)': [],
+        'Max Execution Time (s)': [],
+        'Std Execution Time (s)': []
     }
-    
+
     # Define a color mapping for each trajectory type.
     color_map = {
         'Greedy': 'red',
@@ -75,59 +106,70 @@ def main():
         if not perf_file:
             print(f"Skipping {traj_type} - no performance file found")
             continue
-        
+
         perf_metrics = load_performance_metrics(perf_file)
-        
-        # Load velocity data
-        vel_file = get_latest_file(traj_type, 'velocity_commands')
-        if not vel_file:
-            print(f"Skipping {traj_type} - no velocity file found")
+
+        # Load velocity commands data
+        vel_cmd_file = get_latest_file(traj_type, 'velocity_commands')
+        if not vel_cmd_file:
+            print(f"Skipping {traj_type} - no velocity commands file found")
             continue
-            
-        vel_metrics = load_velocity_data(vel_file)
-        
-        # Multiply velocity values for non-MPC types
-        if traj_type != 'mpc':
-            vel_metrics['Mean Velocity (m/s)'] *= 4
-            vel_metrics['Std Velocity (m/s)'] *= 4
-        
-        # Combine metrics
+
+        vel_cmd_stats = load_velocity_data(vel_cmd_file)
+
+        # Load velocity metrics data for execution times
+        vel_metrics_file = get_latest_file(traj_type, 'velocity_commands')  # Corrected suffix
+        if not vel_metrics_file:
+            print(f"Skipping {traj_type} - no velocity metrics file found")
+            continue
+        exec_time_stats = load_velocity_metrics(vel_metrics_file)
+
+        # Combine metrics into the dictionary.
         traj_name = traj_type.replace('_', ' ').title()
         metrics_data['Trajectory Type'].append(traj_name)
         metrics_data['Total Time (s)'].append(perf_metrics.get('Total Time (s)', np.nan))
         metrics_data['Total Distance (m)'].append(perf_metrics.get('Total Distance (m)', np.nan))
         metrics_data['Average WP Time (s)'].append(perf_metrics.get('Average WP Time (s)', np.nan))
         metrics_data['Final Entropy'].append(perf_metrics.get('Final Entropy', np.nan))
-        metrics_data['Mean Velocity (m/s)'].append(vel_metrics.get('Mean Velocity (m/s)', np.nan))
-        metrics_data['Std Velocity (m/s)'].append(vel_metrics.get('Std Velocity (m/s)', np.nan))
-        
-    # Define the metrics to be plotted (excluding the Trajectory Type)
+        metrics_data['Mean Velocity (m/s)'].append(vel_cmd_stats.get('Mean Velocity (m/s)', np.nan))
+        metrics_data['Std Velocity (m/s)'].append(vel_cmd_stats.get('Std Velocity (m/s)', np.nan))
+        metrics_data['Mean Angular Velocity (rad/s)'].append(vel_cmd_stats.get('Mean Angular Velocity (rad/s)', np.nan))
+        metrics_data['Std Angular Velocity (rad/s)'].append(vel_cmd_stats.get('Std Angular Velocity (rad/s)', np.nan))
+        metrics_data['Average Execution Time (s)'].append(exec_time_stats.get('Average Execution Time (s)', np.nan))
+        metrics_data['Min Execution Time (s)'].append(exec_time_stats.get('Min Execution Time (s)', np.nan))
+        metrics_data['Max Execution Time (s)'].append(exec_time_stats.get('Max Execution Time (s)', np.nan))
+        metrics_data['Std Execution Time (s)'].append(exec_time_stats.get('Std Execution Time (s)', np.nan))
+
+    # Define the metrics to be plotted in the new order
     metrics_list = [
-        'Total Time (s)',
+        'Final Entropy',
         'Total Distance (m)',
-        'Average WP Time (s)',
+        'Total Time (s)',
+        '',
+        'Average Execution Time (s)',
+        'Min Execution Time (s)',
+        'Max Execution Time (s)',
+        'Std Execution Time (s)',
         'Mean Velocity (m/s)',
         'Std Velocity (m/s)',
-        'Final Entropy'
+        '',
+        '',
+        'Mean Angular Velocity (rad/s)',
+        'Std Angular Velocity (rad/s)',
+        '',
+        '',
     ]
-    
-    # Create subplots: 2 rows and 3 columns
-    subplot_titles = [metric for metric in metrics_list]
-    fig = make_subplots(rows=2, cols=3, subplot_titles=subplot_titles)
-    
-    # Map each metric to a specific subplot (row, col)
-    subplot_positions = {
-        'Total Time (s)': (1, 1),
-        'Total Distance (m)': (1, 2),
-        'Average WP Time (s)': (1, 3),
-        'Mean Velocity (m/s)': (2, 1),
-        'Std Velocity (m/s)': (2, 2),
-        'Final Entropy': (2, 3)
-    }
-    
+
+    # Create subplots: using 4 rows and 3 columns for 11 metrics.
+    rows = 4
+    cols = 4
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=metrics_list)
+
     # Add a bar trace for each metric with different colors for each trajectory type.
-    for metric in metrics_list:
-        row, col = subplot_positions[metric]
+    for i, metric in enumerate(metrics_list):
+        if metric == '': continue
+        row = i // cols + 1
+        col = i % cols + 1
         fig.add_trace(
             go.Bar(
                 x=metrics_data['Trajectory Type'],
@@ -136,18 +178,20 @@ def main():
                 textposition='auto',
                 marker=dict(
                     color=[color_map[traj] for traj in metrics_data['Trajectory Type']]
-                )
+                ),
+                showlegend=False  # Ensure individual traces do not show legend
             ),
             row=row,
             col=col
         )
-    
+
     fig.update_layout(
         title_text="Trajectory Performance Comparison",
-        height=800,
-        width=1200
+        height=1200,
+        width=1200,
+        showlegend=False  # Hide the legend
     )
-    
+
     fig.show()
 
 if __name__ == "__main__":

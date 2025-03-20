@@ -3,7 +3,6 @@ __pycache__*
 rootfinder.py
 global_planner_1d.py
 runs/*
-main.ipynb
 plots/
 saved_models/*
 entropy_reduction_mpc.py
@@ -16,3 +15,10 @@ ros/logs
 ros/pyenv
 ros/build
 scripts.zip
+ros/src/nmpc_ros/src/nmpc_ros_package/models/*
+datasets/*
+*.html
+*.png
+ros/src/nmpc_ros/baselines/*
+ros/src/nmpc_ros/src/nmpc_ros_package/baselines/*
+baselines/*

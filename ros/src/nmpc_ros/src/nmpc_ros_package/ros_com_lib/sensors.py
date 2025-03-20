@@ -91,7 +91,7 @@ def create_tree_markers(trees_pos, scores):
         text_marker.id = i * 2 + 1
         text_marker.type = Marker.TEXT_VIEW_FACING
         text_marker.action = Marker.ADD
-        text_marker.pose.position = Point(x=tree_pos[0], y=tree_pos[1], z=2.5)
+        text_marker.pose.position = Point(x=tree_pos[0], y=tree_pos[1], z=4)
         text_marker.text = f"Score: {score:.2f}"
         text_marker.scale.z = 0.2
         text_marker.color.a = 1.0

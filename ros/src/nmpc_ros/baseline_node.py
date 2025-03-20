@@ -9,6 +9,7 @@ import tf
 import csv
 import time
 import os
+import threading
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from nmpc_ros_package.ros_com_lib.bridge_class import BridgeClass
@@ -110,13 +111,13 @@ class TrajectoryGenerator:
         self.time_history = []
 
         # Initialize PID controllers.
-        self.pid_controller_x = PIDController(kp=5.0, kd=1)
-        self.pid_controller_y = PIDController(kp=5.0, kd=1)
-        self.pid_controller_yaw = PIDController(kp=9.0, kd=1)
+        self.pid_controller_x = PIDController(kp=3.0, kd=1)
+        self.pid_controller_y = PIDController(kp=3.0, kd=1)
+        self.pid_controller_yaw = PIDController(kp=.25, kd=0.1)
 
         self.idx = None
         self.is_mower = False
-        self.circle_tree = False
+        self.circle_tree_event = threading.Event()
         # Bridge for robot state and sensor data.
         self.bridge = BridgeClass(SENSORS)
         # Get tree positions from the server.
@@ -128,11 +129,10 @@ class TrajectoryGenerator:
             "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
         })
 
-        self.max_repulsive_distance = 5.0  # Maximum distance for repulsive effect to take place
-        self.max_velocity = 5.0          # Maximum velocity of the robot
-        self.max_yaw_velocity = np.pi/2      # Maximum yaw velocity (rad/s)
+        self.max_velocity = 0.50 if self.is_mower else 1.5          # Maximum velocity of the robot
+        self.max_yaw_velocity = np.pi/4      # Maximum yaw velocity (rad/s)
 
-        self.dt = 0.05
+        self.dt = 0.1
         self.rate = rospy.Rate(int(1/self.dt))  # Control loop rate
 
         # Maximum time allowed for observation around a tree (in seconds)
@@ -143,7 +143,7 @@ class TrajectoryGenerator:
             pass
 
     def measurement_callback(self, event):
-        if not (self.is_mower or self.circle_tree):
+        if not (self.is_mower or self.circle_tree_event.is_set()):
             return
         new_data = self.bridge.get_data()
         if new_data is None or new_data.get("tree_scores") is None:
@@ -154,8 +154,9 @@ class TrajectoryGenerator:
             self.lambda_values = self.bayes(self.lambda_values, z_k)
         elif self.idx is not None:
             self.lambda_values[self.idx] = self.bayes(self.lambda_values[self.idx], z_k[self.idx])
-            if self.lambda_values[self.idx]*1e3 >= 999:
-                self.circle_tree = False
+            # When the lambda value reaches a threshold, clear the event to stop observation.
+            if self.lambda_values[self.idx] * 1e3 >= 999:
+                self.circle_tree_event.clear()
 
         current_entropy = self.calculate_entropy(self.lambda_values)
         self.bridge.pub_data({
@@ -261,9 +262,13 @@ class TrajectoryGenerator:
 
             # Log the injected velocities.
             self.logger.log_velocity(x_output, y_output, yaw_output, tag="move_to_waypoint")
-
+    
             cmd_pose = np.array([self.x + x_output * self.dt, self.y + y_output * self.dt, self.theta + yaw_output * self.dt]).reshape(-1, 1)
             self.bridge.pub_data({"cmd_pose": cmd_pose})
+
+            # Calculate the distance traveled in this step.
+            step_distance = np.linalg.norm([x_output * self.dt,  y_output * self.dt])
+            self.logger.add_distance(step_distance)
             self.rate.sleep()
 
         execution_time = time.time() - start_time
@@ -272,20 +277,17 @@ class TrajectoryGenerator:
     # ------------------------------------------------------------------------
 
     def observe_tree(self):
-        """
-        Circle the tree from the current position and update lambda until it
-        reaches saturation (λ>=1.0) or until max_observe_time is reached.
-        """
-        self.circle_tree = True
+        # Set the event to start observation.
+        self.circle_tree_event.set()
         center_x, center_y = self.tree_positions[self.idx]
         start_time = time.time()
 
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         phi = math.atan2(self.y - center_y, self.x - center_x)
-        radius = np.sqrt((self.x - center_x)**2 + (self.y - center_y)**2)
-        delta_phi = self.dt * 20 * math.pi / 180  # Angular increment (in radians)
+        radius = np.sqrt((self.x - center_x) ** 2 + (self.y - center_y) ** 2)
+        delta_phi = self.dt * 5.0 * math.pi / 180  # Angular increment (in radians)
 
-        while (time.time() - start_time) < self.max_observe_time and self.circle_tree:
+        while self.circle_tree_event.is_set():
             desired_x = center_x + radius * math.cos(phi)
             desired_y = center_y + radius * math.sin(phi)
             desired_theta = phi + math.pi  # Face the tree center
@@ -304,18 +306,20 @@ class TrajectoryGenerator:
             y_output = self.pid_controller_y.update(y_error)
             yaw_output = self.pid_controller_yaw.update(yaw_error)
 
-            # Clip the PID outputs to their maximum limits.
+            # Clip the outputs
             x_output = np.clip(x_output, -self.max_velocity, self.max_velocity)
             y_output = np.clip(y_output, -self.max_velocity, self.max_velocity)
             yaw_output = np.clip(yaw_output, -self.max_yaw_velocity, self.max_yaw_velocity)
 
-            # Log the injected velocities for tree observation.
             self.logger.log_velocity(x_output, y_output, yaw_output, tag=f"observe_tree_{self.idx}")
 
             cmd_pose = np.array([self.x + x_output * self.dt, self.y + y_output * self.dt, self.theta + yaw_output]).reshape(-1, 1)
             self.bridge.pub_data({"cmd_pose": cmd_pose})
             phi += delta_phi
+            step_distance = np.linalg.norm([x_output * self.dt, y_output * self.dt])
+            self.logger.add_distance(step_distance)
             rospy.sleep(self.dt)
+
         return time.time() - start_time
 
     def bayes(self, lambda_prev, z):
@@ -324,7 +328,7 @@ class TrajectoryGenerator:
         denominator = numerator + (1 - lambda_prev) * (1 - z)
         return numerator / denominator
     
-    def generate_mower_path_between_rows(self, offset=2.0, spacing=4.0, heading_direction='E'):
+    def generate_mower_path_between_rows(self, offset=2.0, spacing=4.0, heading_direction='O', axis='x'):
         """
         Generate a mower path that includes external rows outside the tree grid.
 
@@ -389,10 +393,18 @@ class TrajectoryGenerator:
         direction_map = {'N': np.pi/2, 'E': 0, 'S': -np.pi/2, 'W': np.pi}
         fixed_heading = direction_map.get(heading_direction.upper(), 0)
         
-        for x in x_coords:
+
+        if axis == 'x':
             for y in y_coords:
-                waypoints.append((x, y, fixed_heading))
-            y_coords = y_coords[::-1]       
+                for x in x_coords:
+                    waypoints.append((x, y, fixed_heading))
+                x_coords = x_coords[::-1]       
+    
+        else:
+            for x in x_coords:
+                for y in y_coords:
+                    waypoints.append((x, y, fixed_heading))
+                y_coords = y_coords[::-1]       
 
         return waypoints
 
@@ -408,38 +420,21 @@ class TrajectoryGenerator:
 
         # Generate the simple mower path.
         # You can adjust offset, spacing, and heading_direction as needed.
-        path = self.generate_mower_path_between_rows(offset=2.0, spacing=4.0, heading_direction='E')
+        path = self.generate_mower_path_between_rows(offset=2.0, spacing=4.0, heading_direction='E', axis='y')
         self.plot_path(path, self.tree_positions)
 
         total_time = 0
-        total_distance = 0
-        # Assume the first waypoint gives the starting position.
-        prev_point = np.array(path[0][:2])
-
         for i in range(1, len(path)):
             current_point = np.array(path[i][:2])
             heading = path[i][2]
             print(f"Moving to waypoint {i}: ({current_point[0]:.2f}, {current_point[1]:.2f}) with heading: {heading:.2f} rad")
 
-            # Move the robot toward the current waypoint.
-            # The move_to_waypoint method is assumed to take x, y, tolerance, and desired_heading.
             wp_time, _ = self.move_to_waypoint(
                 current_point[0], current_point[1],
                 tolerance=0.25, observe=True, desired_heading=heading
             )
             total_time += wp_time
-
-            # Calculate the distance traveled in this step.
-            step_distance = np.linalg.norm(current_point - prev_point)
-            total_distance += step_distance
-
-            self.logger.add_distance(step_distance)
-            self.logger.record_performance(
-                i, wp_time, total_distance, wp_time, 0,  # entropy reduction is set to 0 here
-                position=current_point.tolist()
-            )
-            prev_point = current_point
-
+        
         final_entropy = self.calculate_entropy(self.lambda_values)
         final_bayes = self.lambda_values.tolist()
         self.logger.finalize_performance_metrics(final_entropy, final_bayes)
@@ -872,41 +867,35 @@ class TrajectoryGenerator:
         fig_animated.write_html(filename)
 
     def run_tree_to_tree_trajectory(self):
-        """
-        Run mode: move from tree to tree (nearest-neighbor ordering). Upon reaching a tree,
-        perform the observation procedure before continuing.
-        """
-        self.logger.start_logging()
-        tree_order = self.generate_tree_to_tree_path()
-        tree_path = [self.tree_positions[idx].tolist() for idx in tree_order]
-        self.plot_path(tree_path, self.tree_positions)
+            self.logger.start_logging()
+            tree_order = self.generate_tree_to_tree_path()
+            tree_path = [self.tree_positions[idx].tolist() for idx in tree_order]
+            self.plot_path(tree_path, self.tree_positions)
 
-        total_time = 0
-        total_distance = 0
-        current_state = np.array(self.bridge.update_robot_state()).flatten()[:2]
-        prev_point = current_state
+            total_time = 0
+            total_distance = 0
+            current_state = np.array(self.bridge.update_robot_state()).flatten()[:2]
+            prev_point = current_state
 
-        for idx in tree_order:
-            self.idx = idx
-            tree_pos = self.tree_positions[idx]
-            print(f"Moving to tree {idx} at position: ({tree_pos[0]:.2f}, {tree_pos[1]:.2f})")
-            wp_time, _ = self.move_to_waypoint(tree_pos[0], tree_pos[1], tolerance=3)
-            total_time += wp_time
-            step_distance = np.linalg.norm(tree_pos - prev_point)
-            total_distance += step_distance
-            self.logger.add_distance(step_distance)
-            prev_point = tree_pos
-            self.logger.record_performance(f"T{idx}", wp_time, total_distance, wp_time, position=tree_pos)
+            for idx in tree_order:
+                self.idx = idx
+                tree_pos = self.tree_positions[idx] + np.array([np.cos(np.pi/2), np.sin(np.pi/2)]) * 2
+                print(f"Moving to tree {idx} at position: ({tree_pos[0]:.2f}, {tree_pos[1]:.2f})")
+                wp_time, _ = self.move_to_waypoint(tree_pos[0], tree_pos[1], desired_heading=-np.pi/2, tolerance=0.2)
+                total_time += wp_time
+                print(f"Observing tree {idx}...")
+                # Run observe_tree in a separate thread.
+                obs_thread = threading.Thread(target=self.observe_tree)
+                obs_thread.start()
+                obs_thread.join()  # Optionally, wait for observation to finish before moving on.
 
-            print(f"Observing tree {idx}...")
-            observe_time = self.observe_tree()
-            total_time += observe_time
-            self.logger.record_performance(f"T_obs_{idx}", observe_time, total_distance, observe_time, position=tree_pos)
-
-        final_entropy = self.calculate_entropy(self.lambda_values)
-        final_bayes = self.lambda_values.tolist()
-        self.logger.finalize_performance_metrics(final_entropy, final_bayes)
-        print("Tree-to-tree trajectory complete")
+                # Alternatively, if you want to continue without waiting:
+                # obs_thread.start()
+                # ... continue with other tasks
+            final_entropy = self.calculate_entropy(self.lambda_values)
+            final_bayes = self.lambda_values.tolist()
+            self.logger.finalize_performance_metrics(final_entropy, final_bayes)
+            print("Tree-to-tree trajectory complete")
 
     def run_greedy_trajectory(self):
         """
@@ -927,35 +916,28 @@ class TrajectoryGenerator:
         total_time = 0
         total_distance = 0
         current_pos = np.array(self.bridge.update_robot_state()).flatten()[:2]
-        observation_distance_threshold = 3.0
+        observation_distance_threshold = .20
 
         while candidates:
             candidates.sort(key=lambda c: (c['bayes'], np.linalg.norm(np.array(c['position']) - current_pos)))
             next_candidate = candidates[0]
-            target = np.array(next_candidate['position'])
+            target = np.array(next_candidate['position']) + np.array([np.cos(np.pi/2), np.sin(np.pi/2)]) * 2
             target_type = next_candidate['type']
             target_index = next_candidate['index']
             self.idx = next_candidate['index']
 
             print(f"Moving to {target_type} {target_index} at position: ({target[0]:.2f}, {target[1]:.2f}), bayes: {next_candidate['bayes']:.2f}")
-            wp_time, entropy_reduction = self.move_to_waypoint(target[0], target[1],
-                                                               tolerance=observation_distance_threshold,
-                                                               observe=(target_type == 'tree'))
-            total_time += wp_time
-            step_distance = np.linalg.norm(target - current_pos)
-            total_distance += step_distance
-            self.logger.add_distance(step_distance)
-            current_pos = target
-            self.logger.record_performance(f"{target_type}{target_index}", wp_time, total_distance, wp_time,
-                                           entropy_reduction, position=target)
+            self.move_to_waypoint(target[0], target[1],
+                                    desired_heading=-np.pi/2,
+                                    tolerance=observation_distance_threshold,
+                                    observe=(target_type == 'tree'))
 
             if target_type == 'tree':
                 print(f"Observing tree {target_index}...")
-                observe_time = self.observe_tree()
-                total_time += observe_time
-                self.logger.record_performance(f"T_obs_{target_index}", observe_time, total_distance, observe_time,
-                                               position=self.tree_positions[target_index])
-
+                # Run observe_tree in a separate thread.
+                obs_thread = threading.Thread(target=self.observe_tree)
+                obs_thread.start()
+                obs_thread.join()  # Optionally, wait for observation to finish before moving on.
             candidates.pop(0)
 
         final_entropy = self.calculate_entropy(self.lambda_values)

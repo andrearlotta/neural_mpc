@@ -14,9 +14,9 @@ import tf
 import tf.transformations as tf_trans
 import message_filters
 
-def weight_value(n_elements, mean_score, midpoint=5, steepness=.25):
+def weight_value(n_elements, mean_score, midpoint=5, steepness=10.):
     # Sigmoidal weighting based on number of elements
-    return  (mean_score-0.5) * (0.5+0.5 *np.tanh(steepness* (n_elements-midpoint))) + 0.5
+    return  np.ceil(100 *(mean_score-0.5) * (0.5+0.5 *np.tanh(steepness* (n_elements-midpoint))))/100 + 0.5
 
 class DataAssociationNode:
     def __init__(self):
@@ -169,7 +169,7 @@ class DataAssociationNode:
                 if distance < 8:
                     # Get indices of fruits corresponding to this tree
                     fruit_indices = np.where((transformed_fruit_positions[:, None] == fruits).all(-1).any(-1))[0]
-                    tree_scores[i] = weight_value(len(fruit_indices), np.mean([fruit_scores[j] for j in fruit_indices]))
+                    tree_scores[i] = weight_value(len(fruit_indices), np.median([fruit_scores[j]  for j in fruit_indices] ))
 
 
         # Publish tree scores
