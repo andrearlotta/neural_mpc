@@ -78,8 +78,8 @@ def create_tree_markers(trees_pos, scores):
         sphere_marker.pose.orientation.w = 1.0
         sphere_marker.scale.x = sphere_marker.scale.y = sphere_marker.scale.z = 0.5
         sphere_marker.color.a = 1.0
-        sphere_marker.color.r = 1.0 - score
-        sphere_marker.color.g = score
+        sphere_marker.color.r = score
+        sphere_marker.color.g = 1.0 - score
         sphere_marker.color.b = 0.0
         markers.markers.append(sphere_marker)
         
@@ -91,7 +91,7 @@ def create_tree_markers(trees_pos, scores):
         text_marker.id = i * 2 + 1
         text_marker.type = Marker.TEXT_VIEW_FACING
         text_marker.action = Marker.ADD
-        text_marker.pose.position = Point(x=tree_pos[0], y=tree_pos[1], z=4)
+        text_marker.pose.position = Point(x=tree_pos[0], y=tree_pos[1], z=3)
         text_marker.text = f"Score: {score:.2f}"
         text_marker.scale.z = 0.2
         text_marker.color.a = 1.0
