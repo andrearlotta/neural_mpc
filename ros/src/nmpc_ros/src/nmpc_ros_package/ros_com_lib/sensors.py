@@ -165,7 +165,7 @@ SENSORS = [
   {
       "name": "tree_markers",
       "type": MarkerArray,
-      "topic": "/agent_0/tree_markers",
+      "topic": "agent_0/tree_markers",
       "mode": "pub",
       "serializer": lambda self: create_tree_markers(self["trees_pos"], self["lambda"]),
   },
