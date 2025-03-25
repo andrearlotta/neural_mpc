@@ -55,7 +55,7 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 10
+        self.N = 5
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
@@ -150,7 +150,7 @@ class NeuralMPC:
         Compute the binary entropy of a probability p.
         Values are clipped to avoid log(0).
         """
-        p = ca.fmax(ca.fmin(p, 1 - 1e-6),  1e-6)
+        p = ca.fmax(ca.fmin(p, 1 - 1e-4),  1e-4)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
 
     # ---------------------------
@@ -179,9 +179,9 @@ class NeuralMPC:
         trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
 
         # Weights and safety parameters.
-        w_control = 1e-1         # Control effort weight
-        w_ang = 1e-2             # Angular control weight
-        w_entropy = 1e3          # Weight for final entropy
+        w_control = 1e-2         # Control effort weight
+        w_ang = 1e-4             # Angular control weight
+        w_entropy = 1e1          # Weight for final entropy
         w_attract = 1e-2         # Weight for low-entropy attraction
         safe_distance = 1.0      # Safety margin (meters)
 
@@ -234,10 +234,11 @@ class NeuralMPC:
 
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
-        entropy_term = ca.sumsqr( lambda_evol[-1]) * w_entropy
+        entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
+                                ( entropy_future - ca.vcat([lambda_evol[0] for i in range(steps)])) ) * w_entropy
 
         # Add terms to the objective.
-        obj = entropy_term
+        obj += entropy_term
         opti.minimize(obj)
 
         # Solver options.
