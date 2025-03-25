@@ -1,0 +1,46 @@
+<launch>
+
+  <include file="$(find ros_tcp_endpoint)/launch/endpoint.launch"/>
+  <include file="$(find yolov7_ros)/launch/yolov7_multi.launch"/>
+
+  <node pkg="rostopic" type="rostopic" name="pose_publisher1" args="pub -1 /agent_1/cmd/pose geometry_msgs/Pose '{position: {x: -3.354, y: -2.0, z: 2.350}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}'" />
+  <node pkg="rostopic" type="rostopic" name="pose_publisher2" args="pub -1 /agent_2/cmd/pose geometry_msgs/Pose '{position: {x: -3.354, y: -7.3, z: 2.350}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}'" />
+  <node pkg="rostopic" type="rostopic" name="pose_publisher3" args="pub -1 /agent_3/cmd/pose geometry_msgs/Pose '{position: {x: -3.354, y: -14.1, z: 2.350}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}'" />
+
+  <arg name="node_start_delay_first" default="2.0" />  <!-- Delay first mpc -->
+  <arg name="node_start_delay_mpc" default="1.0" />    <!-- Delay second, third mpcs -->
+
+  <group ns="agent_1">
+    <!-- Launch data_association_node.py -->
+    <node name="data_association_node" pkg="nmpc_ros" type="multi_data_association_node.py" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay_first); $0 $@' "> 
+      <param name="n_agent" value="1" />
+    </node>
+    <!-- Launch nmpc.py -->
+    <node name="main_node" pkg="nmpc_ros" type="multi_nmpc_ros_node.py" output="screen">
+      <param name="n_agent" value="1" />
+    </node>
+  </group>
+
+  <group ns="agent_2">
+    <!-- Launch data_association_node.py -->
+    <node name="data_association_node" pkg="nmpc_ros" type="multi_data_association_node.py" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay_mpc); $0 $@' "> 
+      <param name="n_agent" value="2" />
+    </node>
+    <!-- Launch nmpc.py -->
+    <node name="main_node" pkg="nmpc_ros" type="multi_nmpc_ros_node.py" output="screen">
+      <param name="n_agent" value="2" />
+    </node>
+  </group>
+
+  <group ns="agent_3">
+    <!-- Launch data_association_node.py -->
+    <node name="data_association_node" pkg="nmpc_ros" type="multi_data_association_node.py" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay_mpc); $0 $@' "> 
+      <param name="n_agent" value="3" />
+    </node>
+    <!-- Launch nmpc.py -->
+    <node name="main_node" pkg="nmpc_ros" type="multi_nmpc_ros_node.py" output="screen">
+      <param name="n_agent" value="3" />
+    </node>
+  </group>
+
+</launch>

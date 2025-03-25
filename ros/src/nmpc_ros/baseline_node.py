@@ -97,6 +97,7 @@ class Logger:
         print(f"Total Distance: {self.total_distance:.2f} m")
         print(f"Average Waypoint-to-Waypoint Time: {avg_wp_time:.2f} s")
 
+
 class TrajectoryGenerator:
     def __init__(self, trajectory_type, bridge, run_folder="baselines", random_initial_state=True):
         self.run_folder = run_folder
@@ -741,9 +742,9 @@ if __name__ == '__main__':
     try:
         bridge = BridgeClass(SENSORS)
         # Initialize and run the trajectory generator
-        modes = ['greedy']
+        modes = ['greedy', 'tree_to_tree', 'between_rows']
         for mode in modes:
-            for test_num in range(0, 1):
+            for test_num in range(0, 2):
                 import re
                 # Define base folder
                 base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"test_for_creating_plot_{mode}")

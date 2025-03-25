@@ -100,6 +100,21 @@ def create_tree_markers(trees_pos, scores):
     
     return markers
 
+def update_robot_state(buffer):
+    robot_pose = []
+    while not len(robot_pose):
+        try:
+            # Get the transform from 'map' to 'drone_base_link'
+            trans = buffer.lookup_transform('map', 'drone_base_link', rospy.Time())
+            # Extract rotation
+            (_, _, yaw) = tf.transformations.euler_from_quaternion([ trans.transform.rotation.x,  trans.transform.rotation.y,  trans.transform.rotation.z,  trans.transform.rotation.w])
+            
+            # Update x_robot with the transform (x, y, yaw)
+            robot_pose = [[trans.transform.translation.x], [trans.transform.translation.y], [yaw]]
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn(f"Failed to get transform: {e}")
+        
+    return robot_pose
 
 # Update the SENSORS dictionary with the new entry for the Detection2D message
 SENSORS = [
