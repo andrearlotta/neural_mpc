@@ -223,11 +223,7 @@ class NeuralMPC:
 
         lambda_0_ext = ca.vcat([lambda_evol[0] for i in range(steps)])
         z_k = (lambda_0_ext <= 0.5) * ( 1 - ca.fmax(g_nn_raw(ca.vcat([*nn_batch])), 0.5)) + (lambda_0_ext > 0.5) * ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
-        #alpha = 10  # Adjust steepness as needed
-        #w1 = 0.5 * (1 - ca.tanh(alpha * (lambda_0_ext - 0.5)))
-        #w2 = 0.5 * (1 + ca.tanh(alpha * (lambda_0_ext - 0.5)))
-        #z_k = w1 * (1 - ca.fmax(g_nn_raw(ca.vcat([*nn_batch])), 0.5)) + \
-        #    w2 * ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
+
         for i in range(steps):
             lambda_next = self.bayes(lambda_evol[-1], z_k[i*num_trees:(1+i)*num_trees])
             lambda_evol.append(lambda_next)
@@ -235,10 +231,10 @@ class NeuralMPC:
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
         entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
-                                ( entropy_future - ca.vcat([lambda_evol[0] for i in range(steps)])) ) * w_entropy
+                                ( entropy_future - ca.entropy(ca.vcat([lambda_evol[0] for i in range(steps)]))) ) 
 
         # Add terms to the objective.
-        obj += entropy_term
+        obj += w_entropy * entropy_term
         opti.minimize(obj)
 
         # Solver options.
