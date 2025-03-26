@@ -61,7 +61,7 @@ class MultiLayerPerceptron(torch.nn.Module):
         return x
 
 # ---------------------------
-# Neural MPC Class
+# Neural MPC Class (Modified Version)
 # ---------------------------
 class NeuralMPC:
     def __init__(self, run_dir=None, initial_randomic=False):
@@ -83,7 +83,6 @@ class NeuralMPC:
         # For storing the latest tree scores from the sensor callback.
         self.latest_trees_scores = None
         # For storing the latest robot state from the gps callback.
-
 
         rospy.init_node("nmpc_node", anonymous=True, log_level=rospy.DEBUG)
         
@@ -1036,6 +1035,7 @@ class NeuralMPC:
 # Main Execution
 # ---------------------------
 if __name__ == "__main__":
+    rospy.init_node("neural_mpc_node", anonymous=True)
     mpc = NeuralMPC()
     sim_results = mpc.run_simulation()
     # Optionally, call the plotting method:
