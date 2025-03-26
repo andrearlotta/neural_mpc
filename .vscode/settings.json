@@ -1,6 +1,7 @@
 {
     "python.analysis.extraPaths": [
         "./ros/src/nmpc_ros/src",
-        "./ros/src/nmpc_ros/src"
+        "./ros/src/nmpc_ros/src",
+        "./ros/src/yolov7-ros/src"
     ]
 }

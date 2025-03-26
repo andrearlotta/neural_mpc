@@ -285,30 +285,19 @@ class NeuralMPC:
             nn_batch.append(ca.horzcat(delta.T, heading))
 
         lambda_0_ext = ca.vcat([lambda_evol[0] for i in range(steps)])
-        z_k = ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
+        z_k = (lambda_0_ext <= 0.5) * ( 1 - ca.fmax(g_nn_raw(ca.vcat([*nn_batch])), 0.5)) + (lambda_0_ext > 0.5) * ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
+
         for i in range(steps):
             lambda_next = self.bayes(lambda_evol[-1], z_k[i*num_trees:(1+i)*num_trees])
             lambda_evol.append(lambda_next)
 
-        # --- Entropy Cost ---
-        # Instead of comparing with the initial belief, sum a discounted entropy over the horizon.
-        discount = .9
-        entropy_term = 0
-        entropy_0 = self.entropy(lambda_evol[0])
-
+        # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
-        #no
-        #entropy_term =  ca.mtimes((self.entropy(ca.vcat([*lambda_evol[2:]])) - self.entropy(ca.vcat([*lambda_evol[1:-1]]))).T, \
-        #                                        (self.entropy(ca.vcat([*lambda_evol[2:]])) - self.entropy(ca.vcat([*lambda_evol[1:-1]]))))
-        entropy_term =  ca.sum1(entropy_future)
+        entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
+                                ( entropy_future - ca.entropy(ca.vcat([lambda_evol[0] for i in range(steps)]))) ) 
+
+        # Add terms to the objective.
         obj += w_entropy * entropy_term
-        obj += 1e-3 *  ca.sum1(self.entropy(lambda_evol[-1]) * ca.sum2(nn_batch[0][:,:2]**2))
-        # --- Exploration Reward ---
-        # Add a negative term (reward) that encourages the robot to approach trees with high entropy.
-        # The reward is stronger when the distance to the tree is close to the safe distance.
-
-
-        # Set the optimization objective.
         opti.minimize(obj)
 
         # Solver options.

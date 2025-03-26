@@ -22,3 +22,4 @@ datasets/*
 ros/src/nmpc_ros/baselines/*
 ros/src/nmpc_ros/src/nmpc_ros_package/baselines/*
 baselines/*
+.vscode/settings.json
