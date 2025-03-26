@@ -10,14 +10,25 @@ import rospy
 import casadi as ca
 import numpy as np
 import torch
+import tf2_ros
 from scipy.stats import norm
-
-from nmpc_ros_package.ros_com_lib.bridge_class import BridgeClass
-from nmpc_ros_package.ros_com_lib.sensors import SENSORS
 
 import l4casadi as l4c
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# ROS message imports
+from geometry_msgs.msg import Pose, PoseStamped, Point, Quaternion
+from std_msgs.msg import Float32MultiArray
+from visualization_msgs.msg import MarkerArray
+from nav_msgs.msg import Path
+import tf
+
+# Service import for tree poses (as in sensors.py)
+from nmpc_ros.srv import GetTreesPoses
+
+# Import helper functions from sensors.py
+from nmpc_ros_package.ros_com_lib.sensors import create_path_from_mpc_prediction, create_tree_markers
 
 # ---------------------------
 # Simple Neural Network
@@ -46,7 +57,7 @@ class MultiLayerPerceptron(torch.nn.Module):
         return x
 
 # ---------------------------
-# Neural MPC Class
+# Neural MPC Class (Modified Version)
 # ---------------------------
 class NeuralMPC:
     def __init__(self):
@@ -55,38 +66,91 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 5
+        self.N = 2
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
 
         # For storing the latest tree scores from the sensor callback.
         self.latest_trees_scores = None
+        # For storing the latest robot state from the gps callback.
+        self.current_state = None
 
-        # Initialize the sensor bridge.
-        self.bridge = BridgeClass(SENSORS)
+        rospy.init_node("nmpc_node", anonymous=True, log_level=rospy.DEBUG)
+        
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        # Variable to hold the current robot state [x, y, yaw]
+        self.current_state = None
+
+        # Start the robot state update thread at 30 Hz.
+        self.robot_state_thread = threading.Thread(target=self.robot_state_update_thread)
+        self.robot_state_thread.daemon = True
+        self.robot_state_thread.start()
+        # Subscribers
+        rospy.Subscriber("tree_scores", Float32MultiArray, self.tree_scores_callback)
+        # Publishers
+        self.cmd_pose_pub = rospy.Publisher("agent_0/cmd/pose", Pose, queue_size=10)
+        self.pred_path_pub = rospy.Publisher("agent_0/predicted_path", Path, queue_size=10)
+        self.tree_markers_pub = rospy.Publisher("agent_0/tree_markers", MarkerArray, queue_size=10)
+
+        # Get tree positions from service using the sensors.py serializer logic.
+        self.trees_pos = self.get_trees_poses()
+        self.lambda_k = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
 
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
-        self.trees_pos = np.array(self.bridge.call_server({"trees_poses": None})["trees_poses"])
-        self.lambda_k = ca.DM.ones(self.trees_pos.shape[0],1) * 0.5
 
     # ---------------------------
-    # Sensor Callback Thread
+    # Callback Functions
     # ---------------------------
-    def measurement_callback(self, measurement_interval=0.1):
+
+    def robot_state_update_thread(self):
+        """Continuously update the robot's state using TF at 30 Hz."""
+        rate = rospy.Rate(30)  # 30 Hz update rate
         while not rospy.is_shutdown():
-            data = self.bridge.get_data()
-            if data["tree_scores"] is not None:
-                self.latest_trees_scores = data["tree_scores"]
-            time.sleep(measurement_interval)
+            try:
+                # Look up the transform from 'map' to 'drone_base_link'
+                trans = self.tf_buffer.lookup_transform('map', 'drone_base_link', rospy.Time(0))
+                # Extract the yaw angle from the quaternion
+                (_, _, yaw) = tf.transformations.euler_from_quaternion([
+                    trans.transform.rotation.x,
+                    trans.transform.rotation.y,
+                    trans.transform.rotation.z,
+                    trans.transform.rotation.w
+                ])
+                # Update current_state with [x, y, yaw]
+                self.current_state = [trans.transform.translation.x,
+                                      trans.transform.translation.y,
+                                      yaw]
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+                rospy.logwarn("Failed to get transform: %s", e)
+            rate.sleep()
 
-    def start_measurement_thread(self, measurement_interval=0.1):
-        meas_thread = threading.Thread(
-            target=self.measurement_callback, args=(measurement_interval,)
-        )
-        meas_thread.daemon = True
-        meas_thread.start()
+    def tree_scores_callback(self, msg):
+        """
+        Callback for tree scores.
+        """
+        self.latest_trees_scores = np.array(msg.data).reshape(-1, 1)
+
+    # ---------------------------
+    # Service Call to Get Trees Poses
+    # ---------------------------
+    def get_trees_poses(self):
+        """
+        Calls the GetTreesPoses service and returns tree positions as an (N,2) numpy array.
+        The serializer logic is taken from sensors.py.
+        """
+        rospy.wait_for_service("/obj_pose_srv")
+        try:
+            trees_srv = rospy.ServiceProxy("/obj_pose_srv", GetTreesPoses)
+            response = trees_srv()  # Adjust parameters if needed
+            # Using the serializer from sensors.py:
+            trees_pos = np.array([[pose.position.x, pose.position.y] for pose in response.trees_poses.poses])
+            return trees_pos
+        except rospy.ServiceException as e:
+            rospy.logerr("Service call failed: %s", e)
+            return np.array([])
 
     # ---------------------------
     # Utility Functions
@@ -95,8 +159,7 @@ class NeuralMPC:
         # Get the directory where THIS script is stored.
         script_dir = os.path.dirname(os.path.abspath(__file__))
         # Models are stored in a subdirectory "models/" relative to this script.
-        model_dir = os.path.join(script_dir, "models")
-        model_dir = os.path.join(model_dir, cls)
+        model_dir = os.path.join(script_dir, "models", cls)
         # Find the latest best model file matching the pattern.
         model_files = [
             f for f in os.listdir(model_dir)
@@ -129,7 +192,7 @@ class NeuralMPC:
         U = ca.MX.sym('U', nx)      # 3 controls
         rhs = ca.vertcat(X[nx:], U)
         f = ca.Function('f', [X, U], [rhs])
-        intg_opts = {"number_of_finite_elements":1, "simplify":1}
+        intg_opts = {"number_of_finite_elements": 1, "simplify": 1}
         intg = ca.integrator('intg', 'rk', {'x': X, 'p': U, 'ode': f(X, U)}, 0, dt, intg_opts)
         xf = intg(x0=X, p=U)['xf']
         return ca.Function('F', [X, U], [xf])
@@ -150,12 +213,15 @@ class NeuralMPC:
         Compute the binary entropy of a probability p.
         Values are clipped to avoid log(0).
         """
-        p = ca.fmax(ca.fmin(p, 1 - 1e-4),  1e-4)
+        p = ca.fmax(ca.fmin(p, 1 - 1e-1), 1e-1)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
 
-    # ---------------------------
-    # MPC Optimization Function
-    # ---------------------------
+# ---------------------------
+# MPC Optimization Function
+# ---------------------------
+# ---------------------------
+# MPC Optimization Function
+# ---------------------------
     def mpc_opt(self, g_nn_raw, g_nn_ripe, trees, lb, ub, x0, lambda_vals, steps=10):
         nx_local = 3                   # For clarity in this function
         n_state = nx_local * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
@@ -163,7 +229,7 @@ class NeuralMPC:
         opti = ca.Opti()
         F_ = self.kin_model(self.nx, self.dt)  # kinematic model function
 
-        # Decision variables:
+        # Decision variables.
         X = opti.variable(n_state, steps + 1)
         U = opti.variable(n_control, steps)
 
@@ -176,15 +242,14 @@ class NeuralMPC:
         lambda_evol = [L0]
 
         # Convert tree positions to a CasADi DM.
-        trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
+        trees_dm = ca.DM(trees)  # shape: (num_trees, 2)
 
         # Weights and safety parameters.
-        w_control = 1e-2         # Control effort weight
+        w_control = 1e-1        # Control effort weight
         w_ang = 1e-4             # Angular control weight
-        w_entropy = 1e1          # Weight for final entropy
-        w_attract = 1e-2         # Weight for low-entropy attraction
-        safe_distance = 1.0      # Safety margin (meters)
-
+        w_entropy = 1e3         # Weight for final entropy
+        safe_distance = 1.25     # Safety margin (meters)
+        R = ca.diag(ca.DM([w_control, w_control, w_ang]))
         # Initialize the objective.
         obj = 0
 
@@ -192,61 +257,68 @@ class NeuralMPC:
         opti.subject_to(X[:, 0] == X0)
 
         # Loop over the prediction horizon.
-        for i in range(steps+1):
-            # State and input bounds.
-            opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
-            opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
-            opti.subject_to(opti.bounded(-6*np.pi, X[2, i], +6*np.pi))
-
-            opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]),4.00))
-            opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
-
+        for i in range(steps + 1):
+            # State bounds.
+            opti.subject_to(opti.bounded(lb[0] - 2., X[0, i], ub[0] + 2.))
+            opti.subject_to(opti.bounded(lb[1] - 2., X[1, i], ub[1] + 2.))
+            opti.subject_to(opti.bounded(-6 * np.pi, X[2, i], 6 * np.pi))
+            opti.subject_to(ca.sumsqr(X[3:5, i]) <= 2.00)
+            opti.subject_to(opti.bounded(-3.14 / 4, X[5, i], 3.14 / 4))
+            # Add control bounds and control cost for all but the last state.
             if i < steps:
-                opti.subject_to(opti.bounded(0.0, ca.sumsqr(U[0:2, i]),8.0))
-                opti.subject_to(opti.bounded(-3.14/2, U[-1, i], 3.14/2))
-                obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
-
-            # Collision avoidance: ensure safety margin from trees.
-            delta = X[:2, i] - trees_dm.T
-            sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-            opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
-
+                opti.subject_to(ca.sumsqr(U[0:2, i]) <=8.0)
+                opti.subject_to( U[-1, i]**2 <= 3.14**2 / 4)
+                obj += ca.mtimes([U[:, i].T, R, U[:, i]])
+            # Collision avoidance: ensure a safety margin from each tree.
+            #for t in range(num_trees):
+            #    opti.subject_to(ca.sumsqr(X[:2, i] - trees_dm[t, :].T) >= safe_distance ** 2)
             if i < steps:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
 
+        # --- Neural Network Prediction and Belief Update ---
+        # Use a smoothing parameter for the sigmoid to blend network outputs.
         nn_batch = []
         for i in range(steps):
             # For each tree, build NN input using the state at steps 1:steps+1.
             delta = X[:2, i+1] - trees_dm.T
-            heading =ca.vcat( [X[2, i+1] for _ in range(num_trees)])
+            heading = ca.vcat([X[2, i+1] for _ in range(num_trees)])
             nn_batch.append(ca.horzcat(delta.T, heading))
 
         lambda_0_ext = ca.vcat([lambda_evol[0] for i in range(steps)])
-        z_k = (lambda_0_ext <= 0.5) * ( 1 - ca.fmax(g_nn_raw(ca.vcat([*nn_batch])), 0.5)) + (lambda_0_ext > 0.5) * ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
-        #alpha = 10  # Adjust steepness as needed
-        #w1 = 0.5 * (1 - ca.tanh(alpha * (lambda_0_ext - 0.5)))
-        #w2 = 0.5 * (1 + ca.tanh(alpha * (lambda_0_ext - 0.5)))
-        #z_k = w1 * (1 - ca.fmax(g_nn_raw(ca.vcat([*nn_batch])), 0.5)) + \
-        #    w2 * ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
+        z_k = ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
         for i in range(steps):
             lambda_next = self.bayes(lambda_evol[-1], z_k[i*num_trees:(1+i)*num_trees])
             lambda_evol.append(lambda_next)
 
-        # Compute entropy terms for the objective.
-        entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
-        entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
-                                ( entropy_future - ca.vcat([lambda_evol[0] for i in range(steps)])) ) * w_entropy
+        # --- Entropy Cost ---
+        # Instead of comparing with the initial belief, sum a discounted entropy over the horizon.
+        discount = .9
+        entropy_term = 0
+        entropy_0 = self.entropy(lambda_evol[0])
 
-        # Add terms to the objective.
-        obj += entropy_term
+        entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
+        #no
+        #entropy_term =  ca.mtimes((self.entropy(ca.vcat([*lambda_evol[2:]])) - self.entropy(ca.vcat([*lambda_evol[1:-1]]))).T, \
+        #                                        (self.entropy(ca.vcat([*lambda_evol[2:]])) - self.entropy(ca.vcat([*lambda_evol[1:-1]]))))
+        entropy_term =  ca.sum1(entropy_future)
+        obj += w_entropy * entropy_term
+        obj += 1e-3 *  ca.sum1(self.entropy(lambda_evol[-1]) * ca.sum2(nn_batch[0][:,:2]**2))
+        # --- Exploration Reward ---
+        # Add a negative term (reward) that encourages the robot to approach trees with high entropy.
+        # The reward is stronger when the distance to the tree is close to the safe distance.
+
+
+        # Set the optimization objective.
         opti.minimize(obj)
 
         # Solver options.
         options = {
             "ipopt": {
                 "tol": 1e-2,
-                "acceptable_tol" : 1e-1,
-                "warm_start_init_point": "yes",
+                "acceptable_tol": 1e-1,
+                "bound_relax_factor": 1e-1,
+                "bound_push": 1e-8,
+                "warm_start_init_point": "no",
                 "hessian_approximation": "limited-memory",
                 "print_level": 5,
                 "sb": "no",
@@ -255,7 +327,8 @@ class NeuralMPC:
             }
         }
         opti.solver("ipopt", options)
-        # Set the parameter values.
+        
+        # Set parameter values.
         opti.set_value(P0, ca.vertcat(x0, lambda_vals))
         sol = opti.solve()
 
@@ -275,34 +348,34 @@ class NeuralMPC:
     # ---------------------------
     def run_simulation(self):
         F_ = self.kin_model(self.nx, self.dt)
-        # Get tree positions from the server.
-
         lb, ub = self.get_domain(self.trees_pos)
-
         self.mpc_horizon = self.N
 
-        # Start sensor measurement thread.
-        self.start_measurement_thread(0.1)
+        # Wait until a GPS message has been received.
+        rospy.loginfo("Waiting for GPS data...")
+        while self.current_state is None and not rospy.is_shutdown():
+            rospy.sleep(0.05)
+        rospy.loginfo("GPS data received.")
 
         # ---------------------------
-        # Load the Learned Neural Network Model
+        # Load the Learned Neural Network Models
         # ---------------------------
         model_raw = MultiLayerPerceptron(input_dim=self.nn_input_dim,
-                                     hidden_size=self.hidden_size,
-                                     hidden_layers=self.hidden_layers)
+                                         hidden_size=self.hidden_size,
+                                         hidden_layers=self.hidden_layers)
         model_raw.load_state_dict(torch.load(self.get_latest_best_model('raw'), weights_only=True))
         model_raw.eval()
-        g_nn_raw = l4c.L4CasADi(model_raw,name='raw_nn', batched=True, device='cuda')
+        g_nn_raw = l4c.L4CasADi(model_raw, name='raw_nn', batched=True, device='cuda')
         
         model_ripe = MultiLayerPerceptron(input_dim=self.nn_input_dim,
-                                     hidden_size=self.hidden_size,
-                                     hidden_layers=self.hidden_layers)
+                                          hidden_size=self.hidden_size,
+                                          hidden_layers=self.hidden_layers)
         model_ripe.load_state_dict(torch.load(self.get_latest_best_model('ripe'), weights_only=True))
         model_ripe.eval()
-        g_nn_ripe = l4c.L4CasADi(model_ripe,name='ripe_nn', batched=True, device='cuda')
+        g_nn_ripe = l4c.L4CasADi(model_ripe, name='ripe_nn', batched=True, device='cuda')
 
-        # Initialize robot state: assume update_robot_state() returns [x, y, theta].
-        initial_state = self.bridge.update_robot_state()  # e.g., [x, y, theta]
+        # Initialize robot state from the latest GPS callback.
+        initial_state = self.current_state  # [x, y, theta]
         vx_k = ca.DM.zeros(self.nx)  # velocity component: [vx, vy, omega]
         x_k = ca.vertcat(ca.DM(initial_state), vx_k)
 
@@ -312,16 +385,10 @@ class NeuralMPC:
         entropy_history = []
         durations = []
 
-        # ---------------------------
-        # Velocity Command Logging
-        # ---------------------------
         velocity_command_log = []
         pose_history = []      # [x, y, theta] for each step
         time_history = []      # simulation time at each step
 
-        # ---------------------------
-        # Metrics Tracking
-        # ---------------------------
         sim_start_time = time.time()
         total_distance = 0.0
         total_commands = 0
@@ -339,33 +406,34 @@ class NeuralMPC:
 
         # Main MPC loop.
         while mpciter < sim_time and not rospy.is_shutdown():
-            print('Step:', mpciter)
-            print('Observe and update state')
-
-            # Update state from sensor.
-            current_state = self.bridge.update_robot_state()  # returns [x, y, theta]
+            rospy.loginfo('Step: %d', mpciter)
+            # Update state from the latest GPS callback.
+            while self.current_state is None and not rospy.is_shutdown():
+                rospy.sleep(0.05)
+            current_state = self.current_state
             current_sim_time = time.time() - sim_start_time
             pose_history.append(current_state)
             time_history.append(current_sim_time)
-
             x_k = ca.vertcat(ca.DM(current_state), vx_k)
 
-            while self.latest_trees_scores is None:
-                time.sleep(0.05)
+            # Wait until tree scores have been received.
+            while self.latest_trees_scores is None and not rospy.is_shutdown():
+                rospy.sleep(0.05)
             latest_trees_scores = self.latest_trees_scores.copy()
             self.lambda_k = self.bayes(self.lambda_k, latest_trees_scores)
             self.lambda_k = np.ceil(self.lambda_k*1000)/1000
-            print("Current state x_k:", x_k)
-            print("Lambda:", self.lambda_k)
-            print("current_measurements:", latest_trees_scores.flatten())
+            rospy.loginfo("Current state x_k: %s", x_k)
+            rospy.loginfo("Lambda: %s", self.lambda_k)
+            rospy.loginfo("Current tree scores: %s", latest_trees_scores.flatten())
 
-            self.bridge.pub_data({
-                "tree_markers": {"trees_pos": self.trees_pos, "lambda": self.lambda_k.full().flatten()}
-            })
+            # Publish tree markers using the helper function from sensors.py.
+            tree_markers_msg = create_tree_markers(self.trees_pos, self.lambda_k.full().flatten())
+            self.tree_markers_pub.publish(tree_markers_msg)
 
             step_start_time = time.time()
             if warm_start:
-                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn_raw, g_nn_ripe, self.trees_pos, lb, ub, x_k, self.lambda_k, self.mpc_horizon)
+                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn_raw, g_nn_ripe,
+                                                                self.trees_pos, lb, ub, x_k, self.lambda_k, self.mpc_horizon)
                 warm_start = False
             else:
                 u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k), x_dec, lam)
@@ -374,9 +442,22 @@ class NeuralMPC:
             # Log the MPC velocity command.
             u_np = np.array(u.full()).flatten()
 
-            # Publish data and apply control.
+            # Compute the command pose.
             cmd_pose = F_(x_k, u[:, 0])
-            self.bridge.pub_data({ "predicted_path": x_traj[:self.nx, 1:], "cmd_pose": cmd_pose})
+
+            # Publish predicted path.
+            predicted_path_msg = create_path_from_mpc_prediction(x_traj[:self.nx, 1:])
+            self.pred_path_pub.publish(predicted_path_msg)
+
+            # Build and publish the cmd_pose message.
+            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(cmd_pose[2]))
+            cmd_pose_msg = Pose()
+            cmd_pose_msg.position = Point(x=float(cmd_pose[0]), y=float(cmd_pose[1]), z=0.0)
+            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                  y=quaternion[1],
+                                                  z=quaternion[2],
+                                                  w=quaternion[3])
+            self.cmd_pose_pub.publish(cmd_pose_msg)
 
             vx_k = cmd_pose[self.nx:]
             velocity_command_log.append([current_sim_time, "MPC", vx_k[0], vx_k[1], vx_k[2]])
@@ -404,7 +485,7 @@ class NeuralMPC:
             all_trajectories.append(x_traj[:self.nx, :].full())
 
             mpciter += 1
-            print("Entropy:", entropy_k)
+            rospy.loginfo("Entropy: %s", entropy_k)
             if entropy_k < 0.10:
                 break
             rate.sleep()
@@ -447,8 +528,8 @@ class NeuralMPC:
             writer.writerow(["Time (s)", "Tag", "x_velocity", "y_velocity", "yaw_velocity"])
             writer.writerows(velocity_command_log)
 
-        print(f"Performance metrics saved to {perf_csv}")
-        print(f"Velocity command log saved to {vel_csv}")
+        rospy.loginfo("Performance metrics saved to %s", perf_csv)
+        rospy.loginfo("Velocity command log saved to %s", vel_csv)
 
         plot_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_plot_data.csv")
         with open(plot_csv, mode='w', newline='') as csvfile:
@@ -467,7 +548,7 @@ class NeuralMPC:
                 lambda_vals = lambda_history[i]
                 row = [time_val, x, y, theta, entropy_val] + lambda_vals
                 writer.writerow(row)
-        print(f"Plot data saved to {plot_csv}")
+        rospy.loginfo("Plot data saved to %s", plot_csv)
 
         return all_trajectories, entropy_history, lambda_history, durations, g_nn_raw, g_nn_ripe, self.trees_pos, lb, ub
 
@@ -477,15 +558,15 @@ class NeuralMPC:
     def plot_animated_trajectory_and_entropy_2d(self, all_trajectories, entropy_history, lambda_history, trees, lb, ub, computation_durations):
         # Load both neural network models for plotting.
         model_raw = MultiLayerPerceptron(input_dim=self.nn_input_dim,
-                                        hidden_size=self.hidden_size,
-                                        hidden_layers=self.hidden_layers)
+                                         hidden_size=self.hidden_size,
+                                         hidden_layers=self.hidden_layers)
         model_raw.load_state_dict(torch.load(self.get_latest_best_model('ripe'), weights_only=True))
         model_raw.eval()
         g_nn_raw = l4c.L4CasADi(model_raw, name='plotting_f_raw', batched=True, device='cuda')
 
         model_ripe = MultiLayerPerceptron(input_dim=self.nn_input_dim,
-                                        hidden_size=self.hidden_size,
-                                        hidden_layers=self.hidden_layers)
+                                          hidden_size=self.hidden_size,
+                                          hidden_layers=self.hidden_layers)
         model_ripe.load_state_dict(torch.load(self.get_latest_best_model('ripe'), weights_only=True))
         model_ripe.eval()
         g_nn_ripe = l4c.L4CasADi(model_ripe, name='plotting_f_ripe', batched=True, device='cuda')
@@ -499,31 +580,21 @@ class NeuralMPC:
         # Compute predicted entropy reduction using the two NNs.
         entropy_mpc_pred = []
         for k in range(all_trajectories.shape[0]):
-            # Use the current lambda values as the starting belief for prediction.
             lambda_k = ca.DM(lambda_history[k])
             entropy_mpc_pred_k = [entropy_history[k]]
-            # For each future time step in the prediction horizon.
             for i in range(all_trajectories.shape[2]-1):
-                # Get the predicted state at horizon step i+1.
-                state_pred = all_trajectories[k, :, i+1]  # e.g., [x, y, theta, ...]
-                # Compute relative position for all trees.
+                state_pred = all_trajectories[k, :, i+1]
                 rel_pos = np.tile(state_pred[:2], (trees.shape[0], 1)) - trees
                 distance = np.sqrt(np.sum(rel_pos**2, axis=1))
                 theta_val = state_pred[2]
-                # Build the NN input: for each tree, input = [dx, dy, theta].
                 input_nn = ca.horzcat(ca.DM(rel_pos), ca.DM([[theta_val]]*trees.shape[0]))
-                # Evaluate both neural networks.
                 nn_raw_val = ca.fmax(g_nn_raw(input_nn), 0.5)
                 nn_ripe_val = ca.fmax(g_nn_ripe(input_nn), 0.5)
-                # For each tree, choose the network based on the initial lambda.
                 lambda_initial = np.array(lambda_history[k]).flatten()
                 nn_raw_np = np.array(nn_raw_val.full()).flatten()
                 nn_ripe_np = np.array(nn_ripe_val.full()).flatten()
-                # If lambda < 0.5, use 1 - nn_raw; otherwise use nn_ripe.
                 z_vals = np.where(lambda_initial < 0.5, 1 - nn_raw_np, nn_ripe_np)
-                # If the distance > 10, override with 0.5.
                 z_vals = np.where(distance > 10, 0.5, z_vals)
-                # Convert to CasADi DM and update lambda.
                 z_dm = ca.DM(z_vals)
                 lambda_k = self.bayes(lambda_k, z_dm)
                 current_entropy = ca.sum1(self.entropy(lambda_k)).full().flatten()[0]
@@ -569,8 +640,7 @@ class NeuralMPC:
             row=1, col=1
         )
 
-        # Add tree markers with a modified colorscale:
-        # Now 0 maps to green and 1 maps to red.
+        # Add tree markers.
         for i in range(trees.shape[0]):
             fig.add_trace(
                 go.Scatter(
@@ -775,12 +845,12 @@ class NeuralMPC:
         fig.write_html('neural_mpc_results.html')
         return entropy_mpc_pred
 
-
 # ---------------------------
 # Main Execution
 # ---------------------------
 if __name__ == "__main__":
+    rospy.init_node("neural_mpc_node", anonymous=True)
     mpc = NeuralMPC()
     sim_results = mpc.run_simulation()
-    # Optionally, you can call the plotting method:
+    # Optionally, call the plotting method:
     # mpc.plot_animated_trajectory_and_entropy_2d(*sim_results[:-4], computation_durations=sim_results[3])
