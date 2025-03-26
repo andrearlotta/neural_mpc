@@ -9,7 +9,8 @@ from plotly.subplots import make_subplots
 import plotly.io as pio
 import sys
 import os
-sys.path.append(os.path.join(os.getcwd(), '/home/andre/wkspaces/ROS/neural_mpc/ros/src/yolov7-ros/src'))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(os.getcwd(), script_dir + '/ros/src/yolov7-ros/src'))
 from models.experimental import attempt_load
 from utils.general import non_max_suppression, scale_coords
 from utils.plots import plot_one_box
@@ -17,9 +18,9 @@ from utils.torch_utils import select_device, time_synchronized
 from utils.datasets import letterbox
 
 # Configuration
-is_ripe = False
+is_ripe = True
 polar = False
-fixedView = True
+fixedView = False
 
 def find_latest_folder(base_dir):
     """Finds the most recently modified subdirectory in given base directory."""
