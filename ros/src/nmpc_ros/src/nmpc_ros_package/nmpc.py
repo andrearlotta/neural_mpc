@@ -294,7 +294,7 @@ class NeuralMPC:
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
         entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
-                                ( entropy_future - ca.entropy(ca.vcat([lambda_evol[0] for i in range(steps)]))) ) 
+                                ( entropy_future  - self.entropy(ca.vcat([lambda_evol[0] for i in range(steps)]))) ) 
 
         # Add terms to the objective.
         obj += w_entropy * entropy_term
