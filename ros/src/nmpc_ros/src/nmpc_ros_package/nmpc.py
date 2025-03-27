@@ -63,10 +63,10 @@ class NeuralMPC:
     def __init__(self):
         # Global Constants and Parameters
         self.hidden_size = 64
-        self.hidden_layers = 3
+        self.hidden_layers = 8
         self.nn_input_dim = 3
 
-        self.N = 2
+        self.N = 5
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
@@ -171,6 +171,7 @@ class NeuralMPC:
             model_files,
             key=lambda x: int(re.match(r"best_model_epoch_(\d+)\.pth", x).group(1))
         )
+        print( os.path.join(model_dir, latest_model))
         return os.path.join(model_dir, latest_model)
 
     @staticmethod
@@ -213,12 +214,9 @@ class NeuralMPC:
         Compute the binary entropy of a probability p.
         Values are clipped to avoid log(0).
         """
-        p = ca.fmax(ca.fmin(p, 1 - 1e-1), 1e-1)
+        p = ca.fmax(ca.fmin(p, 1 - 1e-5), 1e-5)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
 
-# ---------------------------
-# MPC Optimization Function
-# ---------------------------
 # ---------------------------
 # MPC Optimization Function
 # ---------------------------
@@ -245,9 +243,9 @@ class NeuralMPC:
         trees_dm = ca.DM(trees)  # shape: (num_trees, 2)
 
         # Weights and safety parameters.
-        w_control = 1e-1        # Control effort weight
-        w_ang = 1e-4             # Angular control weight
-        w_entropy = 1e3         # Weight for final entropy
+        w_control = 1e0         # Control effort weight
+        w_ang = 1e0            # Angular control weight
+        w_entropy = 1e2         # Weight for final entropy
         safe_distance = 1.25     # Safety margin (meters)
         R = ca.diag(ca.DM([w_control, w_control, w_ang]))
         # Initialize the objective.
@@ -261,76 +259,75 @@ class NeuralMPC:
             # State bounds.
             opti.subject_to(opti.bounded(lb[0] - 2., X[0, i], ub[0] + 2.))
             opti.subject_to(opti.bounded(lb[1] - 2., X[1, i], ub[1] + 2.))
-            opti.subject_to(opti.bounded(-6 * np.pi, X[2, i], 6 * np.pi))
-            opti.subject_to(ca.sumsqr(X[3:5, i]) <= 2.00)
+            opti.subject_to(opti.bounded(X0[2] - np.pi, X[2, i], X0[2] +  np.pi))
+            opti.subject_to(ca.sumsqr(X[3:5, i]) <= 4.00)
             opti.subject_to(opti.bounded(-3.14 / 4, X[5, i], 3.14 / 4))
             # Add control bounds and control cost for all but the last state.
             if i < steps:
                 opti.subject_to(ca.sumsqr(U[0:2, i]) <=8.0)
-                opti.subject_to( U[-1, i]**2 <= 3.14**2 / 4)
+                opti.subject_to( U[-1, i]**2 <= 3.14**2)
                 obj += ca.mtimes([U[:, i].T, R, U[:, i]])
             # Collision avoidance: ensure a safety margin from each tree.
-            #for t in range(num_trees):
-            #    opti.subject_to(ca.sumsqr(X[:2, i] - trees_dm[t, :].T) >= safe_distance ** 2)
+            for t in range(num_trees):
+                opti.subject_to(ca.sumsqr(X[:2, i] - trees_dm[t, :].T) >= safe_distance ** 2)
             if i < steps:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
 
-        # --- Neural Network Prediction and Belief Update ---
-        # Use a smoothing parameter for the sigmoid to blend network outputs.
+        # --- Neural Network Integration ---
         nn_batch = []
         for i in range(steps):
-            # For each tree, build NN input using the state at steps 1:steps+1.
             delta = X[:2, i+1] - trees_dm.T
-            heading = ca.vcat([X[2, i+1] for _ in range(num_trees)])
-            nn_batch.append(ca.horzcat(delta.T, heading))
+            theta = X[2, i+1]
+            heading_sin = ca.repmat(ca.sin(theta), 1, num_trees).T
+            heading_cos = ca.repmat(ca.cos(theta), 1, num_trees).T
+            nn_batch.append(ca.horzcat(delta.T, heading_sin, heading_cos))
 
-        lambda_0_ext = ca.vcat([lambda_evol[0] for i in range(steps)])
-        z_k = (lambda_0_ext <= 0.5) * ( 1 - ca.fmax(g_nn_raw(ca.vcat([*nn_batch])), 0.5)) + (lambda_0_ext > 0.5) * ca.fmax(g_nn_ripe(ca.vcat([*nn_batch])), 0.5)
-
+        z_k = 0.5 + 10 * g_nn_ripe(ca.vcat(nn_batch))
+        # Belief update
         for i in range(steps):
-            lambda_next = self.bayes(lambda_evol[-1], z_k[i*num_trees:(1+i)*num_trees])
+            lambda_next = self.bayes(lambda_evol[-1], z_k[i*num_trees:(i+1)*num_trees,:])
             lambda_evol.append(lambda_next)
 
         # Compute entropy terms for the objective.
-        entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
-        entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
-                                ( entropy_future  - self.entropy(ca.vcat([lambda_evol[0] for i in range(steps)]))) ) 
-
+        entropy_future = ca.sum1(self.entropy(ca.vcat([*lambda_evol]))) #- ca.sum1( z_k[i*num_trees:(i+1)*num_trees,:] * lambda_evol[0])
+    
         # Add terms to the objective.
-        obj += w_entropy * entropy_term
+        obj += w_entropy *(ca.sum1(self.entropy(lambda_evol[-1]))-ca.sum1(self.entropy(lambda_evol[0]))) #/ca.sum1(self.entropy(lambda_evol[0]))  
         opti.minimize(obj)
-
-        # Solver options.
+        # Solver settings
         options = {
             "ipopt": {
-                "tol": 1e-2,
-                "acceptable_tol": 1e-1,
-                "bound_relax_factor": 1e-1,
-                "bound_push": 1e-8,
-                "warm_start_init_point": "no",
-                "hessian_approximation": "limited-memory",
                 "print_level": 5,
-                "sb": "no",
-                "mu_strategy": "monotone",
-                "max_iter": 3000
+                "hessian_approximation": "limited-memory"
             }
         }
         opti.solver("ipopt", options)
-        
-        # Set parameter values.
-        opti.set_value(P0, ca.vertcat(x0, lambda_vals))
-        sol = opti.solve()
 
-        # Create the MPC step function for warm starting.
+        # Solve
+        opti.set_value(P0, ca.vertcat(x0, lambda_vals))
+        try:
+            sol = opti.solve()
+            u_opt = ca.DM(sol.value(U[:, 0]))
+            x_opt = ca.DM(sol.value(X))
+            x__opt = ca.DM(sol.value(opti.x))
+            lam_opt = ca.DM(sol.value(opti.lam_g))
+        except:
+            print("Solver failed, using initial guess")
+            u_opt = ca.DM(opti.debug.value(U[:, 0]))
+            x_opt = ca.DM(opti.debug.value(X))
+            x__opt = ca.DM(opti.debug.value(opti.x))
+            lam_opt = ca.DM(opti.debug.value(opti.lam_g))
+
+        # Function for warm-start
         inputs = [P0, opti.x, opti.lam_g]
         outputs = [U[:, 0], X, opti.x, opti.lam_g]
         mpc_step = opti.to_function("mpc_step", inputs, outputs)
 
         return (mpc_step,
-                ca.DM(sol.value(U[:, 0])),
-                ca.DM(sol.value(X)),
-                ca.DM(sol.value(opti.x)),
-                ca.DM(sol.value(opti.lam_g)))
+                u_opt,
+                x_opt,
+                x__opt,
+                lam_opt)
 
     # ---------------------------
     # Simulation Function
@@ -349,19 +346,17 @@ class NeuralMPC:
         # ---------------------------
         # Load the Learned Neural Network Models
         # ---------------------------
-        model_raw = MultiLayerPerceptron(input_dim=self.nn_input_dim,
-                                         hidden_size=self.hidden_size,
-                                         hidden_layers=self.hidden_layers)
+        model_raw = l4c.naive.MultiLayerPerceptron(4, 64, 1, 8, 'Tanh') 
         model_raw.load_state_dict(torch.load(self.get_latest_best_model('raw'), weights_only=True))
         model_raw.eval()
-        g_nn_raw = l4c.L4CasADi(model_raw, name='raw_nn', batched=True, device='cuda')
+        g_nn_raw = l4c.L4CasADi(model_raw, name='raw_nn', batched=True, device='cpu')
         
-        model_ripe = MultiLayerPerceptron(input_dim=self.nn_input_dim,
-                                          hidden_size=self.hidden_size,
-                                          hidden_layers=self.hidden_layers)
+
+        model_ripe = l4c.naive.MultiLayerPerceptron(4, 64, 1, 8, 'Tanh') 
+
         model_ripe.load_state_dict(torch.load(self.get_latest_best_model('ripe'), weights_only=True))
         model_ripe.eval()
-        g_nn_ripe = l4c.L4CasADi(model_ripe, name='ripe_nn', batched=True, device='cuda')
+        g_nn_ripe = l4c.L4CasADi(model_ripe, name='ripe_nn', batched=True, device='cpu')
 
         # Initialize robot state from the latest GPS callback.
         initial_state = self.current_state  # [x, y, theta]
@@ -410,7 +405,7 @@ class NeuralMPC:
                 rospy.sleep(0.05)
             latest_trees_scores = self.latest_trees_scores.copy()
             self.lambda_k = self.bayes(self.lambda_k, latest_trees_scores)
-            self.lambda_k = np.ceil(self.lambda_k*1000)/1000
+            self.lambda_k = np.ceil(self.lambda_k*100)/100
             rospy.loginfo("Current state x_k: %s", x_k)
             rospy.loginfo("Lambda: %s", self.lambda_k)
             rospy.loginfo("Current tree scores: %s", latest_trees_scores.flatten())
