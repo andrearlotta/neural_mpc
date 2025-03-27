@@ -67,7 +67,7 @@ class NeuralMPC:
     def __init__(self, run_dir=None, initial_randomic=False):
         # Global Constants and Parameters
         self.hidden_size = 64
-        self.hidden_layers = 3
+        self.hidden_layers = 8
         self.nn_input_dim = 3
 
         self.N = 10
