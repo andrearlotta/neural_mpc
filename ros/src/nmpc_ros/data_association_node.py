@@ -29,12 +29,12 @@ class DataAssociationNode:
         self.publish_visualization = rospy.get_param('~publish_visualization', True)
 
         detection_sub = message_filters.Subscriber("/yolov7/detect", Detection2DArray)
-        depth_image_sub = message_filters.Subscriber("/camera/depth/image/compressed", CompressedImage)
+        depth_image_sub = message_filters.Subscriber("/agent_0/camera/depth/image/compressed", CompressedImage)
 
         self.ts = message_filters.ApproximateTimeSynchronizer([detection_sub, depth_image_sub], queue_size=10, slop=0.2)
         self.ts.registerCallback(self.synchronized_callback)
 
-        self.camera_info_sub = rospy.Subscriber("/camera/depth/camera_info", CameraInfo, self.camera_info_callback)
+        self.camera_info_sub = rospy.Subscriber("/agent_0/camera/depth/camera_info", CameraInfo, self.camera_info_callback)
         self.scores_pub = rospy.Publisher("/tree_scores", Float32MultiArray, queue_size=1)
         
         if self.publish_visualization:
