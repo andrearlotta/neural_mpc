@@ -48,7 +48,7 @@ def main():
     # Define baseline modes and directories
     modes = ["greedy", "mpc"]
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    baselines_dir = os.path.join(script_dir, "baselines")
+    baselines_dir = os.path.join(script_dir, "test_for_creating_plot_greedy/run_23")
 
     # Collect data for each mode
     all_data = []
