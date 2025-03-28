@@ -13,3 +13,4 @@ ros/build
 *.pth
 unity_exec/*
 *events.out.*
+*.svg

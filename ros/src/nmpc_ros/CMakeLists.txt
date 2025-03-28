@@ -80,6 +80,7 @@ catkin_install_python(PROGRAMS
   multi_nmpc_ros_node.py
   multi_data_association_node.py
   fov_mpc.py
+  kmeans.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
