@@ -1,0 +1,12 @@
+<launch>
+
+  <include file="$(find ros_tcp_endpoint)/launch/endpoint.launch"/>
+  <include file="$(find yolov7_ros)/launch/yolov7_multi.launch"/>
+  
+  <arg name="node_start_delay" default="10.0" />  
+
+  <!-- Launch data_association_node.py -->
+  <node name="data_association_node" pkg="nmpc_ros" type="multi_data_association_node.py" output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@' " /> 
+  <!-- Launch nmpc.py -->
+  <node name="main_node" pkg="nmpc_ros" type="multi_nmpc_ros_node.py" output="screen"/>
+</launch>
