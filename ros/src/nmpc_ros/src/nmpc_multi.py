@@ -90,9 +90,9 @@ class NeuralMPC:
         # Subscribers
         rospy.Subscriber("tree_scores", Float32MultiArray, self.tree_scores_callback)
         # Publishers
-        self.cmd_pose_pub = rospy.Publisher("agent_1/cmd/pose", Pose, queue_size=10)
-        self.pred_path_pub = rospy.Publisher("agent_1/predicted_path", Path, queue_size=10)
-        self.tree_markers_pub = rospy.Publisher("agent_1/tree_markers", MarkerArray, queue_size=10)
+        self.cmd_pose_pub = rospy.Publisher("cmd/pose", Pose, queue_size=10)
+        self.pred_path_pub = rospy.Publisher("predicted_path", Path, queue_size=10)
+        self.tree_markers_pub = rospy.Publisher("tree_markers", MarkerArray, queue_size=10)
 
         # Get tree positions from service using the sensors.py serializer logic.
         self.trees_pos = self.get_trees_poses()
