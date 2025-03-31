@@ -497,7 +497,7 @@ class NeuralMPC:
         baselines_dir = os.path.join(script_dir, "baselines")
         os.makedirs(baselines_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        perf_csv = os.path.join(baselines_dir, f"mpc_n{self.n_agent}_{timestamp}_performance_metrics.csv")
+        perf_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
         with open(perf_csv, mode='w', newline='') as perf_file:
             writer = csv.writer(perf_file)
             writer.writerow([
@@ -515,7 +515,7 @@ class NeuralMPC:
                 total_commands
             ])
 
-        vel_csv = os.path.join(baselines_dir, f"mpc_n{self.n_agent}_{timestamp}_velocity_commands.csv")
+        vel_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
         with open(vel_csv, mode='w', newline='') as vel_file:
             writer = csv.writer(vel_file)
             writer.writerow(["Time (s)", "Tag", "x_velocity", "y_velocity", "yaw_velocity"])
@@ -524,7 +524,7 @@ class NeuralMPC:
         rospy.loginfo("Performance metrics saved to %s", perf_csv)
         rospy.loginfo("Velocity command log saved to %s", vel_csv)
 
-        plot_csv = os.path.join(baselines_dir, f"mpc_n{self.n_agent}_{timestamp}_plot_data.csv")
+        plot_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_plot_data.csv")
         with open(plot_csv, mode='w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             tree_positions_flat = self.trees_pos.flatten().tolist()
