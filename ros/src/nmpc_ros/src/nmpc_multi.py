@@ -77,6 +77,9 @@ class NeuralMPC:
         self.current_state = None
 
         rospy.init_node("nmpc_node", anonymous=True, log_level=rospy.DEBUG)
+
+        # agent number
+        self.n_agent = rospy.get_param('~n_agent', 1) # default 1
         
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -110,8 +113,9 @@ class NeuralMPC:
         rate = rospy.Rate(30)  # 30 Hz update rate
         while not rospy.is_shutdown():
             try:
-                # Look up the transform from 'map' to 'drone_base_link'
-                trans = self.tf_buffer.lookup_transform('map', 'base_link_1', rospy.Time(0))
+                # Look up the transform from 'map' to 'base_link_n'
+                link_str = 'base_link_' + str(self.n_agent)
+                trans = self.tf_buffer.lookup_transform('map', link_str, rospy.Time(0))
                 # Extract the yaw angle from the quaternion
                 (_, _, yaw) = tf.transformations.euler_from_quaternion([
                     trans.transform.rotation.x,
