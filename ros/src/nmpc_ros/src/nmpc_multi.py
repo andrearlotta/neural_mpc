@@ -350,6 +350,17 @@ class NeuralMPC:
             rospy.sleep(0.05)
         rospy.loginfo("GPS data received.")
 
+        ######################################### DA RIVEDERE
+        # # FORZARE A MANO I RETTANGOLI (divido campo in tre strisce uguali)
+        # dom_length = (ub[1]-lb[1])/3 # lunghezza striscia (lungo x; y non si tocca)
+        # ub[1] = - dom_length * (self.n_agent-1)
+        # lb[1] = - dom_length * (self.n_agent)
+        # # # inizializza posizioni a metà della fascia
+        # cmd_pose_msg = Pose()
+        # cmd_pose_msg.position = Point(x=self.current_state[0], y=float((lb[1]+ub[1])/2), z=0.0)
+        # self.cmd_pose_pub.publish(cmd_pose_msg)
+        #########################################
+
         # ---------------------------
         # Load the Learned Neural Network Models
         # ---------------------------
