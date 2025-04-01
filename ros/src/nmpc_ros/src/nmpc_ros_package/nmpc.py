@@ -69,7 +69,9 @@ class NeuralMPC:
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
         self.trees_pos = np.array(self.bridge.call_server({"trees_poses": None})["trees_poses"])
-        self.lambda_k = ca.DM.ones(self.trees_pos.shape[0],1) * 0.5
+        # Initialize two lambda vectors: one for raw and one for ripe.
+        self.lambda_k_raw = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
+        self.lambda_k_ripe = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
 
     # ---------------------------
     # Sensor Callback Thread
@@ -78,10 +80,28 @@ class NeuralMPC:
         while not rospy.is_shutdown():
             data = self.bridge.get_data()
             if data["tree_scores"] is not None:
-                self.latest_trees_scores = data["tree_scores"]
-                # Update belief using tree scores.
-                self.lambda_k = self.bayes(self.lambda_k, self.latest_trees_scores)
-                self.lambda_k = np.ceil(self.lambda_k*1000)/1000
+                
+                # Assume tree_scores is an array with values in [0,1]
+                scores = np.array(data["tree_scores"])
+                raw_scores = scores.copy()
+                ripe_scores = scores.copy()
+                # For each tree score, if the value is less than 0.5,
+                # flip it so that it lies between 0.5 and 1 for the raw branch,
+                # and set the ripe branch to a neutral value (here 0.5).
+                # Otherwise, update the ripe branch with the original value and keep raw neutral.
+                for i, val in enumerate(scores):
+                    if val < 0.5:
+                        raw_scores[i] = 0.5 + (0.5 - val)  # flip: e.g., 0.2 becomes 0.8
+                        ripe_scores[i] = 0.5
+                    else:
+                        raw_scores[i] = 0.5
+                        ripe_scores[i] = val
+                # Update both lambda arrays using the bayes update.
+                self.lambda_k_raw = self.bayes(self.lambda_k_raw, ca.DM(raw_scores))
+                self.lambda_k_ripe = self.bayes(self.lambda_k_ripe, ca.DM(ripe_scores))
+                self.lambda_k_raw = np.ceil(self.lambda_k_raw * 1000) / 1000
+                self.lambda_k_ripe = np.ceil(self.lambda_k_ripe * 1000) / 1000
+                self.latest_trees_scores = scores
             time.sleep(measurement_interval)
 
     def start_measurement_thread(self, measurement_interval=0.5):
@@ -143,7 +163,7 @@ class NeuralMPC:
            lambda_next = (lambda_prev * z) / (lambda_prev * z + (1 - lambda_prev) * (1 - z))
         """
         prod = lambda_prev * z
-        denom = prod + (1 - lambda_prev) * (1 - z)
+        denom = prod + (1 - lambda_prev) * (1 - z) + 1e-9
         return prod / denom
 
     @staticmethod
@@ -152,7 +172,7 @@ class NeuralMPC:
         Compute the binary entropy of a probability p.
         Values are clipped to avoid log(0).
         """
-        p = ca.fmin(p, 1 - 1e-6)
+        p = ca.fmax(ca.fmin(p, 1 - 1e-6), 1e-9)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
 
     # ---------------------------
@@ -171,11 +191,13 @@ class NeuralMPC:
 
         # Parameter vector: initial state and tree beliefs.
         num_trees = trees.shape[0]
-        P0 = opti.parameter(n_state + num_trees)
+        P0 = opti.parameter(n_state + num_trees*2)
         X0 = P0[: n_state]
-        L0 = P0[n_state:]
-        # Initialize belief evolution.
-        lambda_evol = [L0]
+        L0_raw = P0[n_state : n_state + num_trees]
+        L0_ripe = P0[n_state + num_trees : n_state + 2 * num_trees]
+        # Initialize belief evolution for both branches.
+        lambda_evol_raw = [L0_raw]
+        lambda_evol_ripe = [L0_ripe]
 
         # Convert tree positions to a CasADi DM.
         trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
@@ -224,18 +246,22 @@ class NeuralMPC:
             nn_batch.append(ca.horzcat(delta.T, heading.T))
 
         g_out = g_nn(ca.vcat([*nn_batch]))
-        # Threshold the NN output
+
+        # Use the NN output to update both branches over the horizon.
         z_k = ca.fmax(g_out, 0.5)
-
         for i in range(steps):
-            lambda_next = self.bayes(lambda_evol[-1], z_k[i::steps])
-            lambda_evol.append(lambda_next)
+            lambda_next_raw = self.bayes(lambda_evol_raw[-1], z_k[i::steps])
+            lambda_evol_raw.append(lambda_next_raw)
+            lambda_next_ripe = self.bayes(lambda_evol_ripe[-1], z_k[i::steps])
+            lambda_evol_ripe.append(lambda_next_ripe)
 
-        # Compute entropy terms for the objective.
-        entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
-        entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
-                                ( entropy_future - ca.vcat([lambda_evol[0] for i in range(steps)])) ) * w_entropy
-
+        # Compute the entropy evolution for each branch.
+        entropy_future_raw = self.entropy(ca.vcat([*lambda_evol_raw[1:]]))
+        entropy_future_ripe = self.entropy(ca.vcat([*lambda_evol_ripe[1:]]))
+        # Combine the two entropy futures with softmax weighting.
+        entropy_future_combined = entropy_future_raw* entropy_future_ripe
+        entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
+                               (entropy_future_combined)) * w_entropy
         # Add terms to the objective.
         obj += entropy_term
         opti.minimize(obj)
@@ -244,8 +270,6 @@ class NeuralMPC:
         options = {
             "ipopt": {
                 "tol": 1e-2,
-                "bound_relax_factor": 1e-1,
-                "bound_push": 1e-8,
                 "warm_start_init_point": "yes",
                 "hessian_approximation": "limited-memory",
                 "print_level": 0,
@@ -276,9 +300,7 @@ class NeuralMPC:
     def run_simulation(self):
         F_ = self.kin_model(self.nx, self.dt)
         # Get tree positions from the server.
-
         lb, ub = self.get_domain(self.trees_pos)
-
         self.mpc_horizon = self.N
 
         # Start sensor measurement thread.
@@ -302,6 +324,8 @@ class NeuralMPC:
         # Containers for simulation output.
         all_trajectories = []
         lambda_history = []
+        lambda_ripe_history = []
+        lambda_raw_history = []
         entropy_history = []
         durations = []
 
@@ -347,20 +371,23 @@ class NeuralMPC:
                 time.sleep(0.05)
 
             print("Current state x_k:", x_k)
-            print("Lambda:", self.lambda_k)
-
+            print("Lambda raw:", self.lambda_k_raw)
+            print("Lambda ripe:", self.lambda_k_ripe)
+            lambda_score = (self.lambda_k_ripe > self.lambda_k_raw) * self.lambda_k_ripe + (self.lambda_k_ripe <= self.lambda_k_raw) * (1 - self.lambda_k_raw)
             self.bridge.pub_data({
-                "tree_markers": {"trees_pos": self.trees_pos, "lambda": self.lambda_k.full().flatten()}
+                "tree_markers": {"trees_pos": self.trees_pos, "lambda": lambda_score.full().flatten()}
             })
 
             step_start_time = time.time()
             if warm_start:
-                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.mpc_horizon)
+                # Concatenate the two lambda arrays for the MPC parameter.
+                lambdas_concat = ca.vertcat(self.lambda_k_raw, self.lambda_k_ripe)
+                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, lambdas_concat, self.mpc_horizon)
                 warm_start = False
             else:
-                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k), x_dec, lam)
+                lambdas_concat = ca.vertcat(self.lambda_k_raw, self.lambda_k_ripe)
+                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambdas_concat), x_dec, lam)
             durations.append(time.time() - step_start_time)
-
             # Log the MPC velocity command.
             u_np = np.array(u.full()).flatten()
 
@@ -388,14 +415,16 @@ class NeuralMPC:
             total_distance += distance_step
             prev_x, prev_y = curr_x, curr_y
 
-            entropy_k = ca.sum1(self.entropy(self.lambda_k)).full().flatten()[0]
-            lambda_history.append(self.lambda_k.full().flatten().tolist())
+            entropy_k = ca.sum1(ca.fmin(self.entropy(self.lambda_k_raw), self.entropy(self.lambda_k_ripe))).full().flatten()[0]
+            lambda_history.append(lambda_score.full().flatten().tolist())
+            lambda_ripe_history.append(self.lambda_k_ripe)
+            lambda_raw_history.append(self.lambda_k_raw)
             entropy_history.append(entropy_k)
             all_trajectories.append(x_traj[:self.nx, :].full())
 
             mpciter += 1
             print("Entropy:", entropy_k)
-            if entropy_k < 0.10:
+            if entropy_k < 0.15:
                 break
             rate.sleep()
 
@@ -410,26 +439,31 @@ class NeuralMPC:
         avg_trans_speed = sum_trans_speed / total_commands if total_commands > 0 else 0.0
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        baselines_dir = os.path.join(script_dir, "baselines")
+        baselines_dir = os.path.join(script_dir, "../../baselines")
         os.makedirs(baselines_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         perf_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
         with open(perf_csv, mode='w', newline='') as perf_file:
-            writer = csv.writer(perf_file)
-            writer.writerow([
+            headers = [
                 "Total Execution Time (s)",
                 "Total Distance (m)",
                 "Average Waypoint-to-Waypoint Time (s)",
                 "Final Entropy",
                 "Total Commands"
-            ])
-            writer.writerow([
+            ]
+
+            values = [
                 total_execution_time,
                 total_distance,
                 avg_wp_time,
                 entropy_history[-1] if entropy_history else "N/A",
                 total_commands
-            ])
+            ]
+
+            writer = csv.writer(perf_file)
+            # Write data as columns: one label per row with its value
+            for label, value in zip(headers, values):
+                writer.writerow([label, value])
 
         vel_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
         with open(vel_csv, mode='w', newline='') as vel_file:
@@ -452,20 +486,35 @@ class NeuralMPC:
             writer.writerow(header)
             for i in range(len(time_history)):
                 time_val = time_history[i]
-                x, y, theta = pose_history[i]
+                x, y, theta = np.array(pose_history[i]).flatten()
                 entropy_val = entropy_history[i]
                 lambda_vals = lambda_history[i]
                 row = [time_val, x, y, theta, entropy_val] + lambda_vals
                 writer.writerow(row)
         print(f"Plot data saved to {plot_csv}")
 
+        # ---------------------------
+        # Save Lambda History Separately
+        # ---------------------------
+        lambda_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_lambda_history.csv")
+        with open(lambda_csv, mode='w', newline='') as lambda_file:
+            writer = csv.writer(lambda_file)
+            writer.writerow(["time"] + [f"lambda_{i}" for i in range(len(lambda_history[0]))])
+            for i in range(len(time_history)):
+                writer.writerow([time_history[i]] + lambda_history[i])
+        print(f"Lambda history saved to {lambda_csv}")
+
+        # Store time and entropy history for separate plotting.
+        self.time_history = time_history
+        self.entropy_history = entropy_history
+
         return all_trajectories, entropy_history, lambda_history, durations, g_nn, self.trees_pos, lb, ub
 
     # ---------------------------
-    # Plotting Function
+    # Plotting Function (Animated Trajectory etc.)
     # ---------------------------
     def plot_animated_trajectory_and_entropy_2d(self, all_trajectories, entropy_history, lambda_history, trees, lb, ub, computation_durations):
-        # Reload the model for plotting.
+        # (The original plotting function remains unchanged.)
         model = MultiLayerPerceptron(input_dim=self.nn_input_dim,
                                      hidden_size=self.hidden_size,
                                      hidden_layers=self.hidden_layers)
@@ -489,7 +538,7 @@ class NeuralMPC:
                 distance_robot_trees = np.sqrt(np.sum(relative_position_robot_trees**2, axis=1))
                 theta = np.tile(all_trajectories[k, 2, i+1], (trees.shape[0], 1))
                 input_nn = ca.horzcat(relative_position_robot_trees, theta)
-                z_k = (distance_robot_trees > 10) * 0.5 + (distance_robot_trees <= 10) * ca.fmax(g_nn(input_nn), 0.5)
+                z_k =  ca.fmax(g_nn(input_nn), 0.5)
                 lambda_k = self.bayes(lambda_k, z_k)
                 reduction = ca.sum1(self.entropy(lambda_k)).full().flatten()[0]
                 entropy_mpc_pred_k.append(reduction)
@@ -740,11 +789,31 @@ class NeuralMPC:
         fig.write_html('neural_mpc_results.html')
         return entropy_mpc_pred
 
+    # ---------------------------
+    # New Function: Plot Entropy Separately
+    # ---------------------------
+    def plot_entropy_separately(self):
+        # Ensure we have stored time and entropy history
+        if not hasattr(self, "time_history") or not hasattr(self, "entropy_history"):
+            print("Time or entropy history is not available. Run the simulation first.")
+            return
+        # Create a separate Plotly figure for the entropy plot.
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=self.time_history, y=self.entropy_history,
+                                 mode='lines+markers', name='Entropy'))
+        fig.update_layout(title='Entropy over Time',
+                          xaxis_title='Time (s)',
+                          yaxis_title='Entropy')
+        fig.show()
+        fig.write_html('neural_mpc_entropy.html')
+
 # ---------------------------
 # Main Execution
 # ---------------------------
 if __name__ == "__main__":
     mpc = NeuralMPC()
     sim_results = mpc.run_simulation()
-    # Optionally, you can call the plotting method:
+    # Optionally, you can call the animated plotting method:
     # mpc.plot_animated_trajectory_and_entropy_2d(*sim_results[:-4], computation_durations=sim_results[3])
+    # And to plot the entropy separately:
+    mpc.plot_entropy_separately()
