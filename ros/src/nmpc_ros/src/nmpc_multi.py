@@ -23,6 +23,7 @@ from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import MarkerArray
 from nav_msgs.msg import Path
 import tf
+from std_msgs.msg import Float32MultiArray
 
 # Service import for tree poses (as in sensors.py)
 from nmpc_ros.srv import GetTreesPoses
@@ -96,6 +97,8 @@ class NeuralMPC:
         self.cmd_pose_pub = rospy.Publisher("cmd/pose", Pose, queue_size=10)
         self.pred_path_pub = rospy.Publisher("predicted_path", Path, queue_size=10)
         self.tree_markers_pub = rospy.Publisher("tree_markers", MarkerArray, queue_size=10)
+        # send lambda values
+        self.lambda_pub = rospy.Publisher('lambda', Float32MultiArray, queue_size=10)
 
         # Get tree positions from service using the sensors.py serializer logic.
         self.trees_pos = self.get_trees_poses()
@@ -485,6 +488,11 @@ class NeuralMPC:
             lambda_history.append(self.lambda_k.full().flatten().tolist())
             entropy_history.append(entropy_k)
             all_trajectories.append(x_traj[:self.nx, :].full())
+
+            # send lambda values
+            lambda_msg = Float32MultiArray()
+            lambda_msg.data = self.lambda_k.full().flatten()
+            self.lambda_pub.publish(lambda_msg)
 
             mpciter += 1
             rospy.loginfo("Entropy: %s", entropy_k)
