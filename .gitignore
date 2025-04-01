@@ -14,7 +14,6 @@ ros/logs
 ros/pyenv
 ros/build
 scripts.zip
-ros/src/nmpc_ros/src/nmpc_ros_package/models/*
 datasets/*
 *.html
 *.png
