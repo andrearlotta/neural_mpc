@@ -8,7 +8,6 @@ saved_models/*
 entropy_reduction_mpc.py
 saved_models_*
 scripts/*
-_models/*
 ros/.catkin_tools
 ros/devel
 ros/logs
