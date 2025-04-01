@@ -107,7 +107,6 @@ class NeuralMPC:
     # ---------------------------
     # Callback Functions
     # ---------------------------
-
     def robot_state_update_thread(self):
         """Continuously update the robot's state using TF at 30 Hz."""
         rate = rospy.Rate(30)  # 30 Hz update rate
@@ -268,6 +267,16 @@ class NeuralMPC:
             opti.subject_to(opti.bounded(-6 * np.pi, X[2, i], 6 * np.pi))
             opti.subject_to(ca.sumsqr(X[3:5, i]) <= 2.00)
             opti.subject_to(opti.bounded(-3.14 / 4, X[5, i], 3.14 / 4))
+            #########################################
+            # Vincolo rettangolo di lavoro (poi capire come implementare le singole zone)
+            # Si muove su tutte le x ma y limitata
+            if self.n_agent == 1:
+                opti.subject_to(opti.bounded(-5.33, X[1, i], 0.0))
+            if self.n_agent == 2:
+                opti.subject_to(opti.bounded(-10.66, X[1, i], -5.33))
+            if self.n_agent == 3:
+                opti.subject_to(opti.bounded(-16.0, X[1, i], -10.66))
+            #########################################
             # Add control bounds and control cost for all but the last state.
             if i < steps:
                 opti.subject_to(ca.sumsqr(U[0:2, i]) <=8.0)
@@ -313,7 +322,7 @@ class NeuralMPC:
                 "bound_push": 1e-8,
                 "warm_start_init_point": "no",
                 "hessian_approximation": "limited-memory",
-                "print_level": 5,
+                "print_level": 5, #5
                 "sb": "no",
                 "mu_strategy": "monotone",
                 "max_iter": 3000
@@ -349,17 +358,6 @@ class NeuralMPC:
         while self.current_state is None and not rospy.is_shutdown():
             rospy.sleep(0.05)
         rospy.loginfo("GPS data received.")
-
-        ######################################### DA RIVEDERE
-        # # FORZARE A MANO I RETTANGOLI (divido campo in tre strisce uguali)
-        # dom_length = (ub[1]-lb[1])/3 # lunghezza striscia (lungo x; y non si tocca)
-        # ub[1] = - dom_length * (self.n_agent-1)
-        # lb[1] = - dom_length * (self.n_agent)
-        # # # inizializza posizioni a metà della fascia
-        # cmd_pose_msg = Pose()
-        # cmd_pose_msg.position = Point(x=self.current_state[0], y=float((lb[1]+ub[1])/2), z=0.0)
-        # self.cmd_pose_pub.publish(cmd_pose_msg)
-        #########################################
 
         # ---------------------------
         # Load the Learned Neural Network Models
