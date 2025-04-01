@@ -104,6 +104,20 @@ class NeuralMPC:
         self.trees_pos = self.get_trees_poses()
         self.lambda_k = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
 
+        # Consensus protocol
+        # Network connection (fully connected)
+        n_robots = 3
+        neighbors = list(range(1, n_robots+1))
+        neighbors.remove(int(self.n_agent))
+        # subscibers
+        subscribers_net = []
+        for neighbor in neighbors:
+            topic = f"/agent_{neighbor}/lambda"
+            sub = rospy.Subscriber(topic, Float32MultiArray, self.consensus_lambda)
+            subscribers_net.append(sub)
+        # Lambda consensus variables
+        self.lambda_cons = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
+
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
 
@@ -138,6 +152,23 @@ class NeuralMPC:
         Callback for tree scores.
         """
         self.latest_trees_scores = np.array(msg.data).reshape(-1, 1)
+
+    def consensus_lambda(self, msg):
+        """
+        Callback for consensus lambda.
+        """
+        # Take data
+        neighbors = msg.data
+        lambda_curr = self.lambda_cons.full().flatten()
+        # Compute maximum/minimum
+        result_max = np.maximum(neighbors, lambda_curr)
+        result_min = np.minimum(neighbors, lambda_curr)
+        for i in range(len(result_max)):
+            val_max = result_max[i] - 0.5
+            val_min = 0.5 - result_min[i]
+            if val_max > val_min:
+                result_min[i] = result_max[i]
+        self.lambda_cons = ca.DM(result_min)
 
     # ---------------------------
     # Service Call to Get Trees Poses
@@ -417,6 +448,7 @@ class NeuralMPC:
                 rospy.sleep(0.05)
             current_state = self.current_state
             current_sim_time = time.time() - sim_start_time
+            self.lambda_k = self.lambda_cons
             pose_history.append(current_state)
             time_history.append(current_sim_time)
             x_k = ca.vertcat(ca.DM(current_state), vx_k)
