@@ -89,9 +89,12 @@ def main():
         showlegend=True
     )
 
-    # Save and show the figure
+    # Save and show the figure (html)
     output_path = os.path.join(baselines_dir, "all_lambdas_plot.html")
     fig.write_html(output_path)
+    # Save figure (svg)
+    # output_path = os.path.join(baselines_dir, "all_lambdas_plot.svg")
+    # fig.write_image(output_path)
     print(f"Saved combined plot to: {output_path}")
     
     fig.show()
