@@ -143,7 +143,7 @@ class NeuralMPC:
            lambda_next = (lambda_prev * z) / (lambda_prev * z + (1 - lambda_prev) * (1 - z))
         """
         prod = lambda_prev * z
-        denom = prod + (1 - lambda_prev) * (1 - z)
+        denom = prod + (1 - lambda_prev) * (1 - z) + 1e-9
         return prod / denom
 
     @staticmethod
@@ -152,7 +152,7 @@ class NeuralMPC:
         Compute the binary entropy of a probability p.
         Values are clipped to avoid log(0).
         """
-        p = ca.fmin(p, 1 - 1e-6)
+        p = ca.fmax(ca.fmin(p, 1 - 1e-6), 1e-9)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
 
     # ---------------------------
@@ -233,9 +233,7 @@ class NeuralMPC:
 
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
-        entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
-                                ( entropy_future - ca.vcat([lambda_evol[0] for i in range(steps)])) ) * w_entropy
-
+        entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) * entropy_future) * w_entropy
         # Add terms to the objective.
         obj += entropy_term
         opti.minimize(obj)
@@ -244,8 +242,6 @@ class NeuralMPC:
         options = {
             "ipopt": {
                 "tol": 1e-2,
-                "bound_relax_factor": 1e-1,
-                "bound_push": 1e-8,
                 "warm_start_init_point": "yes",
                 "hessian_approximation": "limited-memory",
                 "print_level": 0,
@@ -276,9 +272,7 @@ class NeuralMPC:
     def run_simulation(self):
         F_ = self.kin_model(self.nx, self.dt)
         # Get tree positions from the server.
-
         lb, ub = self.get_domain(self.trees_pos)
-
         self.mpc_horizon = self.N
 
         # Start sensor measurement thread.
@@ -360,7 +354,6 @@ class NeuralMPC:
             else:
                 u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k), x_dec, lam)
             durations.append(time.time() - step_start_time)
-
             # Log the MPC velocity command.
             u_np = np.array(u.full()).flatten()
 
@@ -395,7 +388,7 @@ class NeuralMPC:
 
             mpciter += 1
             print("Entropy:", entropy_k)
-            if entropy_k < 0.10:
+            if all( v >=0.99 for v in ca.fmax(self.lambda_k_ripe, self.lambda_k_raw).full().flatten()) :
                 break
             rate.sleep()
 
@@ -410,26 +403,31 @@ class NeuralMPC:
         avg_trans_speed = sum_trans_speed / total_commands if total_commands > 0 else 0.0
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        baselines_dir = os.path.join(script_dir, "baselines")
+        baselines_dir = os.path.join(script_dir, "../../baselines")
         os.makedirs(baselines_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         perf_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
         with open(perf_csv, mode='w', newline='') as perf_file:
-            writer = csv.writer(perf_file)
-            writer.writerow([
+            headers = [
                 "Total Execution Time (s)",
                 "Total Distance (m)",
                 "Average Waypoint-to-Waypoint Time (s)",
                 "Final Entropy",
                 "Total Commands"
-            ])
-            writer.writerow([
+            ]
+
+            values = [
                 total_execution_time,
                 total_distance,
                 avg_wp_time,
                 entropy_history[-1] if entropy_history else "N/A",
                 total_commands
-            ])
+            ]
+
+            writer = csv.writer(perf_file)
+            # Write data as columns: one label per row with its value
+            for label, value in zip(headers, values):
+                writer.writerow([label, value])
 
         vel_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
         with open(vel_csv, mode='w', newline='') as vel_file:
@@ -452,7 +450,7 @@ class NeuralMPC:
             writer.writerow(header)
             for i in range(len(time_history)):
                 time_val = time_history[i]
-                x, y, theta = pose_history[i]
+                x, y, theta = np.array(pose_history[i]).flatten()
                 entropy_val = entropy_history[i]
                 lambda_vals = lambda_history[i]
                 row = [time_val, x, y, theta, entropy_val] + lambda_vals
@@ -489,7 +487,7 @@ class NeuralMPC:
                 distance_robot_trees = np.sqrt(np.sum(relative_position_robot_trees**2, axis=1))
                 theta = np.tile(all_trajectories[k, 2, i+1], (trees.shape[0], 1))
                 input_nn = ca.horzcat(relative_position_robot_trees, theta)
-                z_k = (distance_robot_trees > 10) * 0.5 + (distance_robot_trees <= 10) * ca.fmax(g_nn(input_nn), 0.5)
+                z_k =  ca.fmax(g_nn(input_nn), 0.5)
                 lambda_k = self.bayes(lambda_k, z_k)
                 reduction = ca.sum1(self.entropy(lambda_k)).full().flatten()[0]
                 entropy_mpc_pred_k.append(reduction)
