@@ -55,7 +55,7 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 5
+        self.N = 7
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
@@ -259,7 +259,7 @@ class NeuralMPC:
         entropy_future_raw = self.entropy(ca.vcat([*lambda_evol_raw[1:]]))
         entropy_future_ripe = self.entropy(ca.vcat([*lambda_evol_ripe[1:]]))
         # Combine the two entropy futures with softmax weighting.
-        entropy_future_combined = entropy_future_raw* entropy_future_ripe
+        entropy_future_combined = ca.fmin(entropy_future_raw,entropy_future_ripe)
         entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
                                (entropy_future_combined)) * w_entropy
         # Add terms to the objective.
@@ -271,6 +271,9 @@ class NeuralMPC:
             "ipopt": {
                 "tol": 1e-2,
                 "warm_start_init_point": "yes",
+                "tol": 1e-2,
+                "bound_relax_factor": 1e-1,
+                "bound_push": 1e-8,
                 "hessian_approximation": "limited-memory",
                 "print_level": 0,
                 "sb": "no",
@@ -507,6 +510,9 @@ class NeuralMPC:
         # Store time and entropy history for separate plotting.
         self.time_history = time_history
         self.entropy_history = entropy_history
+        # Also store the lambda histories as class attributes for later plotting.
+        self.lambda_ripe_history = [lr.full().flatten().tolist() for lr in lambda_ripe_history]
+        self.lambda_raw_history = [lr.full().flatten().tolist() for lr in lambda_raw_history]
 
         return all_trajectories, entropy_history, lambda_history, durations, g_nn, self.trees_pos, lb, ub
 
@@ -790,6 +796,59 @@ class NeuralMPC:
         return entropy_mpc_pred
 
     # ---------------------------
+    # New Function: Plot Lambda Entropy Trends for Each Tree
+    # ---------------------------
+    def plot_tree_lambda_trends(self):
+        """
+        Plots for each tree the trend of the binary entropy computed from the raw and ripe lambda values over time.
+        It uses the stored self.time_history, self.lambda_raw_history, and self.lambda_ripe_history.
+        """
+        # Ensure we have stored time and lambda history
+        if (not hasattr(self, "time_history") or 
+            not hasattr(self, "lambda_raw_history") or 
+            not hasattr(self, "lambda_ripe_history")):
+            print("Time or lambda history is not available. Run the simulation first.")
+            return
+
+        # Local helper to compute binary entropy.
+        def binary_entropy(p):
+            p = np.clip(p, 1e-9, 1-1e-9)
+            return -p * np.log2(p) - (1-p) * np.log2(1-p)
+
+        time_history = self.time_history
+        num_steps = len(time_history)
+        # Determine the number of trees from the first entry of the lambda history.
+        num_trees = len(self.lambda_raw_history[0])
+
+        # Create subplots: one row per tree.
+        fig = make_subplots(rows=num_trees, cols=1, shared_xaxes=True,
+                            subplot_titles=[f"Tree {i} Lambda Entropy Trend" for i in range(num_trees)])
+
+        # For each tree, compute the entropy over time for both raw and ripe lambda values.
+        for i in range(num_trees):
+            raw_vals = [entry[i] for entry in self.lambda_raw_history]
+            ripe_vals = [entry[i] for entry in self.lambda_ripe_history]
+            raw_entropy = [binary_entropy(val) for val in raw_vals]
+            ripe_entropy = [binary_entropy(val) for val in ripe_vals]
+
+            # Add traces for raw and ripe entropy.
+            fig.add_trace(go.Scatter(x=time_history, y=raw_entropy,
+                                     mode='lines+markers', name=f'Tree {i} Raw Entropy',
+                                     line=dict(width=2)),
+                          row=i+1, col=1)
+            fig.add_trace(go.Scatter(x=time_history, y=ripe_entropy,
+                                     mode='lines+markers', name=f'Tree {i} Ripe Entropy',
+                                     line=dict(width=2, dash='dot')),
+                          row=i+1, col=1)
+
+        fig.update_layout(title="Lambda Entropy Trends for Each Tree",
+                          xaxis_title="Time (s)",
+                          yaxis_title="Binary Entropy",
+                          height=300 * num_trees)
+        fig.show()
+        fig.write_html('neural_mpc_tree_lambda_entropy.html')
+
+    # ---------------------------
     # New Function: Plot Entropy Separately
     # ---------------------------
     def plot_entropy_separately(self):
@@ -817,3 +876,5 @@ if __name__ == "__main__":
     # mpc.plot_animated_trajectory_and_entropy_2d(*sim_results[:-4], computation_durations=sim_results[3])
     # And to plot the entropy separately:
     mpc.plot_entropy_separately()
+    # New: Plot each tree's lambda entropy trends (raw vs. ripe)
+    mpc.plot_tree_lambda_trends()
