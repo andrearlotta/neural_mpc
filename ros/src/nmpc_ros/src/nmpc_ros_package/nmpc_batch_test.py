@@ -55,7 +55,7 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 7
+        self.N = 5
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]

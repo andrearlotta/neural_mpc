@@ -3,7 +3,7 @@ import os
 if __name__ == '__main__':
     
     # Run 100 tests consecutively.
-    for test_num in range(20, 50):
+    for test_num in range(0, 50):
         print(f"================== Starting Test Run {test_num} ==================")
         mpc = NeuralMPC()
         # Base folder to store all test run outputs.
