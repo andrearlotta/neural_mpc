@@ -162,13 +162,14 @@ class NeuralMPC:
         lambda_curr = self.lambda_cons.full().flatten()
         # Compute maximum/minimum
         result_max = np.maximum(neighbors, lambda_curr)
-        result_min = np.minimum(neighbors, lambda_curr)
-        for i in range(len(result_max)):
-            val_max = result_max[i] - 0.5
-            val_min = 0.5 - result_min[i]
-            if val_max > val_min:
-                result_min[i] = result_max[i]
-        self.lambda_cons = ca.DM(result_min)
+        # result_min = np.minimum(neighbors, lambda_curr)
+        # for i in range(len(result_max)):
+        #     val_max = result_max[i] - 0.5
+        #     val_min = 0.5 - result_min[i]
+        #     if val_max > val_min:
+        #         result_min[i] = result_max[i]
+        # self.lambda_cons = ca.DM(result_min)x
+        self.lambda_cons = ca.DM(result_max)
 
     # ---------------------------
     # Service Call to Get Trees Poses

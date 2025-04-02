@@ -157,7 +157,7 @@ class DataAssociationNode:
             if distance < 8:
                 ripe_value = weight_value(len(ripe_scores), np.mean(ripe_scores) if ripe_scores else 0)
                 raw_value = weight_value(len(raw_scores), np.mean(raw_scores) if raw_scores else 0)
-                tree_scores[i] = ripe_value - raw_value + 0.5
+                tree_scores[i] = ripe_value + 0.5 #@MIELE: se vuoi poi switchare a due classi devi aggiungere qui '-raw_value'
         
         scores_msg = Float32MultiArray()
         scores_msg.data = tree_scores.tolist()
