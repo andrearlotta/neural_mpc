@@ -67,7 +67,7 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 2
+        self.N = 5
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
@@ -255,13 +255,13 @@ class NeuralMPC:
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
     
     @staticmethod
-    def penalty_2d(x, y, x_c, y_c, p=10, s=1):
+    def penalty_2d(x, y, x_c, y_c, p=10, s=1, a=1):
         """Compute penalty term"""
         # return np.exp(-(x**p + y**p)/((2.0*s)**p))
-        return ca.exp(-((x-x_c)**p + (y-y_c)**p)/((2.0*s)**p))
+        return a*ca.exp(-((x-x_c)**p + (y-y_c)**p)/((2.0*s)**p))
 
     # ---------------------------
-    # MPC Optimization Function
+    # MPC Optimization Function 
     # ---------------------------
     def mpc_opt(self, g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
         nx_local = 3                   # For clarity in this function
@@ -302,7 +302,15 @@ class NeuralMPC:
         penalty_cells = 0
 
         # Get unassigned cells. Grid -> 1: assigned, 0: unassigned
-        assigned = [(2,0), (2,1), (2,2), (2,3), (2,4)]
+        if self.n_agent == 1:
+            # assigned = [(0,0), (0,1), (0,2), (0,3), (0,4), (1,0), (1,1), (1,2), (1,3), (1,4)]
+            assigned = [(0,0), (0,1), (0,2), (0,3), (1,0), (1,1), (1,2), (1,3)]
+        if self.n_agent == 2:
+            # assigned = [(2,0), (2,1), (2,2), (2,3), (2,4)]
+            assigned = [(2,0), (2,1), (2,2), (2,3), (2,4), (0,4), (1,4), (3,4), (4,4)]
+        if self.n_agent == 3:
+            # assigned = [(3,0), (3,1), (3,2), (3,3), (3,4), (4,0), (4,1), (4,2), (4,3), (4,4)]
+            assigned = [(3,0), (3,1), (3,2), (3,3), (4,0), (4,1), (4,2), (4,3)]
         grid = np.zeros((5, 5))
         for a in assigned:
             grid[a] = 1
@@ -327,7 +335,7 @@ class NeuralMPC:
         for i in range(steps+1):
             # State and input bounds.
             opti.subject_to(opti.bounded(lb[0] - 4., X[0, i], ub[0] + 4.))
-            opti.subject_to(opti.bounded(lb[1] - 4., X[1, i], ub[1] + 4.))
+            opti.subject_to(opti.bounded(lb[1] - 2., X[1, i], ub[1] + 2.))
             opti.subject_to(opti.bounded(-6*np.pi, X[2, i], +6*np.pi))
 
             opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]),4.00))
@@ -346,7 +354,7 @@ class NeuralMPC:
             for k in range(grid.shape[0]):  # iterazione sulle righe
                 for h in range(grid.shape[1]):
                     if grid[k,h] == 0:
-                        penalty_cells += self.penalty_2d(X[0, i], X[1, i], centers[k,h][0], centers[k,h][1], 10, 0.66)
+                        penalty_cells += self.penalty_2d(X[0, i], X[1, i], centers[k,h][0], centers[k,h][1], 10, 0.9, 5)
             #########################################
 
             if i < steps:

@@ -7,7 +7,7 @@
   <node pkg="rostopic" type="rostopic" name="pose_publisher2" args="pub -1 /agent_2/cmd/pose geometry_msgs/Pose '{position: {x: -3.354, y: -7.3, z: 2.350}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}'" />
   <node pkg="rostopic" type="rostopic" name="pose_publisher3" args="pub -1 /agent_3/cmd/pose geometry_msgs/Pose '{position: {x: -3.354, y: -14.1, z: 2.350}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}'" />
 
-  <arg name="node_start_delay_first" default="10.0" />  <!-- Delay first mpc -->
+  <arg name="node_start_delay_first" default="2.0" />  <!-- Delay first mpc -->
   <arg name="node_start_delay_mpc" default="1.0" />    <!-- Delay second, third mpcs -->
 
   <group ns="agent_1">
