@@ -29,11 +29,11 @@ class PIDController:
 
 
 class Logger:
-    def __init__(self, trajectory_type, filename='performance_metrics.csv'):
+    def __init__(self, trajectory_type, run_folder="baselines", filename='performance_metrics.csv'):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.timestamp = time.strftime("%Y%m%d_%H%M%S")  # Current timestamp
         # Create a filename that includes trajectory type and timestamp
-        self.filename = os.path.join(os.path.join(script_dir, "baselines"),
+        self.filename = os.path.join(os.path.join(script_dir, run_folder),
                                      f"{trajectory_type}_{self.timestamp}_{filename}")
 
         self.csv_file = open(self.filename, 'w', newline='')
@@ -46,7 +46,7 @@ class Logger:
         self.total_distance = 0
 
         # Open an additional CSV file to log injected velocity commands.
-        self.velocity_filename = os.path.join(os.path.join(script_dir, "baselines"),
+        self.velocity_filename = os.path.join(os.path.join(script_dir,run_folder),
                                               f"{trajectory_type}_{self.timestamp}_velocity_commands.csv")
         self.velocity_csv_file = open(self.velocity_filename, 'w', newline='')
         self.velocity_csv_writer = csv.writer(self.velocity_csv_file)
@@ -99,10 +99,10 @@ class Logger:
 
 
 class TrajectoryGenerator:
-    def __init__(self, trajectory_type):
+    def __init__(self, trajectory_type, run_folder="baselines"):
         # Get trajectory mode and initialize Logger only once.
         self.trajectory_type = trajectory_type
-        self.logger = Logger(trajectory_type)
+        self.logger = Logger(trajectory_type, run_folder)
 
         # New history lists for storing poses and bayesian (lambda) values
         self.pose_history = []      # Each entry: [x, y, theta]
@@ -120,8 +120,13 @@ class TrajectoryGenerator:
         self.circle_tree_event = threading.Event()
         # Bridge for robot state and sensor data.
         self.bridge = BridgeClass(SENSORS)
-        # Get tree positions from the server.
         self.tree_positions = np.array(self.bridge.call_server({"trees_poses": None})["trees_poses"])
+        lb, ub = self.get_domain(self.tree_positions)
+        initial_state = self.generate_random_initial_state(lb, ub, margin=1.75)
+        print(f"Initial State: {initial_state}")
+        # Publish the initial random position.
+        self.bridge.pub_data({ "cmd_pose": initial_state})
+        rospy.sleep(2.5)
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         self.lambda_values = np.full(len(self.tree_positions), 0.5)  # Initialize lambda
 
@@ -141,6 +146,34 @@ class TrajectoryGenerator:
         self.measurement_timer = rospy.Timer(rospy.Duration(0.5), self.measurement_callback)
         while self.bridge.get_data()["tree_scores"] is None:
             pass
+    
+    def generate_random_initial_state(self, lb, ub, margin=1.25):
+        """
+        Generate a random initial state [x, y, theta] such that:
+         - x is in [lb[0], ub[0]] and y in [lb[1], ub[1]]
+         - The position is at least `margin` meters away from every tree.
+         - theta is chosen uniformly from [-pi, pi].
+        """
+        while True:
+            x = np.random.uniform(lb[0], ub[0])
+            y = np.random.uniform(lb[1], ub[1])
+            valid = True
+            for tree in self.tree_positions:
+                if np.linalg.norm(np.array([x, y]) - tree) < margin:
+                    valid = False
+                    break
+            if valid:
+                theta = np.random.uniform(-np.pi, np.pi)
+                return np.array([x, y, theta]).reshape(-1,1)    
+    
+    @staticmethod
+    def get_domain(tree_positions):
+        """Return the domain (bounding box) of the tree positions."""
+        x_min = np.min(tree_positions[:, 0])
+        x_max = np.max(tree_positions[:, 0])
+        y_min = np.min(tree_positions[:, 1])
+        y_max = np.max(tree_positions[:, 1])
+        return [x_min, y_min], [x_max, y_max]
 
     def measurement_callback(self, event):
         if not (self.is_mower or self.circle_tree_event.is_set()):
@@ -155,7 +188,7 @@ class TrajectoryGenerator:
         elif self.idx is not None:
             self.lambda_values[self.idx] = self.bayes(self.lambda_values[self.idx], z_k[self.idx])
             # When the lambda value reaches a threshold, clear the event to stop observation.
-            if self.lambda_values[self.idx] * 1e3 >= 999:
+            if self.calculate_entropy(self.lambda_values[self.idx]) <= 0.025:
                 self.circle_tree_event.clear()
 
         current_entropy = self.calculate_entropy(self.lambda_values)
@@ -421,7 +454,7 @@ class TrajectoryGenerator:
         # Generate the simple mower path.
         # You can adjust offset, spacing, and heading_direction as needed.
         path = self.generate_mower_path_between_rows(offset=2.0, spacing=4.0, heading_direction='E', axis='y')
-        self.plot_path(path, self.tree_positions)
+        #self.plot_path(path, self.tree_positions)
 
         total_time = 0
         for i in range(1, len(path)):
@@ -959,13 +992,20 @@ class TrajectoryGenerator:
             self.run_greedy_trajectory()
 
         # Corrected the parameter passed for plotting from an undefined 'mode' to self.trajectory_type.
-        self.plot_animated_trajectory_and_entropy_2d(self.trajectory_type)
+        #self.plot_animated_trajectory_and_entropy_2d(self.trajectory_type)
 
 
 if __name__ == '__main__':
     try:
-        mode = rospy.get_param('~trajectory_mode', 'between_rows')
-        trajectory_generator = TrajectoryGenerator(mode)
-        trajectory_generator.run()
+        # Run 100 tests consecutively.
+        for test_num in range(1, 50):
+            print(f"================== Starting Test Run {test_num} ==================")
+            base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_runs_greedy")
+            os.makedirs(base_test_folder, exist_ok=True)
+            run_folder = os.path.join(base_test_folder, f"run_{test_num}")
+            os.makedirs(run_folder, exist_ok=True)
+            mode = rospy.get_param('~trajectory_mode', 'greedy')
+            trajectory_generator = TrajectoryGenerator(mode, run_folder=run_folder)
+            trajectory_generator.run()
     except rospy.ROSInterruptException:
         pass
