@@ -67,7 +67,7 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 5
+        self.N = 2
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
@@ -168,7 +168,7 @@ class NeuralMPC:
         #     val_min = 0.5 - result_min[i]
         #     if val_max > val_min:
         #         result_min[i] = result_max[i]
-        # self.lambda_cons = ca.DM(result_min)x
+        # self.lambda_cons = ca.DM(result_min)
         self.lambda_cons = ca.DM(result_max)
 
     # ---------------------------
@@ -307,7 +307,7 @@ class NeuralMPC:
             assigned = [(0,0), (0,1), (0,2), (0,3), (1,0), (1,1), (1,2), (1,3)]
         if self.n_agent == 2:
             # assigned = [(2,0), (2,1), (2,2), (2,3), (2,4)]
-            assigned = [(2,0), (2,1), (2,2), (2,3), (2,4), (0,4), (1,4), (3,4), (4,4)]
+            assigned = [(2,0), (2,1), (2,2), (2,3), (0,4), (1,4), (2,4), (3,4), (4,4)]
         if self.n_agent == 3:
             # assigned = [(3,0), (3,1), (3,2), (3,3), (3,4), (4,0), (4,1), (4,2), (4,3), (4,4)]
             assigned = [(3,0), (3,1), (3,2), (3,3), (4,0), (4,1), (4,2), (4,3)]
@@ -388,6 +388,21 @@ class NeuralMPC:
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
         entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) * entropy_future) * w_entropy
+        #--------------------------- Annulla la funzione degli alberi che non mi interessano
+        # mask = ca.DM.zeros(num_trees * steps, 1)
+        # if self.n_agent == 1:
+        #     indices_to_keep = [0, 1, 5, 6, 10, 11, 15, 16]
+        # if self.n_agent == 2:
+        #     indices_to_keep = [2, 7, 12, 17, 20, 21, 22, 23, 24]
+        # if self.n_agent == 3:
+        #     indices_to_keep = [3, 4, 8, 9, 13, 14, 18, 19]
+        # for step in range(steps):
+        #     for i in indices_to_keep:
+        #         idx = i + step * num_trees  # Calcola l'indice corretto su mask
+        #         mask[idx] = 1
+        # exp_weights = ca.vcat([ca.exp(-2*i) * ca.DM.ones(num_trees, 1) for i in range(steps)])
+        # entropy_term = ca.sum1((mask * exp_weights) * entropy_future) * w_entropy
+        #---------------------------        
         # Add terms to the objective.
         obj += entropy_term
         obj += penalty_cells

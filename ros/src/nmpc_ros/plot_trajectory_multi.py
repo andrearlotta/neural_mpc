@@ -6,11 +6,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-#############
-## Da terminare il fatto che gli alberi si colorano in base al lambda, questa cosa
-## andrà fatta dopo aver fatto il meccanismo di consenso
-#############
-
 def get_latest_csv(mode, directory, suffix="plot_data.csv"):
     """Find the latest CSV file for a given mode and suffix in the directory."""
     pattern = os.path.join(directory, f"{mode}_*_{suffix}")
