@@ -253,6 +253,12 @@ class NeuralMPC:
         """
         p = ca.fmax(ca.fmin(p, 1 - 1e-6), 1e-9)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
+    
+    @staticmethod
+    def penalty_2d(x, y, x_c, y_c, p=10, s=1):
+        """Compute penalty term"""
+        # return np.exp(-(x**p + y**p)/((2.0*s)**p))
+        return ca.exp(-((x-x_c)**p + (y-y_c)**p)/((2.0*s)**p))
 
     # ---------------------------
     # MPC Optimization Function
@@ -292,25 +298,55 @@ class NeuralMPC:
         # Initial condition constraint.
         opti.subject_to(X[:, 0] == X0)
 
+        # Penalty term for unassigned cells
+        penalty_cells = 0
+
+        # Get unassigned cells. Grid -> 1: assigned, 0: unassigned
+        assigned = [(2,0), (2,1), (2,2), (2,3), (2,4)]
+        grid = np.zeros((5, 5))
+        for a in assigned:
+            grid[a] = 1
+        grid = grid.T
+        matrix_size = int(np.sqrt(len(self.trees_pos)))
+        centers = self.trees_pos.reshape(matrix_size, matrix_size, 2) # only sqare fields
+        # # Plot Assigned Cells Debug
+        # import matplotlib.pyplot as plt
+        # plt.figure()
+        # for i in range(centers.shape[0]):
+        #     for j in range(centers.shape[1]):
+        #         x, y = centers[i, j]
+        #         color = 'red' if grid[i, j] == 1 else 'blue'
+        #         plt.scatter(x, y, color=color)
+        # plt.xlabel('X')
+        # plt.ylabel('Y')
+        # plt.title('Punti in centers')
+        # plt.grid(True)
+        # plt.show()
+
         # Loop over the prediction horizon.
         for i in range(steps+1):
             # State and input bounds.
-            opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
-            opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
+            opti.subject_to(opti.bounded(lb[0] - 4., X[0, i], ub[0] + 4.))
+            opti.subject_to(opti.bounded(lb[1] - 4., X[1, i], ub[1] + 4.))
             opti.subject_to(opti.bounded(-6*np.pi, X[2, i], +6*np.pi))
 
             opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]),4.00))
             opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
 
-            #########################################
-            # Vincolo rettangolo di lavoro (poi capire come implementare le singole zone)
-            # Si muove su tutte le x ma y limitata
-            if self.n_agent == 1:
-                opti.subject_to(opti.bounded(-5.33, X[1, i], 0.0))
-            if self.n_agent == 2:
-                opti.subject_to(opti.bounded(-10.66, X[1, i], -5.33))
-            if self.n_agent == 3:
-                opti.subject_to(opti.bounded(-16.0, X[1, i], -10.66))
+            ######################################### Fixed Rectangle
+            # # Vincolo rettangolo di lavoro
+            # # Si muove su tutte le x ma y limitata
+            # if self.n_agent == 1:
+            #     opti.subject_to(opti.bounded(-5.33, X[1, i], 0.0))
+            # if self.n_agent == 2:
+            #     opti.subject_to(opti.bounded(-10.66, X[1, i], -5.33))
+            # if self.n_agent == 3:
+            #     opti.subject_to(opti.bounded(-16.0, X[1, i], -10.66))
+            ######################################### Cells
+            for k in range(grid.shape[0]):  # iterazione sulle righe
+                for h in range(grid.shape[1]):
+                    if grid[k,h] == 0:
+                        penalty_cells += self.penalty_2d(X[0, i], X[1, i], centers[k,h][0], centers[k,h][1], 10, 0.66)
             #########################################
 
             if i < steps:
@@ -346,6 +382,7 @@ class NeuralMPC:
         entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) * entropy_future) * w_entropy
         # Add terms to the objective.
         obj += entropy_term
+        obj += penalty_cells
         opti.minimize(obj)
 
         # Solver options.
