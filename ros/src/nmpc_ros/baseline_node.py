@@ -110,13 +110,14 @@ class TrajectoryGenerator:
         self.entropy_history = []
         self.time_history = []
 
+        self.is_mower = self.trajectory_type == 'between_rows'
         # Initialize PID controllers.
-        self.pid_controller_x = PIDController(kp=3.0, kd=1)
-        self.pid_controller_y = PIDController(kp=3.0, kd=1)
-        self.pid_controller_yaw = PIDController(kp=.25, kd=0.1)
+        self.pid_controller_x = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
+        self.pid_controller_y = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
+        self.pid_controller_yaw = PIDController(kp=3.0 if self.is_mower else .25, kd=0.1)
 
         self.idx = None
-        self.is_mower = False
+
         self.circle_tree_event = threading.Event()
         # Bridge for robot state and sensor data.
         self.bridge = BridgeClass(SENSORS)
@@ -129,7 +130,7 @@ class TrajectoryGenerator:
             "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
         })
 
-        self.max_velocity = 0.50 if self.is_mower else 1.5          # Maximum velocity of the robot
+        self.max_velocity = .95 if self.is_mower else 1.5          # Maximum velocity of the robot
         self.max_yaw_velocity = np.pi/4      # Maximum yaw velocity (rad/s)
 
         self.dt = 0.1
@@ -378,17 +379,16 @@ class TrajectoryGenerator:
 
         # Generate x coordinates in the correct order
         if x_step > 0:
-            x_coords = np.arange(x_min, x_max + 1e-9, x_step)
+            x_coords = np.arange(x_min, x_max + x_step , x_step)
         else:
-            x_coords = np.arange(x_max, x_min - 1e-9, x_step)
+            x_coords = np.arange(x_max, x_min + x_step , x_step)
 
         # Generate y coordinates in the correct order
         if y_step > 0:
-            y_coords = np.arange(y_min, y_max + 1e-9, y_step)
+            y_coords = np.arange(y_min, y_max + y_step, y_step)
         else:
-            y_coords = np.arange(y_max, y_min - 1e-9, y_step)
+            y_coords = np.arange(y_max, y_min + y_step, y_step)
 
-        # Create grid waypoints: iterate over y first (rows), then x (columns)
         waypoints = []
         direction_map = {'N': np.pi/2, 'E': 0, 'S': -np.pi/2, 'W': np.pi}
         fixed_heading = direction_map.get(heading_direction.upper(), 0)
@@ -870,7 +870,7 @@ class TrajectoryGenerator:
             self.logger.start_logging()
             tree_order = self.generate_tree_to_tree_path()
             tree_path = [self.tree_positions[idx].tolist() for idx in tree_order]
-            self.plot_path(tree_path, self.tree_positions)
+            #self.plot_path(tree_path, self.tree_positions)
 
             total_time = 0
             total_distance = 0
@@ -948,7 +948,8 @@ class TrajectoryGenerator:
     def run(self):
         """
         Main method that runs the trajectory generation based on the specified mode.
-        After completion, the trajectory and entropy reduction are plotted.
+        After completion, the trajectory and entropy r
+            eduction are plotted.
         """
         if self.trajectory_type == "between_rows":
             self.is_mower = True
@@ -958,9 +959,13 @@ class TrajectoryGenerator:
         else:
             self.run_greedy_trajectory()
 
+        self.shutdown()
         # Corrected the parameter passed for plotting from an undefined 'mode' to self.trajectory_type.
         self.plot_animated_trajectory_and_entropy_2d(self.trajectory_type)
 
+    def shutdown(self):
+        if hasattr(self, 'measurement_timer'):
+            self.measurement_timer.shutdown()
 
 if __name__ == '__main__':
     try:
