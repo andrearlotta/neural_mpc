@@ -7,12 +7,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 
-def get_latest_file(mode, suffix):
+def get_latest_file(mode, path, suffix):
     """
     Finds the latest CSV file for a given mode and file suffix.
     For example, suffix might be "performance_metrics", "velocity_commands", or "velocity_metrics".
     """
-    pattern = os.path.join('baselines', f"{mode}_*_{suffix}.csv")
+    pattern = os.path.join(path, f"{mode}_*_{suffix}.csv")
     files = glob.glob(pattern)
     if not files:
         return None
@@ -74,7 +74,7 @@ def load_velocity_metrics(file_path):
         'Std Execution Time (s)': std_time
     }
 
-def main():
+def main(path):
     trajectory_types = ['greedy', 'between_rows', 'tree_to_tree', 'mpc']
     metrics_data = {
         'Trajectory Type': [],
@@ -102,7 +102,7 @@ def main():
 
     for traj_type in trajectory_types:
         # Load performance metrics
-        perf_file = get_latest_file(traj_type, 'performance_metrics')
+        perf_file = get_latest_file(traj_type, path, 'performance_metrics')
         if not perf_file:
             print(f"Skipping {traj_type} - no performance file found")
             continue
@@ -110,7 +110,7 @@ def main():
         perf_metrics = load_performance_metrics(perf_file)
 
         # Load velocity commands data
-        vel_cmd_file = get_latest_file(traj_type, 'velocity_commands')
+        vel_cmd_file = get_latest_file(traj_type, path, 'velocity_commands')
         if not vel_cmd_file:
             print(f"Skipping {traj_type} - no velocity commands file found")
             continue
@@ -118,7 +118,7 @@ def main():
         vel_cmd_stats = load_velocity_data(vel_cmd_file)
 
         # Load velocity metrics data for execution times
-        vel_metrics_file = get_latest_file(traj_type, 'velocity_commands')  # Corrected suffix
+        vel_metrics_file = get_latest_file(traj_type, path, 'velocity_commands')  # Corrected suffix
         if not vel_metrics_file:
             print(f"Skipping {traj_type} - no velocity metrics file found")
             continue
@@ -195,4 +195,4 @@ def main():
     fig.show()
 
 if __name__ == "__main__":
-    main()
+    main('baselines')
