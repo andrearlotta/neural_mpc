@@ -67,7 +67,7 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 2
+        self.N = 5
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
@@ -259,6 +259,13 @@ class NeuralMPC:
         """Compute penalty term"""
         # return np.exp(-(x**p + y**p)/((2.0*s)**p))
         return a*ca.exp(-((x-x_c)**p + (y-y_c)**p)/((2.0*s)**p))
+    
+    def aggregation_2d(self, x, y, evol, idx, a=1):
+        """Compute aggregation term"""
+        x_c = self.trees_pos[idx][0]
+        y_c = self.trees_pos[idx][1]
+        lambda_c = evol[idx]
+        return a * (1 - lambda_c) * ca.sqrt((x - x_c)**2 + (y - y_c)**2)
 
     # ---------------------------
     # MPC Optimization Function 
@@ -298,38 +305,20 @@ class NeuralMPC:
         # Initial condition constraint.
         opti.subject_to(X[:, 0] == X0)
 
-        # Penalty term for unassigned cells
-        penalty_cells = 0
+        # Penalty term for cells
+        penalty_cells = 0 # unassigned
+        aggregation = 0   # assigned
 
-        # Get unassigned cells. Grid -> 1: assigned, 0: unassigned
+        # Get unassigned cells. 
+        # List of assigned trees (ID)
         if self.n_agent == 1:
-            # assigned = [(0,0), (0,1), (0,2), (0,3), (0,4), (1,0), (1,1), (1,2), (1,3), (1,4)]
-            assigned = [(0,0), (0,1), (0,2), (0,3), (1,0), (1,1), (1,2), (1,3)]
+            assigned = [0, 1, 5, 6, 10, 11, 15, 16]
         if self.n_agent == 2:
-            # assigned = [(2,0), (2,1), (2,2), (2,3), (2,4)]
-            assigned = [(2,0), (2,1), (2,2), (2,3), (0,4), (1,4), (2,4), (3,4), (4,4)]
+            assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]
         if self.n_agent == 3:
-            # assigned = [(3,0), (3,1), (3,2), (3,3), (3,4), (4,0), (4,1), (4,2), (4,3), (4,4)]
-            assigned = [(3,0), (3,1), (3,2), (3,3), (4,0), (4,1), (4,2), (4,3)]
-        grid = np.zeros((5, 5))
-        for a in assigned:
-            grid[a] = 1
-        grid = grid.T
-        matrix_size = int(np.sqrt(len(self.trees_pos)))
-        centers = self.trees_pos.reshape(matrix_size, matrix_size, 2) # only sqare fields
-        # # Plot Assigned Cells Debug
-        # import matplotlib.pyplot as plt
-        # plt.figure()
-        # for i in range(centers.shape[0]):
-        #     for j in range(centers.shape[1]):
-        #         x, y = centers[i, j]
-        #         color = 'red' if grid[i, j] == 1 else 'blue'
-        #         plt.scatter(x, y, color=color)
-        # plt.xlabel('X')
-        # plt.ylabel('Y')
-        # plt.title('Punti in centers')
-        # plt.grid(True)
-        # plt.show()
+            assigned = [3, 4, 8, 9, 13, 14, 18, 19]
+        # Not assigned trees (ID)
+        not_assigned = [num for num in list(range(num_trees)) if num not in assigned]
 
         # Loop over the prediction horizon.
         for i in range(steps+1):
@@ -340,22 +329,6 @@ class NeuralMPC:
 
             opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]),4.00))
             opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
-
-            ######################################### Fixed Rectangle
-            # # Vincolo rettangolo di lavoro
-            # # Si muove su tutte le x ma y limitata
-            # if self.n_agent == 1:
-            #     opti.subject_to(opti.bounded(-5.33, X[1, i], 0.0))
-            # if self.n_agent == 2:
-            #     opti.subject_to(opti.bounded(-10.66, X[1, i], -5.33))
-            # if self.n_agent == 3:
-            #     opti.subject_to(opti.bounded(-16.0, X[1, i], -10.66))
-            ######################################### Cells
-            for k in range(grid.shape[0]):  # iterazione sulle righe
-                for h in range(grid.shape[1]):
-                    if grid[k,h] == 0:
-                        penalty_cells += self.penalty_2d(X[0, i], X[1, i], centers[k,h][0], centers[k,h][1], 10, 0.9, 5)
-            #########################################
 
             if i < steps:
                 opti.subject_to(opti.bounded(0.0, ca.sumsqr(U[0:2, i]),8.0))
@@ -385,20 +358,23 @@ class NeuralMPC:
             lambda_next = self.bayes(lambda_evol[-1], z_k[i::steps])
             lambda_evol.append(lambda_next)
 
+        # Limited area (Cells) and attraction
+        for i in range(steps+1):
+            for n_a in not_assigned:
+                # penalty for unassigned cells
+                penalty_cells += self.penalty_2d(X[0, i], X[1, i], self.trees_pos[n_a][0], self.trees_pos[n_a][1], p=10, s=1, a=5)
+            # for a_a in assigned:
+            #     # aggregation term for assigned cells
+            #     aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=0.1)
+
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
         entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) * entropy_future) * w_entropy
         #--------------------------- Annulla la funzione degli alberi che non mi interessano
         # mask = ca.DM.zeros(num_trees * steps, 1)
-        # if self.n_agent == 1:
-        #     indices_to_keep = [0, 1, 5, 6, 10, 11, 15, 16]
-        # if self.n_agent == 2:
-        #     indices_to_keep = [2, 7, 12, 17, 20, 21, 22, 23, 24]
-        # if self.n_agent == 3:
-        #     indices_to_keep = [3, 4, 8, 9, 13, 14, 18, 19]
         # for step in range(steps):
-        #     for i in indices_to_keep:
-        #         idx = i + step * num_trees  # Calcola l'indice corretto su mask
+        #     for i in assigned:
+        #         idx = i + step * num_trees  # indices step successivi
         #         mask[idx] = 1
         # exp_weights = ca.vcat([ca.exp(-2*i) * ca.DM.ones(num_trees, 1) for i in range(steps)])
         # entropy_term = ca.sum1((mask * exp_weights) * entropy_future) * w_entropy
@@ -406,6 +382,7 @@ class NeuralMPC:
         # Add terms to the objective.
         obj += entropy_term
         obj += penalty_cells
+        obj += aggregation
         opti.minimize(obj)
 
         # Solver options.
