@@ -21,6 +21,9 @@ class DataAssociationNode:
     def __init__(self):
         rospy.init_node('bounding_box_3d_pose', anonymous=True)
 
+        # agent number
+        self.n_agent = rospy.get_param('~n_agent', 1) # default 1
+
         self.bridge = CvBridge()
         self.camera_info = None
         self.camera_matrix = None
@@ -28,18 +31,16 @@ class DataAssociationNode:
         self.tree_poses = None
         self.publish_visualization = rospy.get_param('~publish_visualization', True)
 
-        detection_sub = message_filters.Subscriber("/yolov7/detect", Detection2DArray)
-        depth_image_sub = message_filters.Subscriber("/agent_0/camera/depth/image/compressed", CompressedImage)
-
+        detection_sub = message_filters.Subscriber("yolov7/detect", Detection2DArray)
+        depth_image_sub = message_filters.Subscriber("camera/depth/image/compressed", CompressedImage)
         self.ts = message_filters.ApproximateTimeSynchronizer([detection_sub, depth_image_sub], queue_size=10, slop=0.2)
         self.ts.registerCallback(self.synchronized_callback)
-
-        self.camera_info_sub = rospy.Subscriber("/agent_0/camera/depth/camera_info", CameraInfo, self.camera_info_callback)
-        self.scores_pub = rospy.Publisher("/tree_scores", Float32MultiArray, queue_size=1)
+        self.camera_info_sub = rospy.Subscriber("camera/depth/image/info", CameraInfo, self.camera_info_callback)
+        self.scores_pub = rospy.Publisher("tree_scores", Float32MultiArray, queue_size=1)
         
         if self.publish_visualization:
-            self.marker_scores_pub = rospy.Publisher("/scores_markers", MarkerArray, queue_size=1)
-            self.marker_fruits_pub = rospy.Publisher("/fruits_markers", MarkerArray, queue_size=1)
+            self.marker_scores_pub = rospy.Publisher("scores_markers", MarkerArray, queue_size=1)
+            self.marker_fruits_pub = rospy.Publisher("fruits_markers", MarkerArray, queue_size=1)
         
         self.cam_model = PinholeCameraModel()
         self.tf_listener = tf.TransformListener()
@@ -90,7 +91,7 @@ class DataAssociationNode:
         for fruit_pos in fruit_positions:
             point_camera = PointStamped()
             point_camera.point = Point(*fruit_pos)
-            point_camera.header.frame_id = 'depth_camera_frame'
+            point_camera.header.frame_id = 'depth_camera_frame_'+str(self.n_agent)
             try:
                 point_map = self.tf_listener.transformPoint('map', point_camera)
                 map_fruits_positions.append([point_map.point.x, point_map.point.y, point_map.point.z])
@@ -98,10 +99,10 @@ class DataAssociationNode:
                 rospy.logerr(e)
                 continue
         return np.array(map_fruits_positions)
+    
     def synchronized_callback(self, detection_msg, depth_image_msg):
         if self.camera_matrix is None or self.tree_poses is None:
             return
-        
         try:
             self.depth_image = self.bridge.compressed_imgmsg_to_cv2(depth_image_msg, desired_encoding="passthrough")[:, :, 0]
         except CvBridgeError as e:
@@ -139,10 +140,10 @@ class DataAssociationNode:
 
         # Transform fruit positions from camera frame to map frame
         map_fruits_positions = self.transform_fruit_positions(fruit_positions, detection_msg.header)
-
         associated_fruits = self.associate_fruits_to_trees(map_fruits_positions, fruit_classes, fruit_scores)
         try:
-            (drone_trans, drone_rot) = self.tf_listener.lookupTransform('map', 'drone_base_link', rospy.Time())
+            link_str = 'base_link_' + str(self.n_agent)
+            (drone_trans, drone_rot) = self.tf_listener.lookupTransform('map', link_str, rospy.Time())
             drone_x, drone_y = drone_trans[0], drone_trans[1]
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
             rospy.logwarn("Could not get drone position, skipping distance check.")
@@ -156,8 +157,8 @@ class DataAssociationNode:
             if distance < 8:
                 ripe_value = weight_value(len(ripe_scores), np.mean(ripe_scores) if ripe_scores else 0)
                 raw_value = weight_value(len(raw_scores), np.mean(raw_scores) if raw_scores else 0)
-                tree_scores[i] = ripe_value - raw_value + 0.5
-            
+                tree_scores[i] = ripe_value + 0.5 #@MIELE: se vuoi poi switchare a due classi devi aggiungere qui '-raw_value'
+        
         scores_msg = Float32MultiArray()
         scores_msg.data = tree_scores.tolist()
         self.scores_pub.publish(scores_msg)
