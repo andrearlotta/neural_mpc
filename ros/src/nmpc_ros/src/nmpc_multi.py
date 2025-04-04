@@ -109,14 +109,22 @@ class NeuralMPC:
         n_robots = 3
         neighbors = list(range(1, n_robots+1))
         neighbors.remove(int(self.n_agent))
+        self.neighbors_id = neighbors
         # subscibers
         subscribers_net = []
         for neighbor in neighbors:
             topic = f"/agent_{neighbor}/lambda"
             sub = rospy.Subscriber(topic, Float32MultiArray, self.consensus_lambda)
             subscribers_net.append(sub)
+        # neighbors' positions
+        self.neighbors_pos = [(0, 0) for _ in range(n_robots+1)] # id vicino = posizione in lista
         # Lambda consensus variables
         self.lambda_cons = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
+
+        # Start the neighbors state update thread at 30 Hz.
+        self.neighbors_state_thread = threading.Thread(target=self.neighbors_state_update_thread)
+        self.neighbors_state_thread.daemon = True
+        self.neighbors_state_thread.start()
 
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
@@ -145,6 +153,20 @@ class NeuralMPC:
                                       yaw]
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
                 rospy.logwarn("Failed to get transform: %s", e)
+            rate.sleep()
+
+    def neighbors_state_update_thread(self):
+        """Continuously update the neighbors' state using TF at 30 Hz."""
+        rate = rospy.Rate(30)  # 30 Hz update rate
+        while not rospy.is_shutdown():
+            for n in self.neighbors_id:
+                try:
+                    # Look up the transform from 'map' to 'base_link_n'
+                    link_str = 'base_link_' + str(n)
+                    trans = self.tf_buffer.lookup_transform('map', link_str, rospy.Time(0))
+                    self.neighbors_pos[n] = (trans.transform.translation.x, trans.transform.translation.y)
+                except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+                    rospy.logwarn("Failed to get transform: %s", e)
             rate.sleep()
 
     def tree_scores_callback(self, msg):
@@ -490,6 +512,7 @@ class NeuralMPC:
             rospy.loginfo("Current state x_k: %s", x_k)
             rospy.loginfo("Lambda: %s", self.lambda_k)
             rospy.loginfo("Current tree scores: %s", latest_trees_scores.flatten())
+            rospy.loginfo("VICINI: %s", self.neighbors_pos)
 
             # Publish tree markers using the helper function from sensors.py.
             tree_markers_msg = create_tree_markers(self.trees_pos, self.lambda_k.full().flatten())
