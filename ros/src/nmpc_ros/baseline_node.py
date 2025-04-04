@@ -111,7 +111,7 @@ class TrajectoryGenerator:
         self.entropy_history = []
         self.time_history = []
 
-        self.is_mower = self.trajectory_type == 'between_rows'
+        self.is_mower =( self.trajectory_type == 'between_rows')
         # Initialize PID controllers.
         self.pid_controller_x = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
         self.pid_controller_y = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
@@ -136,7 +136,7 @@ class TrajectoryGenerator:
             "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
         })
 
-        self.max_velocity = .95 if self.is_mower else 1.5          # Maximum velocity of the robot
+        self.max_velocity = 0.95 if self.is_mower else 2.0         # Maximum velocity of the robot
         self.max_yaw_velocity = np.pi/4      # Maximum yaw velocity (rad/s)
 
         self.dt = 0.1
@@ -292,7 +292,7 @@ class TrajectoryGenerator:
             return combined / combined_norm
     
     # ----------------------- Modified move_to_waypoint -----------------------
-    def move_to_waypoint(self, target_x, target_y, tolerance=2.0, observe=False, desired_heading=None):
+    def move_to_waypoint(self, target_x, target_y, tolerance=.2, observe=False, desired_heading=None):
         """
         Move the drone to the specified waypoint.
         An optional desired_heading (in radians) can be provided to override the default
@@ -359,7 +359,7 @@ class TrajectoryGenerator:
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         phi = math.atan2(self.y - center_y, self.x - center_x)
         radius = np.sqrt((self.x - center_x) ** 2 + (self.y - center_y) ** 2)
-        delta_phi = self.dt * 7.5 * math.pi / 180  # Angular increment (in radians)
+        delta_phi = self.dt * 14 * math.pi / 180  # Angular increment (in radians)
 
         while self.circle_tree_event.is_set():
             desired_x = center_x + radius * math.cos(phi)
@@ -507,7 +507,7 @@ class TrajectoryGenerator:
 
             wp_time, _ = self.move_to_waypoint(
                 current_point[0], current_point[1],
-                tolerance=2.0, observe=True, desired_heading=heading
+                tolerance=.20, observe=True, desired_heading=heading
             )
             total_time += wp_time
         
@@ -739,12 +739,12 @@ if __name__ == '__main__':
     try:
         bridge = BridgeClass(SENSORS)
         # Initialize and run the trajectory generator
-        modes = ['greedy', 'tree_to_tree', 'between_rows']
+        modes = ['between_rows']
         for mode in modes:
             for test_num in range(0, 2):
                 import re
                 # Define base folder
-                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"test_for_creating_plot_{mode}")
+                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"batch_test_25trees_{mode}")
                 os.makedirs(base_test_folder, exist_ok=True)
 
                 # Find the next test number
