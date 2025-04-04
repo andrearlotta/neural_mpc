@@ -117,7 +117,7 @@ class NeuralMPC:
             sub = rospy.Subscriber(topic, Float32MultiArray, self.consensus_lambda)
             subscribers_net.append(sub)
         # neighbors' positions
-        self.neighbors_pos = [(0, 0) for _ in range(n_robots+1)] # id vicino = posizione in lista
+        self.neighbors_pos = ca.DM.zeros(2*(n_robots+1), 1) # id vicino e id+1 = posizione x e y in lista
         # Lambda consensus variables
         self.lambda_cons = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
 
@@ -158,15 +158,18 @@ class NeuralMPC:
     def neighbors_state_update_thread(self):
         """Continuously update the neighbors' state using TF at 30 Hz."""
         rate = rospy.Rate(30)  # 30 Hz update rate
+        poss = [0.0 for _ in range(self.neighbors_pos.shape[0])]
         while not rospy.is_shutdown():
             for n in self.neighbors_id:
                 try:
                     # Look up the transform from 'map' to 'base_link_n'
                     link_str = 'base_link_' + str(n)
                     trans = self.tf_buffer.lookup_transform('map', link_str, rospy.Time(0))
-                    self.neighbors_pos[n] = (trans.transform.translation.x, trans.transform.translation.y)
+                    poss[2*n] = trans.transform.translation.x
+                    poss[2*n+1] = trans.transform.translation.y
                 except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
                     rospy.logwarn("Failed to get transform: %s", e)
+            self.neighbors_pos = ca.DM(poss)
             rate.sleep()
 
     def tree_scores_callback(self, msg):
@@ -292,7 +295,7 @@ class NeuralMPC:
     # ---------------------------
     # MPC Optimization Function 
     # ---------------------------
-    def mpc_opt(self, g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
+    def mpc_opt(self, g_nn, trees, lb, ub, x0, lambda_vals, neighbors_positions, steps=10):
         nx_local = 3                   # For clarity in this function
         n_state = nx_local * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
         n_control = nx_local           # 3-dimensional control: [ax, ay, angular_acc]
@@ -305,9 +308,11 @@ class NeuralMPC:
 
         # Parameter vector: initial state and tree beliefs.
         num_trees = trees.shape[0]
-        P0 = opti.parameter(n_state + num_trees)
+        num_neighbors = neighbors_positions.shape[0]
+        P0 = opti.parameter(n_state + num_trees + num_neighbors)
         X0 = P0[: n_state]
-        L0 = P0[n_state:]
+        L0 = P0[n_state:n_state+num_trees]
+        N0 = P0[n_state+num_trees:]
         # Initialize belief evolution.
         lambda_evol = [L0]
 
@@ -421,7 +426,7 @@ class NeuralMPC:
         }
         opti.solver("ipopt", options)
         # Set the parameter values.
-        opti.set_value(P0, ca.vertcat(x0, lambda_vals))
+        opti.set_value(P0, ca.vertcat(x0, lambda_vals, neighbors_positions))
         sol = opti.solve()
 
         # Create the MPC step function for warm starting.
@@ -520,10 +525,10 @@ class NeuralMPC:
 
             step_start_time = time.time()
             if warm_start:
-                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.mpc_horizon)
+                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.neighbors_pos, self.mpc_horizon)
                 warm_start = False
             else:
-                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k), x_dec, lam)
+                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k, ca.DM(self.neighbors_pos)), x_dec, lam)
             durations.append(time.time() - step_start_time)
             # Log the MPC velocity command.
             u_np = np.array(u.full()).flatten()
