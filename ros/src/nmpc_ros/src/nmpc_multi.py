@@ -339,11 +339,11 @@ class NeuralMPC:
         # Get unassigned cells. 
         # List of assigned trees (ID)
         if self.n_agent == 1:
-            assigned = [0, 1, 5, 6, 10, 11, 15, 16]
+            assigned = [] #[0, 1, 5, 6, 10, 11, 15, 16]
         if self.n_agent == 2:
-            assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]
+            assigned = [2] #[2, 7, 12, 17, 20, 21, 22, 23, 24]
         if self.n_agent == 3:
-            assigned = [3, 4, 8, 9, 13, 14, 18, 19]
+            assigned = [] #[3, 4, 8, 9, 13, 14, 18, 19]
         # Not assigned trees (ID)
         not_assigned = [num for num in list(range(num_trees)) if num not in assigned]
 
@@ -356,6 +356,16 @@ class NeuralMPC:
 
             opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]),4.00))
             opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
+
+            # Robot-Robot Collision avoidance
+            pi = X0[0:2] 
+            for n in self.neighbors_id:
+                pj = N0[n:n+2]
+                dij = pj - pi
+                m = (pi + pj) / 2
+                epsilon = dij / ca.norm_2(dij)
+                dot_product = ca.dot(m - X[0:2, i], epsilon)
+                opti.subject_to(dot_product >= 0.5)  # DA VERIFICARE
 
             if i < steps:
                 opti.subject_to(opti.bounded(0.0, ca.sumsqr(U[0:2, i]),8.0))
