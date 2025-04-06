@@ -199,7 +199,7 @@ class NeuralMPC:
         self.lambda_k_raw and self.lambda_k_ripe.
         If no tree meets the criterion, the nearest trees are returned.
         If the number of trees meeting the criterion is lower than num_nearest,
-        additional nearest trees are added.
+        additional nearest trees are re-added (duplicated) from the candidates above the threshold.
         """
         # Compute Euclidean distances from the robot to each tree.
         distances = np.linalg.norm(self.trees_pos[:, :2] - robot_position.T, axis=1)
@@ -219,16 +219,15 @@ class NeuralMPC:
         # Sort candidate indices by distance.
         sorted_candidates = candidate_indices[np.argsort(distances[candidate_indices])]
         
-        # If the number of selected candidates is less than num_nearest, add additional nearest trees.
+        # If the number of selected candidates is less than num_nearest,
+        # re-add (duplicate) the nearest ones among those above threshold.
         if sorted_candidates.size < num_nearest:
-            # Get all tree indices sorted by distance.
-            all_sorted_indices = np.argsort(distances)
-            # Find indices not already in sorted_candidates.
-            additional_indices = np.setdiff1d(all_sorted_indices, sorted_candidates, assume_unique=True)
-            # Append the additional indices to the candidate list.
-            sorted_candidates = np.concatenate((sorted_candidates, additional_indices))
+            # Calculate how many times we need to repeat the candidates to cover num_nearest
+            repeats = int(np.ceil(num_nearest / sorted_candidates.size))
+            # Duplicate the candidate array and slice the first num_nearest elements
+            sorted_candidates = np.tile(sorted_candidates, repeats)[:num_nearest]
         
-        # Return the first num_nearest indices (or all if fewer).
+        # Return the first num_nearest indices.
         return sorted_candidates[:num_nearest]
 
     # ---------------------------
@@ -260,7 +259,7 @@ class NeuralMPC:
         # Weights and safety parameters.
         w_control = 1e-2         # Control effort weight
         w_ang = 1e-4             # Angular control weight
-        w_entropy = 1e1          # Weight for final entropy
+        w_entropy = 1e2          # Weight for final entropy
         w_attract = 1e-2         # Weight for low-entropy attraction
         safe_distance = 1.5      # Safety margin (meters)
 
@@ -275,7 +274,7 @@ class NeuralMPC:
             # State and input bounds.
             opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
             opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
-            opti.subject_to(opti.bounded(-6*np.pi, X[2, i], +6*np.pi))
+            opti.subject_to(opti.bounded(-ca.pi+X0[2], X[2, i], ca.pi+X0[2]))
 
             opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]),4.00))
             opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
@@ -288,7 +287,7 @@ class NeuralMPC:
             # Collision avoidance: ensure safety margin from trees.
             delta = X[:2, i] - TREES_param.T
             sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-            opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
+            #opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
 
             if i < steps:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
@@ -326,10 +325,10 @@ class NeuralMPC:
             "ipopt": {
                 "tol": 1e-2,
                 "warm_start_init_point": "yes",
-                "warm_start_bound_push": 1e-2,
-                "warm_start_mult_bound_push": 1e-2,
-                "mu_init": 1e-2,
-                "bound_relax_factor": 1e-6,
+                "warm_start_bound_push": 1e-1,
+                "warm_start_mult_bound_push": 1e-1,
+                "mu_init": 1e-1,
+                "bound_relax_factor": 1e-1,
                 "hsllib": '/usr/local/lib/libcoinhsl.so', # Specify HSL library path if used
                 "linear_solver": 'ma27',
                 "hessian_approximation": "limited-memory",
@@ -433,7 +432,7 @@ class NeuralMPC:
 
             # Compute tree subset based on current robot position and entropy.
             robot_position = np.array(current_state[:2])
-            selected_indices = self.get_selected_tree_indices(robot_position, num_nearest=25, entropy_threshold=0.025)
+            selected_indices = self.get_selected_tree_indices(robot_position, num_nearest=3, entropy_threshold=0.025)
             trees_subset = self.trees_pos[selected_indices]
             lambdas_subset = ca.vertcat(self.lambda_k_raw[selected_indices], self.lambda_k_ripe[selected_indices])
             
