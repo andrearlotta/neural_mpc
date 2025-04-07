@@ -99,7 +99,7 @@ class Logger:
 
 
 class TrajectoryGenerator:
-    def __init__(self, trajectory_type, bridge, run_folder="baselines"):
+    def __init__(self, trajectory_type, bridge, run_folder="baselines", random_initial_state=True):
         # Get trajectory mode and initialize Logger only once.
         self.trajectory_type = trajectory_type
         self.logger = Logger(trajectory_type, run_folder)
@@ -126,7 +126,7 @@ class TrajectoryGenerator:
         initial_state = self.generate_random_initial_state(lb, ub, margin=1.75)
         print(f"Initial State: {initial_state}")
         # Publish the initial random position.
-        self.bridge.pub_data({ "cmd_pose": initial_state})
+        if random_initial_state: self.bridge.pub_data({ "cmd_pose": initial_state})
         rospy.sleep(2.5)
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         self.lambda_values = np.full(len(self.tree_positions), 0.5)  # Initialize lambda
@@ -147,15 +147,6 @@ class TrajectoryGenerator:
         self.measurement_timer = rospy.Timer(rospy.Duration(0.5), self.measurement_callback)
         while self.bridge.get_data()["tree_scores"] is None:
             pass
-    
-    def generate_random_initial_state(self, lb, ub, margin=1.25):
-        """
-        Generate a random initial state [x, y, theta] such that:
-         - x is in [lb[0], ub[0]] and y in [lb[1], ub[1]]
-         - The position is at least `margin` meters away from every tree.
-         - theta is chosen uniformly from [-pi, pi].
-        """
-        threshold = 1.5  # Adjust as needed
 
     def generate_random_initial_state(self, lb, ub, margin=1.25):
         """
@@ -750,6 +741,8 @@ if __name__ == '__main__':
         # Initialize and run the trajectory generator
         mode = 'greedy'
         # Run 100 tests consecutively.
+        trajectory_generator = TrajectoryGenerator(mode, bridge, run_folder='results/random_field')
+        trajectory_generator.run()
         for test_num in range(1, 10):
             import re
             # Define base folder
