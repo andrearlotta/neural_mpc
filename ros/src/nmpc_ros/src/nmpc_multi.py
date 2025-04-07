@@ -285,12 +285,12 @@ class NeuralMPC:
         # return np.exp(-(x**p + y**p)/((2.0*s)**p))
         return a*ca.exp(-((x-x_c)**p + (y-y_c)**p)/((2.0*s)**p))
     
-    def aggregation_2d(self, x, y, evol, idx, a=1):
+    def aggregation_2d(self, x, y, evol, idx, a=1, d=256):
         """Compute aggregation term"""
         x_c = self.trees_pos[idx][0]
         y_c = self.trees_pos[idx][1]
         lambda_c = evol[idx]
-        return a * (1 - lambda_c) * ca.sqrt((x - x_c)**2 + (y - y_c)**2)
+        return (a**2) * (1-lambda_c) * ((x - x_c)**2 + (y - y_c)**2) / (d**2)
 
     # ---------------------------
     # MPC Optimization Function 
@@ -339,11 +339,14 @@ class NeuralMPC:
         # Get unassigned cells. 
         # List of assigned trees (ID)
         if self.n_agent == 1:
-            assigned = [0, 1, 5, 6, 10, 11, 15, 16]
+            # assigned = [0, 1, 5, 6, 10, 11, 15, 16]
+            assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21]
         if self.n_agent == 2:
-            assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]
+            # assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]
+            assigned = [2, 7, 12, 17, 22]
         if self.n_agent == 3:
-            assigned = [3, 4, 8, 9, 13, 14, 18, 19]
+            # assigned = [3, 4, 8, 9, 13, 14, 18, 19]
+            assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24]
         # Not assigned trees (ID)
         not_assigned = [num for num in list(range(num_trees)) if num not in assigned]
 
@@ -399,9 +402,10 @@ class NeuralMPC:
             for n_a in not_assigned:
                 # penalty for unassigned cells
                 penalty_cells += self.penalty_2d(X[0, i], X[1, i], self.trees_pos[n_a][0], self.trees_pos[n_a][1], p=10, s=1, a=5)
-            # for a_a in assigned:
-            #     # aggregation term for assigned cells
-            #     aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=0.1)
+            for a_a in assigned:
+                # aggregation term for assigned cells
+                ### METTERE UN TERMINE CHE FA SCALARE PER IL NUMERO DI ALBERI !!!!!!!!!
+                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=10)
 
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
