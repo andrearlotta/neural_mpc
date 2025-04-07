@@ -257,9 +257,9 @@ class NeuralMPC:
         lambda_evol_ripe = [L0_ripe]
 
         # Weights and safety parameters.
-        w_control = 1e-2         # Control effort weight
+        w_control = 1e-3         # Control effort weight
         w_ang = 1e-4             # Angular control weight
-        w_entropy = 1e2          # Weight for final entropy
+        w_entropy = 1e1          # Weight for final entropy
         w_attract = 1e-2         # Weight for low-entropy attraction
         safe_distance = 1.5      # Safety margin (meters)
 
@@ -274,20 +274,21 @@ class NeuralMPC:
             # State and input bounds.
             opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
             opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
-            opti.subject_to(opti.bounded(-ca.pi+X0[2], X[2, i], ca.pi+X0[2]))
+            opti.subject_to(opti.bounded(-ca.pi+X0[2]-.1, X[2, i], 0.1+ca.pi+X0[2]))
 
-            opti.subject_to(opti.bounded(0.0, ca.sumsqr(X[3:5, i]),4.00))
-            opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
+            opti.subject_to(opti.bounded(-2.0, X[3, i], 2.0)) # vx bound
+            opti.subject_to(opti.bounded(-2.0, X[4, i], 2.0)) # vy bound
+            opti.subject_to(opti.bounded(-ca.pi/4, X[5, i], ca.pi / 4)) # omega bound
 
             if i < steps:
-                opti.subject_to(opti.bounded(0.0, ca.sumsqr(U[0:2, i]),8.0))
-                opti.subject_to(opti.bounded(-3.14/2, U[-1, i], 3.14/2))
-                obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
+                opti.subject_to(opti.bounded(-4.0, U[0:2, i],4.0))
+                opti.subject_to(opti.bounded(-ca.pi/2, U[2, i], ca.pi/2)) # angular acc bound
+                #obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
 
             # Collision avoidance: ensure safety margin from trees.
             delta = X[:2, i] - TREES_param.T
             sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-            #opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
+            opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
 
             if i < steps:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
@@ -312,18 +313,27 @@ class NeuralMPC:
         # Compute the entropy evolution for each branch.
         lambda_future_raw = ca.vcat([*lambda_evol_raw[1:]])
         lambda_future_ripe = ca.vcat([*lambda_evol_ripe[1:]])
-        # Combine the two entropy futures with softmax weighting.
-        entropy_future_combined = self.entropy(ca.fmax(lambda_future_raw,lambda_future_ripe))
-        entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
-                               (entropy_future_combined)) * w_entropy
-        # Add terms to the objective.
+        entropy_future_combined = self.entropy(ca.fmax(lambda_future_raw, lambda_future_ripe))
+
+        # Compute base entropy using the first n_trees from both lambdas.
+        entropy_base = self.entropy(ca.fmax(lambda_evol_raw[0], lambda_evol_ripe[0]))
+
+        # Extend the base entropy to match entropy_future_combined by stacking it 'steps' times.
+        entropy_base_extended = ca.repmat(entropy_base, steps, 1)
+
+        # Divide the combined entropy by the extended base entropy.
+        entropy_future_combined = ca.sum1(entropy_future_combined) / ca.sum1(entropy_base_extended)
+
+        # Compute the weighted entropy term.
+        entropy_term = (entropy_future_combined) * w_entropy
+
+       # Add terms to the objective.
         obj += entropy_term
         opti.minimize(obj)
-
         # Solver options.
         options = {
             "ipopt": {
-                "tol": 1e-2,
+                "tol": 5*1e-1,
                 "warm_start_init_point": "yes",
                 "warm_start_bound_push": 1e-1,
                 "warm_start_mult_bound_push": 1e-1,
@@ -336,7 +346,7 @@ class NeuralMPC:
                 "sb": "no",
                 "mu_strategy": "monotone",
                 "max_iter": 3000
-            }
+                }
         }
         opti.solver("ipopt", options)
         # Set the parameter values.
@@ -432,15 +442,16 @@ class NeuralMPC:
 
             # Compute tree subset based on current robot position and entropy.
             robot_position = np.array(current_state[:2])
-            selected_indices = self.get_selected_tree_indices(robot_position, num_nearest=3, entropy_threshold=0.025)
+            selected_indices = self.get_selected_tree_indices(robot_position, num_nearest=25, entropy_threshold=0.025)
+            print('selected')
             trees_subset = self.trees_pos[selected_indices]
             lambdas_subset = ca.vertcat(self.lambda_k_raw[selected_indices], self.lambda_k_ripe[selected_indices])
             
             # Publish markers using the full lambda scores if needed.
             lambda_score = (self.lambda_k_ripe > self.lambda_k_raw) * self.lambda_k_ripe + (self.lambda_k_ripe <= self.lambda_k_raw) * (1 - self.lambda_k_raw)
-            #self.bridge.pub_data({
-            #    "tree_markers": {"trees_pos": self.trees_pos, "lambda": lambda_score.full().flatten()}
-            #})
+            self.bridge.pub_data({
+                "tree_markers": {"trees_pos": self.trees_pos, "lambda": lambda_score.full().flatten()}
+            })
             print(ca.fmax(self.lambda_k_ripe,self.lambda_k_raw).full().flatten()[ca.fmax(self.lambda_k_ripe,self.lambda_k_raw).full().flatten() > 0.75])
             step_start_time = time.time()
             if warm_start:
@@ -872,7 +883,7 @@ class NeuralMPC:
 
         # Local helper to compute binary entropy.
         def binary_entropy(p):
-            p = np.clip(p, 1e-9, 1-1e-9)
+            p = np.clip(p, 1e-4, 1-1e-4)
             return -p * np.log2(p) - (1-p) * np.log2(1-p)
 
         time_history = self.time_history
