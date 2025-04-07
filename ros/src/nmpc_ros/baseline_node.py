@@ -29,11 +29,11 @@ class PIDController:
 
 
 class Logger:
-    def __init__(self, trajectory_type, filename='performance_metrics.csv'):
+    def __init__(self, trajectory_type, filename='performance_metrics.csv', save_dir='baselines'):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.timestamp = time.strftime("%Y%m%d_%H%M%S")  # Current timestamp
         # Create a filename that includes trajectory type and timestamp
-        self.filename = os.path.join(os.path.join(script_dir, "baselines"),
+        self.filename = os.path.join(os.path.join(script_dir, save_dir),
                                      f"{trajectory_type}_{self.timestamp}_{filename}")
 
         self.csv_file = open(self.filename, 'w', newline='')
@@ -46,7 +46,7 @@ class Logger:
         self.total_distance = 0
 
         # Open an additional CSV file to log injected velocity commands.
-        self.velocity_filename = os.path.join(os.path.join(script_dir, "baselines"),
+        self.velocity_filename = os.path.join(os.path.join(script_dir, save_dir),
                                               f"{trajectory_type}_{self.timestamp}_velocity_commands.csv")
         self.velocity_csv_file = open(self.velocity_filename, 'w', newline='')
         self.velocity_csv_writer = csv.writer(self.velocity_csv_file)
@@ -97,9 +97,8 @@ class Logger:
         print(f"Total Distance: {self.total_distance:.2f} m")
         print(f"Average Waypoint-to-Waypoint Time: {avg_wp_time:.2f} s")
 
-
 class TrajectoryGenerator:
-    def __init__(self, trajectory_type):
+    def __init__(self, trajectory_type, save_dir='baselines'):
         # Get trajectory mode and initialize Logger only once.
         self.trajectory_type = trajectory_type
         self.logger = Logger(trajectory_type)
@@ -531,9 +530,9 @@ class TrajectoryGenerator:
 
         fig.show()
 
-    def save_plot_data_csv(self, trajectory_type):
+    def save_plot_data_csv(self, trajectory_type, save_dir='baselines'):
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        baselines_dir = os.path.join(script_dir, "baselines")
+        baselines_dir = os.path.join(script_dir, save_dir)
         if not os.path.exists(baselines_dir):
             os.makedirs(baselines_dir)
         filename = os.path.join(baselines_dir, f"{trajectory_type}_{self.logger.timestamp}_plot_data.csv")
@@ -964,8 +963,8 @@ class TrajectoryGenerator:
 
 if __name__ == '__main__':
     try:
-        mode = rospy.get_param('~trajectory_mode', 'between_rows')
-        trajectory_generator = TrajectoryGenerator(mode)
+        mode = rospy.get_param('~trajectory_mode', 'greedy')
+        trajectory_generator = TrajectoryGenerator(mode, save_dir='results/random_field')
         trajectory_generator.run()
     except rospy.ROSInterruptException:
         pass
