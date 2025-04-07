@@ -324,7 +324,7 @@ class NeuralMPC:
         w_ang = 1e-4             # Angular control weight
         w_entropy = 1e1          # Weight for final entropy
         w_attract = 1e-2         # Weight for low-entropy attraction
-        safe_distance = 1.0      # Safety margin (meters)
+        safe_distance = 1      # Safety margin (meters)
 
         # Initialize the objective.
         obj = 0
@@ -339,14 +339,14 @@ class NeuralMPC:
         # Get unassigned cells. 
         # List of assigned trees (ID)
         if self.n_agent == 1:
-            # assigned = [0, 1, 5, 6, 10, 11, 15, 16]
-            assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21]
+            assigned = [0, 1, 5, 6, 10, 11, 15, 16]
+            # assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21]
         if self.n_agent == 2:
-            # assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]
-            assigned = [2, 7, 12, 17, 22]
+            assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]
+            # assigned = [2, 7, 12, 17, 22]
         if self.n_agent == 3:
-            # assigned = [3, 4, 8, 9, 13, 14, 18, 19]
-            assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24]
+            assigned = [3, 4, 8, 9, 13, 14, 18, 19]
+            # assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24]
         # Not assigned trees (ID)
         not_assigned = [num for num in list(range(num_trees)) if num not in assigned]
 
@@ -403,9 +403,8 @@ class NeuralMPC:
                 # penalty for unassigned cells
                 penalty_cells += self.penalty_2d(X[0, i], X[1, i], self.trees_pos[n_a][0], self.trees_pos[n_a][1], p=10, s=1, a=5)
             for a_a in assigned:
-                # aggregation term for assigned cells
-                ### METTERE UN TERMINE CHE FA SCALARE PER IL NUMERO DI ALBERI !!!!!!!!!
-                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=10)
+                # aggregation term for assigned cells 
+                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=13) / len(assigned)
 
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
