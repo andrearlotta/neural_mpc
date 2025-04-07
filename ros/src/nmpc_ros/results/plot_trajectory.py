@@ -44,11 +44,11 @@ def load_csv_data(csv_path):
 
     return time_history, x_trajectory, y_trajectory, theta_trajectory, entropy_history, lambda_history, tree_positions
 
-def main():
+def main(path):
     # Define baseline modes and directories
     modes = ["greedy", "mpc"]
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    baselines_dir = os.path.join(script_dir, "baselines")
+    baselines_dir = os.path.join(script_dir, path)
 
     # Collect data for each mode
     all_data = []
@@ -165,4 +165,4 @@ def main():
         fig.show()
 
 if __name__ == "__main__":
-    main()
+    main('random_field')
