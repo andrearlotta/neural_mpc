@@ -290,7 +290,15 @@ class NeuralMPC:
         x_c = self.trees_pos[idx][0]
         y_c = self.trees_pos[idx][1]
         lambda_c = evol[idx]
-        return (a**2) * (1-lambda_c) * ((x - x_c)**2 + (y - y_c)**2) / (d**2)
+        # Norma quadra
+        # return (a**2) * (1-lambda_c) * ((x - x_c)**2 + (y - y_c)**2) / (d**2)
+        # Quadrati
+        # p=4
+        # s=1
+        # return -a*(1-lambda_c) *ca.exp(-((x-x_c)**p + (y-y_c)**p)/((2.0*s)**p))
+        # Distanza
+        return a * (1-lambda_c) * ca.sqrt((x - x_c)**2 + (y - y_c)**2 + 1e-6) / d
+
 
     # ---------------------------
     # MPC Optimization Function 
@@ -339,17 +347,17 @@ class NeuralMPC:
         # Get unassigned cells. 
         # List of assigned trees (ID)
         if self.n_agent == 1:
-            assigned = [0, 1, 5, 6, 10, 11, 15, 16]
-            # assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21]
-            # assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]
+            # assigned = [0, 1, 5, 6, 10, 11, 15, 16]         # T
+            # assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21] # Rect
+            assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]       # L
         if self.n_agent == 2:
-            assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]
-            # assigned = [2, 7, 12, 17, 22]
-            # assigned = [3, 8, 13, 15, 16, 17, 18]
+            # assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]   # T
+            # assigned = [2, 7, 12, 17, 22]                   # Rect
+            assigned = [3, 8, 13, 15, 16, 17, 18]           # L
         if self.n_agent == 3:
-            assigned = [3, 4, 8, 9, 13, 14, 18, 19]
-            # assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24]
-            # assigned = [4, 9, 14, 19, 20, 21, 22, 23, 24]
+            # assigned = [3, 4, 8, 9, 13, 14, 18, 19]         # T
+            # assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24] # Rect
+            assigned = [4, 9, 14, 19, 20, 21, 22, 23, 24]   # L
         # Not assigned trees (ID)
         not_assigned = [num for num in list(range(num_trees)) if num not in assigned]
 
@@ -407,23 +415,23 @@ class NeuralMPC:
                 penalty_cells += self.penalty_2d(X[0, i], X[1, i], self.trees_pos[n_a][0], self.trees_pos[n_a][1], p=10, s=0.9, a=5)
             for a_a in assigned:
                 # aggregation term for assigned cells 
-                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=13) / len(assigned)
+                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=1) / len(assigned) #a=13
 
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
         entropy_term = ca.sum1( ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) * entropy_future) * w_entropy
         #--------------------------- Annulla la funzione degli alberi che non mi interessano
-        # mask = ca.DM.zeros(num_trees * steps, 1)
-        # for step in range(steps):
-        #     for i in assigned:
-        #         idx = i + step * num_trees  # indices step successivi
-        #         mask[idx] = 1
-        # exp_weights = ca.vcat([ca.exp(-2*i) * ca.DM.ones(num_trees, 1) for i in range(steps)])
-        # entropy_term = ca.sum1((mask * exp_weights) * entropy_future) * w_entropy
+        mask = ca.DM.zeros(num_trees * steps, 1)
+        for step in range(steps):
+            for i in assigned:
+                idx = i + step * num_trees  # indices step successivi
+                mask[idx] = 1
+        exp_weights = ca.vcat([ca.exp(-2*i) * ca.DM.ones(num_trees, 1) for i in range(steps)])
+        entropy_term = ca.sum1((mask * exp_weights) * entropy_future) * w_entropy
         #---------------------------        
         # Add terms to the objective.
         obj += entropy_term
-        obj += penalty_cells
+        # obj += penalty_cells
         obj += aggregation
         opti.minimize(obj)
 
