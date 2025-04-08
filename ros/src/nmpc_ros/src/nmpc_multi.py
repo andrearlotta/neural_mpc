@@ -128,6 +128,30 @@ class NeuralMPC:
 
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
+ 
+        # List of assigned trees (ID)
+        if self.n_agent == 1:
+            # Outside
+            # self.assigned = [0, 1, 5, 6, 10, 11, 15, 16]              # T
+            # self.assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21]      # Rect
+            # self.assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]            # L
+            # Inside
+            self.assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]            # Rect
+        if self.n_agent == 2:
+            # Outside
+            # self.assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]        # T
+            # self.assigned = [2, 7, 12, 17, 22]                        # Rect
+            # self.assigned = [3, 8, 13, 15, 16, 17, 18]                # L
+            # Inside
+            self.assigned = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24]  # Rect
+        if self.n_agent == 3:
+            # Outside
+            # self.assigned = [3, 4, 8, 9, 13, 14, 18, 19]              # T
+            # self.assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24]      # Rect
+            # self.assigned = [4, 9, 14, 19, 20, 21, 22, 23, 24]        # L
+            # Inside
+            self.assigned = [3, 4, 8, 9, 13, 14]                      # Rect
+
 
     # ---------------------------
     # Callback Functions
@@ -344,22 +368,10 @@ class NeuralMPC:
         penalty_cells = 0 # unassigned
         aggregation = 0   # assigned
 
-        # Get unassigned cells. 
-        # List of assigned trees (ID)
-        if self.n_agent == 1:
-            # assigned = [0, 1, 5, 6, 10, 11, 15, 16]         # T
-            # assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21] # Rect
-            assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]       # L
-        if self.n_agent == 2:
-            # assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]   # T
-            # assigned = [2, 7, 12, 17, 22]                   # Rect
-            assigned = [3, 8, 13, 15, 16, 17, 18]           # L
-        if self.n_agent == 3:
-            # assigned = [3, 4, 8, 9, 13, 14, 18, 19]         # T
-            # assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24] # Rect
-            assigned = [4, 9, 14, 19, 20, 21, 22, 23, 24]   # L
+        # Assigned trees (ID)
+        assigned_tree  = self.assigned
         # Not assigned trees (ID)
-        not_assigned = [num for num in list(range(num_trees)) if num not in assigned]
+        not_assigned_tree = [num for num in list(range(num_trees)) if num not in assigned_tree]
 
         # Loop over the prediction horizon.
         for i in range(steps+1):
@@ -410,12 +422,12 @@ class NeuralMPC:
 
         # Limited area (Cells) and attraction
         for i in range(steps+1):
-            for n_a in not_assigned:
+            for n_a in not_assigned_tree:
                 # penalty for unassigned cells
                 penalty_cells += self.penalty_2d(X[0, i], X[1, i], self.trees_pos[n_a][0], self.trees_pos[n_a][1], p=10, s=0.9, a=5)
-            for a_a in assigned:
+            for a_a in assigned_tree:
                 # aggregation term for assigned cells 
-                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=1) / len(assigned) #a=13
+                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=2) / len(assigned_tree) #a=13
 
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
@@ -423,7 +435,7 @@ class NeuralMPC:
         #--------------------------- Annulla la funzione degli alberi che non mi interessano
         mask = ca.DM.zeros(num_trees * steps, 1)
         for step in range(steps):
-            for i in assigned:
+            for i in assigned_tree:
                 idx = i + step * num_trees  # indices step successivi
                 mask[idx] = 1
         exp_weights = ca.vcat([ca.exp(-2*i) * ca.DM.ones(num_trees, 1) for i in range(steps)])
@@ -547,17 +559,23 @@ class NeuralMPC:
             self.tree_markers_pub.publish(tree_markers_msg)
 
             step_start_time = time.time()
-            if warm_start:
+            if warm_start: # MPC initialization
                 mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.neighbors_pos, self.mpc_horizon)
                 warm_start = False
-            else:
-                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k, ca.DM(self.neighbors_pos)), x_dec, lam)
+            else: # MPC step
+                # Move to accomplish the task (if not completed)
+                if np.any(self.lambda_k.full().flatten()[self.assigned] < 0.95):
+                    u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k, ca.DM(self.neighbors_pos)), x_dec, lam)
+                    
             durations.append(time.time() - step_start_time)
             # Log the MPC velocity command.
             u_np = np.array(u.full()).flatten()
 
             # Compute the command pose.
-            cmd_pose = F_(x_k, u[:, 0])
+            if np.any(self.lambda_k.full().flatten()[self.assigned] < 0.95): # Stay still if task completed
+                cmd_pose = F_(x_k, u[:, 0])
+            else:
+                rospy.loginfo("\033[92mAgent " + str(self.n_agent) + ": done\033[0m")
 
             # Publish predicted path.
             predicted_path_msg = create_path_from_mpc_prediction(x_traj[:self.nx, 1:])
