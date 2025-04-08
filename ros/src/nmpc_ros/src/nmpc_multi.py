@@ -542,7 +542,7 @@ class NeuralMPC:
 
         # Main MPC loop.
         while mpciter < sim_time and not rospy.is_shutdown():
-            rospy.loginfo('Step: %d', mpciter)
+            # rospy.loginfo('Step: %d', mpciter)
             # Update state from the latest GPS callback.
             while self.current_state is None and not rospy.is_shutdown():
                 rospy.sleep(0.05)
@@ -559,82 +559,84 @@ class NeuralMPC:
             latest_trees_scores = self.latest_trees_scores.copy()
             self.lambda_k = self.bayes(self.lambda_k, latest_trees_scores)
             self.lambda_k = np.ceil(self.lambda_k*1000)/1000
-            rospy.loginfo("Current state x_k: %s", x_k)
-            rospy.loginfo("Lambda: %s", self.lambda_k)
-            rospy.loginfo("Current tree scores: %s", latest_trees_scores.flatten())
-            rospy.loginfo("VICINI: %s", self.neighbors_pos)
+            # rospy.loginfo("Current state x_k: %s", x_k)
+            # rospy.loginfo("Lambda: %s", self.lambda_k)
+            # rospy.loginfo("Current tree scores: %s", latest_trees_scores.flatten())
+            # rospy.loginfo("VICINI: %s", self.neighbors_pos)
 
             # Publish tree markers using the helper function from sensors.py.
             tree_markers_msg = create_tree_markers(self.trees_pos, self.lambda_k.full().flatten())
             self.tree_markers_pub.publish(tree_markers_msg)
 
-            step_start_time = time.time()
-            if warm_start and self.assigned is not None: # MPC initialization
-                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.neighbors_pos, self.mpc_horizon)
-                warm_start = False
-            else: # MPC step
-                # Move to accomplish the task (if not completed)
-                if np.any(self.lambda_k.full().flatten()[self.assigned] < 0.95):
-                    u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k, ca.DM(self.neighbors_pos)), x_dec, lam)
-                    
-            durations.append(time.time() - step_start_time)
-            # Log the MPC velocity command.
-            u_np = np.array(u.full()).flatten()
+            if self.assigned is not None:
+                step_start_time = time.time()
+                if warm_start: # MPC initialization
+                    mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.neighbors_pos, self.mpc_horizon)
+                    warm_start = False
+                else: # MPC step
+                    # Move to accomplish the task (if not completed)
+                    if np.any(self.lambda_k.full().flatten()[self.assigned] < 0.95):
+                        u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, self.lambda_k, ca.DM(self.neighbors_pos)), x_dec, lam)
+                        
+                durations.append(time.time() - step_start_time)
+                # Log the MPC velocity command.
+                u_np = np.array(u.full()).flatten()
 
-            # Compute the command pose.
-            if np.any(self.lambda_k.full().flatten()[self.assigned] < 0.95): # Stay still if task completed
-                cmd_pose = F_(x_k, u[:, 0])
-            else:
-                rospy.loginfo("\033[92mAgent " + str(self.n_agent) + ": done\033[0m")
+                # Compute the command pose.
+                if np.any(self.lambda_k.full().flatten()[self.assigned] < 0.95): # Stay still if task completed
+                    cmd_pose = F_(x_k, u[:, 0])
+                else:
+                    rospy.loginfo("\033[92mAgent " + str(self.n_agent) + ": done\033[0m")
 
-            # Publish predicted path.
-            predicted_path_msg = create_path_from_mpc_prediction(x_traj[:self.nx, 1:])
-            self.pred_path_pub.publish(predicted_path_msg)
+                # Publish predicted path.
+                predicted_path_msg = create_path_from_mpc_prediction(x_traj[:self.nx, 1:])
+                self.pred_path_pub.publish(predicted_path_msg)
 
-            # Build and publish the cmd_pose message.
-            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(cmd_pose[2]))
-            cmd_pose_msg = Pose()
-            cmd_pose_msg.position = Point(x=float(cmd_pose[0]), y=float(cmd_pose[1]), z=0.0)
-            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
-                                                  y=quaternion[1],
-                                                  z=quaternion[2],
-                                                  w=quaternion[3])
-            self.cmd_pose_pub.publish(cmd_pose_msg)
+                # Build and publish the cmd_pose message.
+                quaternion = tf.transformations.quaternion_from_euler(0, 0, float(cmd_pose[2]))
+                cmd_pose_msg = Pose()
+                cmd_pose_msg.position = Point(x=float(cmd_pose[0]), y=float(cmd_pose[1]), z=0.0)
+                cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                    y=quaternion[1],
+                                                    z=quaternion[2],
+                                                    w=quaternion[3])
+                self.cmd_pose_pub.publish(cmd_pose_msg)
 
-            vx_k = cmd_pose[self.nx:]
-            velocity_command_log.append([current_sim_time, "MPC", vx_k[0], vx_k[1], vx_k[2]])
+                vx_k = cmd_pose[self.nx:]
+                velocity_command_log.append([current_sim_time, "MPC", vx_k[0], vx_k[1], vx_k[2]])
 
-            # Update metrics.
-            vx_val = float(vx_k[0])
-            vy_val = float(vx_k[1])
-            yaw_val = float(vx_k[2])
-            sum_vx += vx_val
-            sum_vy += vy_val
-            sum_yaw += yaw_val
-            trans_speed = math.sqrt(vx_val**2 + vy_val**2)
-            sum_trans_speed += trans_speed
-            total_commands += 1
+                # Update metrics.
+                vx_val = float(vx_k[0])
+                vy_val = float(vx_k[1])
+                yaw_val = float(vx_k[2])
+                sum_vx += vx_val
+                sum_vy += vy_val
+                sum_yaw += yaw_val
+                trans_speed = math.sqrt(vx_val**2 + vy_val**2)
+                sum_trans_speed += trans_speed
+                total_commands += 1
 
-            curr_x = float(x_traj[0, 1])
-            curr_y = float(x_traj[1, 1])
-            distance_step = math.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
-            total_distance += distance_step
-            prev_x, prev_y = curr_x, curr_y
+                curr_x = float(x_traj[0, 1])
+                curr_y = float(x_traj[1, 1])
+                distance_step = math.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+                total_distance += distance_step
+                prev_x, prev_y = curr_x, curr_y
 
-            entropy_k = ca.sum1(self.entropy(self.lambda_k)).full().flatten()[0]
-            lambda_history.append(self.lambda_k.full().flatten().tolist())
-            entropy_history.append(entropy_k)
-            all_trajectories.append(x_traj[:self.nx, :].full())
+                entropy_k = ca.sum1(self.entropy(self.lambda_k)).full().flatten()[0]
+                lambda_history.append(self.lambda_k.full().flatten().tolist())
+                entropy_history.append(entropy_k)
+                all_trajectories.append(x_traj[:self.nx, :].full())
+
+                mpciter += 1
+                rospy.loginfo("Entropy: %s", entropy_k)
+                if all( v >=0.99 for v in  self.lambda_k.full().flatten()):
+                    break
 
             # send lambda values
             lambda_msg = Float32MultiArray()
             lambda_msg.data = self.lambda_k.full().flatten()
             self.lambda_pub.publish(lambda_msg)
-
-            mpciter += 1
-            rospy.loginfo("Entropy: %s", entropy_k)
-            if all( v >=0.99 for v in  self.lambda_k.full().flatten()):
-                break
+            
             rate.sleep()
 
         # ---------------------------

@@ -3,13 +3,14 @@
 import rospy
 import numpy as np
 from sklearn.cluster import KMeans
-from std_msgs.msg import Int32MultiArray
+from std_msgs.msg import Int32MultiArray, Float32MultiArray
 from collections import defaultdict
 import threading
 import matplotlib.pyplot as plt
 import tf
 import tf2_ros
 from nmpc_ros.srv import GetTreesPoses
+import os
 
 
 class KMeansClusterNode:
@@ -32,9 +33,28 @@ class KMeansClusterNode:
         self.robots_state_thread.daemon = True
         self.robots_state_thread.start()
         self.data_received = False # first TF obtained
+        
+        # subscibers
+        self.lambda_value = None
+        subscribers_net = []
+        for n in range(1, self.n_agents+1):
+            topic = f"/agent_{n}/lambda"
+            sub = rospy.Subscriber(topic, Float32MultiArray, self.lambda_callback)
+            subscribers_net.append(sub)
 
-        self.reassignment = False   # used to stop first assignment
+        self.first_assignment = False   # used to stop first assignment
         self.dict_assignment = None # store agent-list of assigned trees
+
+    def lambda_callback(self, msg):
+        """
+        Callback for lambda.
+        """
+        if self.lambda_value is None:
+            self.lambda_value = msg.data
+        received = msg.data
+        lambda_curr = self.lambda_value
+        result_max = np.maximum(received, lambda_curr)
+        self.lambda_value = result_max
 
     def robots_state_update_thread(self):
         """Continuously update the robots' state using TF at 30 Hz."""
@@ -83,11 +103,9 @@ class KMeansClusterNode:
         # Per ogni albero, associa l'indice al robot, tenendo conto che i robot partono da indice 1
         for tree_idx, robot_idx in enumerate(assigned_clusters):
             robot_to_trees[robot_idx + 1].append(tree_idx)  # Aggiungiamo 1 per saltare l'indice 0
+
+        self.dict_assignment = robot_to_trees
         
-        for robot_idx, trees in robot_to_trees.items():
-            print(robot_idx)
-            print(trees)
-            print("----------")
         ##################   Plotting
         # colors = plt.cm.viridis(np.linspace(0, 1, len(self.robot_positions) - 1))  # Colori da mappa 'viridis', ridotto di 1 per escludere la posizione 0
         # plt.figure(figsize=(8, 6))
@@ -105,30 +123,82 @@ class KMeansClusterNode:
         # plt.legend()
         # plt.grid(True)
         # # Mostra il grafico
-        # plt.show()
+        # current_dir = os.path.dirname(os.path.abspath(__file__))
+        # filename = os.path.join(current_dir, "start.svg")
+        # plt.savefig(filename, format='svg')
+        # plt.close()
+        # # plt.show()
         ##################
-
-        # Pubblica i risultati
-        for robot_idx, trees in robot_to_trees.items():
-            self.publish_cluster(robot_idx, trees)
     
     def rerun_kmeans(self):
-        # Eseguiamo il K-Means per assegnare gli alberi ai robot
-        # Escludiamo la prima posizione dei robot (posizione 0) e inizializziamo KMeans
-        kmeans = KMeans(n_clusters=self.n_agents, init=self.robot_positions[1:, :], n_init=1)
-        kmeans.fit(self.tree_positions)
+        # Trova gli indici originali degli alberi non ancora visitati (lambda < 0.95)
+        unvisited_idxs = [i for i, val in enumerate(self.lambda_value) if val < 0.95]
 
-        # Otteniamo l'indice dell'albero assegnato per ogni posizione
+        # Se gli alberi non visitati sono meno dei robot, il clustering non ha senso
+        if len(unvisited_idxs) < self.n_agents:
+            return
+
+        # Estrai le posizioni solo degli alberi non ancora visitati
+        unvisited_positions = self.tree_positions[unvisited_idxs]
+
+        # Inizializza K-Means con i robot (escludendo la posizione 0)
+        kmeans = KMeans(
+            n_clusters=self.n_agents,
+            init=self.robot_positions[1:, :],  # le posizioni iniziali dei robot (escluso indice 0)
+            n_init=1
+        )
+        kmeans.fit(unvisited_positions)
+
+        # Ottieni a quale cluster (robot) è stato assegnato ciascun albero non visitato
         assigned_clusters = kmeans.labels_
 
-        # Associa ogni robot agli indici degli alberi
+        # Crea un dizionario che assegna ad ogni robot una lista di indici originali degli alberi
         robot_to_trees = defaultdict(list)
+        for idx_in_subset, robot_idx in enumerate(assigned_clusters):
+            original_tree_idx = unvisited_idxs[idx_in_subset]
+            robot_to_trees[robot_idx + 1].append(original_tree_idx)  # +1 per saltare l'indice 0 del robot
 
-        # Per ogni albero, associa l'indice al robot, tenendo conto che i robot partono da indice 1
-        for tree_idx, robot_idx in enumerate(assigned_clusters):
-            robot_to_trees[robot_idx + 1].append(tree_idx)  # Aggiungiamo 1 per saltare l'indice 0
-
+        # Salva l'assegnamento nel dizionario interno della classe
         self.dict_assignment = robot_to_trees
+
+        ##################   Plotting
+        # colors = plt.cm.viridis(np.linspace(0, 1, self.n_agents))
+        # plt.figure(figsize=(8, 6))
+        # # Plot dei robot (marker 'X'), esclusa la posizione 0
+        # for robot_idx, pos in enumerate(self.robot_positions[1:], start=1):
+        #     plt.scatter(
+        #         pos[0], pos[1],
+        #         s=100,
+        #         color=colors[robot_idx - 1],
+        #         label=f"Robot {robot_idx}",
+        #         edgecolors='black',
+        #         marker='X',
+        #         zorder=5
+        #     )
+        # # Plot degli alberi non visitati, colorati in base al robot assegnato
+        # for i, tree_idx in enumerate(unvisited_idxs):
+        #     pos = self.tree_positions[tree_idx]
+        #     robot_idx = assigned_clusters[i]  # Cluster assegnato
+        #     plt.scatter(
+        #         pos[0], pos[1],
+        #         c=[colors[robot_idx]],
+        #         s=100,
+        #         edgecolors='black',
+        #         zorder=2
+        #     )
+        # # Aggiungi legende, titoli e griglia
+        # plt.title("Assegnamento Alberi ai Robot tramite K-Means", fontsize=14)
+        # plt.xlabel("Coordinata X")
+        # plt.ylabel("Coordinata Y")
+        # plt.legend()
+        # plt.grid(True)
+        # plt.tight_layout()
+        # current_dir = os.path.dirname(os.path.abspath(__file__))
+        # filename = os.path.join(current_dir, "reassignment.svg")
+        # plt.savefig(filename, format='svg')
+        # plt.close()
+        # # plt.show()
+        ##################
 
 
     def publish_cluster(self, robot_idx, trees):
@@ -143,11 +213,20 @@ class KMeansClusterNode:
 
     def spin(self):
         while not rospy.is_shutdown():
-            if self.data_received and self.reassignment == False:
+            if self.data_received and self.first_assignment == False:
                 self.run_first_kmeans()
-            # if se almeno un robot ha tutti i lambda assegnati  > 0.95
-            #     self.reassignment = True
-            #     self.rerun_kmeans()
+                self.first_assignment = True
+
+            # Compute reassignment condition
+            reassignment_needed = False
+            if self.dict_assignment is not None and self.lambda_value is not None:
+                for robot_idx, trees in self.dict_assignment.items():
+                    if np.all(self.lambda_value[trees] >= 0.95): # reassign if all labdas are sufficiently high
+                        reassignment_needed = True
+
+            # Reassignment (if needed)
+            if reassignment_needed == True:
+                self.rerun_kmeans()
 
             # Pubblica i risultati
             if self.dict_assignment is not None:
