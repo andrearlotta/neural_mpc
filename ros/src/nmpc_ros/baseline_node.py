@@ -739,29 +739,27 @@ if __name__ == '__main__':
     try:
         bridge = BridgeClass(SENSORS)
         # Initialize and run the trajectory generator
-        mode = 'greedy'
-        # Run 100 tests consecutively.
-        trajectory_generator = TrajectoryGenerator(mode, bridge, run_folder='results/random_field')
-        trajectory_generator.run()
-        for test_num in range(1, 10):
-            import re
-            # Define base folder
-            base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"test_runs_{mode}")
-            os.makedirs(base_test_folder, exist_ok=True)
+        modes = ['greedy', ' between_rows', 'trees_to_trees']
+        for mode in modes:
+            for test_num in range(1, 15):
+                import re
+                # Define base folder
+                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"test_runs_big_field_{mode}")
+                os.makedirs(base_test_folder, exist_ok=True)
 
-            # Find the next test number
-            existing_runs = [
-                int(match.group(1)) for d in os.listdir(base_test_folder)
-                if (match := re.match(r'run_(\d+)', d)) and os.path.isdir(os.path.join(base_test_folder, d))
-            ]
-            next_test_num = max(existing_runs, default=0) + 1
+                # Find the next test number
+                existing_runs = [
+                    int(match.group(1)) for d in os.listdir(base_test_folder)
+                    if (match := re.match(r'run_(\d+)', d)) and os.path.isdir(os.path.join(base_test_folder, d))
+                ]
+                next_test_num = max(existing_runs, default=0) + 1
 
-            # Create run folder
-            run_folder = os.path.join(base_test_folder, f"run_{next_test_num}")
-            os.makedirs(run_folder, exist_ok=True)
+                # Create run folder
+                run_folder = os.path.join(base_test_folder, f"run_{next_test_num}")
+                os.makedirs(run_folder, exist_ok=True)
 
-            print(f"================== Starting Test Run {next_test_num} ==================")
-            trajectory_generator = TrajectoryGenerator(mode, bridge, run_folder=run_folder)
-            trajectory_generator.run()
+                print(f"================== Starting Test Run {next_test_num} ==================")
+                trajectory_generator = TrajectoryGenerator(mode, bridge, run_folder=run_folder)
+                trajectory_generator.run()
     except rospy.ROSInterruptException:
         pass
