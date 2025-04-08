@@ -20,10 +20,8 @@ class KMeansClusterNode:
         self.rate = rospy.Rate(1)
         self.n_agents = rospy.get_param('~n_agents', 1)
 
+        # Positions
         self.robot_positions = np.zeros((self.n_agents+1, 2)) # elemento 0 vuoto
-
-
-        # Posizioni degli alberi (x, y) -> m alberi
         self.tree_positions = self.get_trees_poses()
 
         # TF listener
@@ -33,10 +31,13 @@ class KMeansClusterNode:
         self.robots_state_thread = threading.Thread(target=self.robots_state_update_thread)
         self.robots_state_thread.daemon = True
         self.robots_state_thread.start()
-        self.data_received = False
+        self.data_received = False # first TF obtained
+
+        self.reassignment = False   # used to stop first assignment
+        self.dict_assignment = None # store agent-list of assigned trees
 
     def robots_state_update_thread(self):
-        """Continuously update the robot's state using TF at 30 Hz."""
+        """Continuously update the robots' state using TF at 30 Hz."""
         rate = rospy.Rate(30)  # 30 Hz update rate
         while not rospy.is_shutdown():
             for n in range(1, self.n_agents+1):
@@ -67,7 +68,7 @@ class KMeansClusterNode:
             rospy.logerr("Service call failed: %s", e)
             return np.array([])
 
-    def run_kmeans(self):
+    def run_first_kmeans(self):
         # Eseguiamo il K-Means per assegnare gli alberi ai robot
         # Escludiamo la prima posizione dei robot (posizione 0) e inizializziamo KMeans
         kmeans = KMeans(n_clusters=self.n_agents, init=self.robot_positions[1:, :], n_init=1)
@@ -82,7 +83,11 @@ class KMeansClusterNode:
         # Per ogni albero, associa l'indice al robot, tenendo conto che i robot partono da indice 1
         for tree_idx, robot_idx in enumerate(assigned_clusters):
             robot_to_trees[robot_idx + 1].append(tree_idx)  # Aggiungiamo 1 per saltare l'indice 0
-
+        
+        for robot_idx, trees in robot_to_trees.items():
+            print(robot_idx)
+            print(trees)
+            print("----------")
         ##################   Plotting
         # colors = plt.cm.viridis(np.linspace(0, 1, len(self.robot_positions) - 1))  # Colori da mappa 'viridis', ridotto di 1 per escludere la posizione 0
         # plt.figure(figsize=(8, 6))
@@ -106,6 +111,24 @@ class KMeansClusterNode:
         # Pubblica i risultati
         for robot_idx, trees in robot_to_trees.items():
             self.publish_cluster(robot_idx, trees)
+    
+    def rerun_kmeans(self):
+        # Eseguiamo il K-Means per assegnare gli alberi ai robot
+        # Escludiamo la prima posizione dei robot (posizione 0) e inizializziamo KMeans
+        kmeans = KMeans(n_clusters=self.n_agents, init=self.robot_positions[1:, :], n_init=1)
+        kmeans.fit(self.tree_positions)
+
+        # Otteniamo l'indice dell'albero assegnato per ogni posizione
+        assigned_clusters = kmeans.labels_
+
+        # Associa ogni robot agli indici degli alberi
+        robot_to_trees = defaultdict(list)
+
+        # Per ogni albero, associa l'indice al robot, tenendo conto che i robot partono da indice 1
+        for tree_idx, robot_idx in enumerate(assigned_clusters):
+            robot_to_trees[robot_idx + 1].append(tree_idx)  # Aggiungiamo 1 per saltare l'indice 0
+
+        self.dict_assignment = robot_to_trees
 
 
     def publish_cluster(self, robot_idx, trees):
@@ -120,9 +143,17 @@ class KMeansClusterNode:
 
     def spin(self):
         while not rospy.is_shutdown():
-            # print(self.robot_positions)
-            if self.data_received:
-                self.run_kmeans()
+            if self.data_received and self.reassignment == False:
+                self.run_first_kmeans()
+            # if se almeno un robot ha tutti i lambda assegnati  > 0.95
+            #     self.reassignment = True
+            #     self.rerun_kmeans()
+
+            # Pubblica i risultati
+            if self.dict_assignment is not None:
+                for robot_idx, trees in self.dict_assignment.items():
+                    self.publish_cluster(robot_idx, trees)
+
             self.rate.sleep()
 
 if __name__ == '__main__':
