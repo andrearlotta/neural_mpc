@@ -181,7 +181,7 @@ class NeuralMPC:
            lambda_next = (lambda_prev * z) / (lambda_prev * z + (1 - lambda_prev) * (1 - z))
         """
         prod = lambda_prev * z
-        denom = prod + (1 - lambda_prev) * (1 - z)
+        denom = prod + (1 - lambda_prev) * (1 - z) + 1e-9
         return prod / denom
 
     @staticmethod
@@ -190,12 +190,12 @@ class NeuralMPC:
         Compute the binary entropy of a probability p.
         Values are clipped to avoid log(0).
         """
-        p = ca.fmax(ca.fmin(p, 1 - 1e-4), 1-4)
+        p = ca.fmax(ca.fmin(p, 1 - 1e-6), 1e-9)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
 
     @staticmethod
     def numpy_entropy(p):
-        p = np.clip(p, 1e-4, 1 - 1e-4)
+        p = np.clip(p, 1e-6, 1 - 1e-9)
         return -p * np.log2(p) - (1 - p) * np.log2(1 - p)
 
     # ---------------------------
@@ -260,7 +260,7 @@ class NeuralMPC:
 
         # Ensure robot_position is 1D array [x, y]
         robot_pos_1d = np.array(robot_position).flatten()
-        distances = np.linalg.norm(self.trees_pos[:, :2] - robot_pos_1d, axis=1)
+        distances = np.linalg.norm(self.trees_pos - robot_pos_1d, axis=1)
 
         # Get indices sorted by distance
         sorted_indices = np.argsort(distances)
@@ -338,7 +338,7 @@ class NeuralMPC:
             # Collision avoidance: ensure safety margin from trees.
             delta = X[:2, i] - OBSTACLE_TREES_param.T
             sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-            opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
+            opti.subject_to(ca.mmin(sq_dists) > safe_distance**2)
 
             # System dynamics constraint
             if i < steps:
@@ -367,14 +367,14 @@ class NeuralMPC:
 
         # Compute the entropy evolution for each branch.
         entropy_term = 0
-        entropy_0 = ca.sum1(ca.fmin(self.entropy(lambda_evol_raw[0]), self.entropy(lambda_evol_raw[0])))
+        entropy_0 = ca.sum1(ca.fmin(self.entropy(lambda_evol_raw[0]), self.entropy(lambda_evol_ripe[0])))
         for i in range(1, steps + 1): # Steps k=1...N
             lambda_raw_k = lambda_evol_raw[i]
             lambda_ripe_k = lambda_evol_ripe[i]
             # Effective entropy at step k is sum over trees of min(H(raw), H(ripe))
             entropy_k = ca.sum1(ca.fmin(self.entropy(lambda_raw_k), self.entropy(lambda_ripe_k)))
             # Discount future entropy reduction (penalize high future entropy)
-            entropy_term += ca.exp(-0.5 * i) * entropy_k/entropy_0# Exponential decay, less aggressive than -2*i
+            entropy_term += ca.exp(-0.5 * i) * entropy_k
         # Add entropy term to the objective.
         obj += w_entropy * entropy_term
         # --- End Information Gain Objective ---

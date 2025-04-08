@@ -14,7 +14,7 @@ import tf
 import tf.transformations as tf_trans
 import message_filters
 
-def weight_value(n_elements, mean_score, midpoint=5, steepness=5.):
+def weight_value(n_elements, mean_score, midpoint=5, steepness=10.):
     return np.ceil(100 * (mean_score - 0.5) * (0.5 + 0.5 * np.tanh(steepness * (n_elements - midpoint)))) / 100
 
 class DataAssociationNode:
