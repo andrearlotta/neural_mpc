@@ -19,7 +19,7 @@ from plotly.subplots import make_subplots
 
 # ROS message imports
 from geometry_msgs.msg import Pose, PoseStamped, Point, Quaternion
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Int32MultiArray
 from visualization_msgs.msg import MarkerArray
 from nav_msgs.msg import Path
 import tf
@@ -92,7 +92,10 @@ class NeuralMPC:
         self.robot_state_thread.daemon = True
         self.robot_state_thread.start()
         # Subscribers
+        # tree scores
         rospy.Subscriber("tree_scores", Float32MultiArray, self.tree_scores_callback)
+        # assigned trees
+        rospy.Subscriber("cluster", Int32MultiArray, self.assignment_callback)
         # Publishers
         self.cmd_pose_pub = rospy.Publisher("cmd/pose", Pose, queue_size=10)
         self.pred_path_pub = rospy.Publisher("predicted_path", Path, queue_size=10)
@@ -130,27 +133,28 @@ class NeuralMPC:
         self.mpc_horizon = self.N
  
         # List of assigned trees (ID)
-        if self.n_agent == 1:
-            # Outside
-            # self.assigned = [0, 1, 5, 6, 10, 11, 15, 16]              # T
-            # self.assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21]      # Rect
-            # self.assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]            # L
-            # Inside
-            self.assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]            # Rect
-        if self.n_agent == 2:
-            # Outside
-            # self.assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]        # T
-            # self.assigned = [2, 7, 12, 17, 22]                        # Rect
-            # self.assigned = [3, 8, 13, 15, 16, 17, 18]                # L
-            # Inside
-            self.assigned = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24]  # Rect
-        if self.n_agent == 3:
-            # Outside
-            # self.assigned = [3, 4, 8, 9, 13, 14, 18, 19]              # T
-            # self.assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24]      # Rect
-            # self.assigned = [4, 9, 14, 19, 20, 21, 22, 23, 24]        # L
-            # Inside
-            self.assigned = [3, 4, 8, 9, 13, 14]                      # Rect
+        self.assigned = None
+        # if self.n_agent == 1:
+        #     # Outside
+        #     # self.assigned = [0, 1, 5, 6, 10, 11, 15, 16]              # T
+        #     # self.assigned = [0, 1, 5, 6, 10, 11, 15, 16, 20, 21]      # Rect
+        #     # self.assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]            # L
+        #     # Inside
+        #     # self.assigned = [0, 1, 2, 5, 6, 7, 10, 11, 12]            # Rect
+        # if self.n_agent == 2:
+        #     # Outside
+        #     # self.assigned = [2, 7, 12, 17, 20, 21, 22, 23, 24]        # T
+        #     # self.assigned = [2, 7, 12, 17, 22]                        # Rect
+        #     # self.assigned = [3, 8, 13, 15, 16, 17, 18]                # L
+        #     # Inside
+        #     # self.assigned = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24]  # Rect
+        # if self.n_agent == 3:
+        #     # Outside
+        #     # self.assigned = [3, 4, 8, 9, 13, 14, 18, 19]              # T
+        #     # self.assigned = [3, 4, 8, 9, 13, 14, 18, 19, 23, 24]      # Rect
+        #     # self.assigned = [4, 9, 14, 19, 20, 21, 22, 23, 24]        # L
+        #     # Inside
+        #     # self.assigned = [3, 4, 8, 9, 13, 14]                      # Rect
 
 
     # ---------------------------
@@ -201,6 +205,12 @@ class NeuralMPC:
         Callback for tree scores.
         """
         self.latest_trees_scores = np.array(msg.data).reshape(-1, 1)
+
+    def assignment_callback(self, msg):
+        """
+        Callback for tree assignemt.
+        """
+        self.assigned = np.array(msg.data)
 
     def consensus_lambda(self, msg):
         """
@@ -559,7 +569,7 @@ class NeuralMPC:
             self.tree_markers_pub.publish(tree_markers_msg)
 
             step_start_time = time.time()
-            if warm_start: # MPC initialization
+            if warm_start and self.assigned is not None: # MPC initialization
                 mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.neighbors_pos, self.mpc_horizon)
                 warm_start = False
             else: # MPC step
