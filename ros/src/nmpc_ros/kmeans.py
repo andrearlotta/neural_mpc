@@ -107,30 +107,38 @@ class KMeansClusterNode:
         self.dict_assignment = robot_to_trees
         
         ##################   Plotting
-        # colors = plt.cm.viridis(np.linspace(0, 1, len(self.robot_positions) - 1))  # Colori da mappa 'viridis', ridotto di 1 per escludere la posizione 0
-        # plt.figure(figsize=(8, 6))
-        # # Plot dei robot (colorati in base al cluster)
-        # for robot_idx, pos in enumerate(self.robot_positions[1:], start=1):  # Iniziamo da 1 per escludere la posizione 0
-        #     plt.scatter(pos[0], pos[1], s=100, color=colors[robot_idx - 1], label=f"Robot {robot_idx}", edgecolors='black', marker='X', zorder=5)
-        # # Plot degli alberi, colorati in base all'assegnazione del robot (cluster)
-        # for tree_idx, pos in enumerate(self.tree_positions):
-        #     robot_idx = assigned_clusters[tree_idx]
-        #     plt.scatter(pos[0], pos[1], c=[colors[robot_idx]], s=100, edgecolors='black', zorder=2)
-        # # Aggiungi legende, titoli e griglia
-        # plt.title("Assegnamento Alberi ai Robot tramite K-Means", fontsize=14)
-        # plt.xlabel("Coordinata X")
-        # plt.ylabel("Coordinata Y")
-        # plt.legend()
-        # plt.grid(True)
-        # # Mostra il grafico
-        # current_dir = os.path.dirname(os.path.abspath(__file__))
-        # filename = os.path.join(current_dir, "start.svg")
-        # plt.savefig(filename, format='svg')
-        # plt.close()
-        # # plt.show()
+        colors = plt.cm.viridis(np.linspace(0, 1, len(self.robot_positions) - 1))  # Colori da mappa 'viridis', ridotto di 1 per escludere la posizione 0
+        plt.figure(figsize=(8, 6))
+        # Plot dei robot (colorati in base al cluster)
+        for robot_idx, pos in enumerate(self.robot_positions[1:], start=1):  # Iniziamo da 1 per escludere la posizione 0
+            plt.scatter(pos[0], pos[1], s=100, color=colors[robot_idx - 1], label=f"Robot {robot_idx}", edgecolors='black', marker='X', zorder=5)
+        # Plot degli alberi, colorati in base all'assegnazione del robot (cluster)
+        for tree_idx, pos in enumerate(self.tree_positions):
+            robot_idx = assigned_clusters[tree_idx]
+            plt.scatter(pos[0], pos[1], c=[colors[robot_idx]], s=100, edgecolors='black', zorder=2)
+        # Aggiungi legende, titoli e griglia
+        plt.title("K-Means", fontsize=14)
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.grid(True)
+        # Calcola i limiti con un margine
+        plt.legend(loc='upper right',
+                fancybox=True, shadow=True, ncol=5)
+        x_min, x_max = self.tree_positions[:, 0].min(), self.tree_positions[:, 0].max()
+        y_min, y_max = self.tree_positions[:, 1].min(), self.tree_positions[:, 1].max()
+        x_margin = 3
+        y_margin = 3
+        plt.xlim(x_min - x_margin, x_max + x_margin)
+        plt.ylim(y_min - y_margin, y_max + 2*y_margin)
+        # Mostra il grafico
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        filename = os.path.join(current_dir, "start.svg")
+        plt.savefig(filename, format='svg')
+        plt.close()
+        # plt.show()
         ##################
     
-    def rerun_kmeans(self):
+    def rerun_kmeans(self, idx):
         # Trova gli indici originali degli alberi non ancora visitati (lambda < 0.95)
         unvisited_idxs = [i for i, val in enumerate(self.lambda_value) if val < 0.95]
 
@@ -162,42 +170,50 @@ class KMeansClusterNode:
         self.dict_assignment = robot_to_trees
 
         ##################   Plotting
-        # colors = plt.cm.viridis(np.linspace(0, 1, self.n_agents))
-        # plt.figure(figsize=(8, 6))
-        # # Plot dei robot (marker 'X'), esclusa la posizione 0
-        # for robot_idx, pos in enumerate(self.robot_positions[1:], start=1):
-        #     plt.scatter(
-        #         pos[0], pos[1],
-        #         s=100,
-        #         color=colors[robot_idx - 1],
-        #         label=f"Robot {robot_idx}",
-        #         edgecolors='black',
-        #         marker='X',
-        #         zorder=5
-        #     )
-        # # Plot degli alberi non visitati, colorati in base al robot assegnato
-        # for i, tree_idx in enumerate(unvisited_idxs):
-        #     pos = self.tree_positions[tree_idx]
-        #     robot_idx = assigned_clusters[i]  # Cluster assegnato
-        #     plt.scatter(
-        #         pos[0], pos[1],
-        #         c=[colors[robot_idx]],
-        #         s=100,
-        #         edgecolors='black',
-        #         zorder=2
-        #     )
-        # # Aggiungi legende, titoli e griglia
-        # plt.title("Assegnamento Alberi ai Robot tramite K-Means", fontsize=14)
-        # plt.xlabel("Coordinata X")
-        # plt.ylabel("Coordinata Y")
-        # plt.legend()
-        # plt.grid(True)
-        # plt.tight_layout()
-        # current_dir = os.path.dirname(os.path.abspath(__file__))
-        # filename = os.path.join(current_dir, "reassignment.svg")
-        # plt.savefig(filename, format='svg')
-        # plt.close()
-        # # plt.show()
+        colors = plt.cm.viridis(np.linspace(0, 1, self.n_agents))
+        plt.figure(figsize=(8, 6))
+        # Plot dei robot (marker 'X'), esclusa la posizione 0
+        for robot_idx, pos in enumerate(self.robot_positions[1:], start=1):
+            plt.scatter(
+                pos[0], pos[1],
+                s=100,
+                color=colors[robot_idx - 1],
+                label=f"Robot {robot_idx}",
+                edgecolors='black',
+                marker='X',
+                zorder=5
+            )
+        # Plot degli alberi non visitati, colorati in base al robot assegnato
+        for i, tree_idx in enumerate(unvisited_idxs):
+            pos = self.tree_positions[tree_idx]
+            robot_idx = assigned_clusters[i]  # Cluster assegnato
+            plt.scatter(
+                pos[0], pos[1],
+                c=[colors[robot_idx]],
+                s=100,
+                edgecolors='black',
+                zorder=2
+            )
+        # Aggiungi legende, titoli e griglia
+        plt.title("K-Means", fontsize=14)
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.grid(True)
+        plt.tight_layout()
+        # Calcola i limiti con un margine
+        plt.legend(loc='upper right',
+                fancybox=True, shadow=True, ncol=5)
+        x_min, x_max = self.tree_positions[:, 0].min(), self.tree_positions[:, 0].max()
+        y_min, y_max = self.tree_positions[:, 1].min(), self.tree_positions[:, 1].max()
+        x_margin = 3
+        y_margin = 3
+        plt.xlim(x_min - x_margin, x_max + x_margin)
+        plt.ylim(y_min - y_margin, y_max + 2*y_margin)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        filename = os.path.join(current_dir, "reassignment_"+str(idx)+".svg")
+        plt.savefig(filename, format='svg')
+        plt.close()
+        # plt.show()
         ##################
 
 
@@ -212,6 +228,7 @@ class KMeansClusterNode:
         pub.publish(msg)
 
     def spin(self):
+        t_res = 0
         while not rospy.is_shutdown():
             if self.data_received and self.first_assignment == False:
                 self.run_first_kmeans()
@@ -226,7 +243,8 @@ class KMeansClusterNode:
 
             # Reassignment (if needed)
             if reassignment_needed == True:
-                self.rerun_kmeans()
+                self.rerun_kmeans(t_res)
+                t_res+=1
 
             # Pubblica i risultati
             if self.dict_assignment is not None:

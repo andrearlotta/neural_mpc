@@ -337,7 +337,7 @@ class NeuralMPC:
     # ---------------------------
     # MPC Optimization Function 
     # ---------------------------
-    def mpc_opt(self, g_nn, trees, lb, ub, x0, lambda_vals, neighbors_positions, steps=10):
+    def mpc_opt(self, g_nn, trees, lb, ub, x0, lambda_vals, neighbors_positions, assigned_tree, steps=10):
         nx_local = 3                   # For clarity in this function
         n_state = nx_local * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
         n_control = nx_local           # 3-dimensional control: [ax, ay, angular_acc]
@@ -378,8 +378,6 @@ class NeuralMPC:
         penalty_cells = 0 # unassigned
         aggregation = 0   # assigned
 
-        # Assigned trees (ID)
-        assigned_tree  = self.assigned
         # Not assigned trees (ID)
         not_assigned_tree = [num for num in list(range(num_trees)) if num not in assigned_tree]
 
@@ -437,7 +435,7 @@ class NeuralMPC:
                 penalty_cells += self.penalty_2d(X[0, i], X[1, i], self.trees_pos[n_a][0], self.trees_pos[n_a][1], p=10, s=0.9, a=5)
             for a_a in assigned_tree:
                 # aggregation term for assigned cells 
-                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=2) / len(assigned_tree) #a=13
+                aggregation += self.aggregation_2d(X[0, i], X[1, i], lambda_evol[i], idx=a_a, a=0.1) # / len(assigned_tree) #a=13
 
         # Compute entropy terms for the objective.
         entropy_future = self.entropy(ca.vcat([*lambda_evol[1:]]))
@@ -570,9 +568,10 @@ class NeuralMPC:
 
             if self.assigned is not None:
                 step_start_time = time.time()
-                if warm_start: # MPC initialization
-                    mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.neighbors_pos, self.mpc_horizon)
+                if warm_start or not np.array_equal(self.assigned, prev_assigned): # MPC initialization or reinitialization
+                    mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, self.lambda_k, self.neighbors_pos, self.assigned, self.mpc_horizon)
                     warm_start = False
+                    prev_assigned = self.assigned.copy()
                 else: # MPC step
                     # Move to accomplish the task (if not completed)
                     if np.any(self.lambda_k.full().flatten()[self.assigned] < 0.95):
