@@ -97,7 +97,6 @@ class Logger:
         print(f"Total Distance: {self.total_distance:.2f} m")
         print(f"Average Waypoint-to-Waypoint Time: {avg_wp_time:.2f} s")
 
-
 class TrajectoryGenerator:
     def __init__(self, trajectory_type, bridge, run_folder="baselines", random_initial_state=True):
         # Get trajectory mode and initialize Logger only once.
@@ -608,9 +607,9 @@ class TrajectoryGenerator:
 
         fig.show()
 
-    def save_plot_data_csv(self, trajectory_type):
+    def save_plot_data_csv(self, trajectory_type, save_dir='baselines'):
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        baselines_dir = os.path.join(script_dir, "baselines")
+        baselines_dir = os.path.join(script_dir, save_dir)
         if not os.path.exists(baselines_dir):
             os.makedirs(baselines_dir)
         filename = os.path.join(baselines_dir, f"{trajectory_type}_{self.logger.timestamp}_plot_data.csv")
