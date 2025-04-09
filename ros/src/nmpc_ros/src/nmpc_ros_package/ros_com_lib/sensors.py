@@ -83,7 +83,7 @@ def create_tree_markers(trees_pos, scores):
         sphere_marker.color.b = 0.0
         markers.markers.append(sphere_marker)
         
-        # Text marker for the score
+        """# Text marker for the score
         text_marker = Marker()
         text_marker.header.frame_id = 'map'
         text_marker.header.stamp = rospy.Time.now()
@@ -96,7 +96,7 @@ def create_tree_markers(trees_pos, scores):
         text_marker.scale.z = 0.2
         text_marker.color.a = 1.0
         text_marker.color.r = text_marker.color.g = text_marker.color.b = 1.0
-        markers.markers.append(text_marker)
+        markers.markers.append(text_marker)"""
     
     return markers
 
