@@ -121,6 +121,7 @@ class KMeansClusterNode:
         plt.xlabel("X")
         plt.ylabel("Y")
         plt.grid(True)
+        plt.tight_layout()
         # Calcola i limiti con un margine
         plt.legend(loc='upper right',
                 fancybox=True, shadow=True, ncol=5)
