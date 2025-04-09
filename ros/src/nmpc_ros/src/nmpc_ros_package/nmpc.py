@@ -324,15 +324,14 @@ class NeuralMPC:
             # State and input bounds.
             opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
             opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
-            opti.subject_to(opti.bounded(-ca.pi-0.1+X0[2], X[2, i], ca.pi+0.1+X0[2]))
 
             opti.subject_to(opti.bounded(-2.0, X[3, i], 2.0)) # vx bound
             opti.subject_to(opti.bounded(-2.0, X[4, i], 2.0)) # vy bound
             opti.subject_to(opti.bounded(-ca.pi/4, X[5, i], ca.pi / 4)) # omega bound
 
             if i < steps:
-                opti.subject_to(opti.bounded(-4.0, U[0:2, i],4.0))
-                opti.subject_to(opti.bounded(-ca.pi/2, U[2, i], ca.pi/2))
+                opti.subject_to(opti.bounded(-5.0, U[0:2, i],5.0))
+                opti.subject_to(opti.bounded(-ca.pi, U[2, i], ca.pi))
                 obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
 
             # Collision avoidance: ensure safety margin from trees.
@@ -340,7 +339,6 @@ class NeuralMPC:
             sq_dists = ca.diag(ca.mtimes(delta.T, delta))
             opti.subject_to(ca.mmin(sq_dists) > safe_distance**2)
 
-            # System dynamics constraint
             if i < steps:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
 
@@ -368,15 +366,14 @@ class NeuralMPC:
         # Compute the entropy evolution for each branch.
         entropy_term = 0
         entropy_0 = ca.sum1(ca.fmin(self.entropy(lambda_evol_raw[0]), self.entropy(lambda_evol_ripe[0])))
-        for i in range(1, steps + 1): # Steps k=1...N
-            lambda_raw_k = lambda_evol_raw[i]
-            lambda_ripe_k = lambda_evol_ripe[i]
-            # Effective entropy at step k is sum over trees of min(H(raw), H(ripe))
-            entropy_k = ca.sum1(ca.fmin(self.entropy(lambda_raw_k), self.entropy(lambda_ripe_k)))
-            # Discount future entropy reduction (penalize high future entropy)
-            entropy_term += ca.exp(-0.5 * i) * entropy_k
-        # Add entropy term to the objective.
-        obj += w_entropy * entropy_term
+        entropy_future_raw = self.entropy(ca.vcat([*lambda_evol_raw[1:]]))
+        entropy_future_ripe = self.entropy(ca.vcat([*lambda_evol_ripe[1:]]))
+        # Combine the two entropy futures with softmax weighting.
+        entropy_future_combined = ca.fmin(entropy_future_raw,entropy_future_ripe)
+        entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_target_trees) for i in range(steps)]) *
+                               (entropy_future_combined)) * w_entropy
+        # Add terms to the objective.
+        obj += entropy_term
         # --- End Information Gain Objective ---
 
         opti.minimize(obj)
