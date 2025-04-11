@@ -122,7 +122,7 @@ SENSORS = [
   { 
     "name":  "tree_scores",
     "type":  Float32MultiArray,
-    "topic": "tree_scores",
+    "topic": "agent_0/tree_scores",
     "mode":  "sub",
     "serializer": lambda array_msg: np.array(array_msg.data).reshape(-1,1),
   },
@@ -150,7 +150,7 @@ SENSORS = [
   {
       "name": "tree_markers",
       "type": MarkerArray,
-      "topic": "agent_0/tree_markers",
+      "topic": "/agent_0/tree_markers",
       "mode": "pub",
       "serializer": lambda self: create_tree_markers(self["trees_pos"], self["lambda"]),
   },
