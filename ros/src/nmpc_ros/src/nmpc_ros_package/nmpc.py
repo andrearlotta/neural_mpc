@@ -250,13 +250,12 @@ class NeuralMPC:
         trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
 
         # Weights and safety parameters.
-        w_control = 1e-2         # Control effort weight
+        w_control = 1e-4         # Control effort weight
         w_ang = 1e-4             # Angular control weight
         w_entropy = 1e1          # Weight for final entropy
         w_attract = 1e-2         # Weight for low-entropy attraction
         safe_distance = 1.0      # Safety margin (meters)
-        yaw_bound = 6*np.pi
-        sqrd_safe_dist = safe_distance**2
+
         # Initialize the objective.
         obj = 0
 
@@ -268,30 +267,30 @@ class NeuralMPC:
             # State bounds.
             opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
             opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
-            opti.subject_to(opti.bounded(-6*np.pi, X[2, i], +6*np.pi))
-            opti.subject_to(ca.sumsqr(X[3:5, i]) <= 4.00)
-            opti.subject_to(opti.bounded(-3.14 / 4, X[5, i], 3.14 / 4))
-            # Add control bounds and control cost for all but the last state.
+            opti.subject_to(opti.bounded(-3*np.pi, X[2, i], +3*np.pi))
+            opti.subject_to(opti.bounded(-2.00, X[3:5, i],2.00))
+            opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
+
             if i < steps:
-                opti.subject_to(opti.bounded(0.0, ca.sumsqr(U[0:2, i]),8.0))
-                opti.subject_to(opti.bounded(-3.14/2, U[-1, i], 3.14/2))
+                opti.subject_to(opti.bounded(-5.0, U[0:2, i],5.0))
+                opti.subject_to(opti.bounded(-np.pi, U[-1, i], np.pi))
                 obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
             # Collision avoidance: ensure a safety margin from each tree.
             delta = X[:2, i] - trees_dm.T
             sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-            opti.subject_to(ca.mmin(sq_dists) >= sqrd_safe_dist)
+            opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
+
             if i < steps:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
 
-        # --- Neural Network Integration ---
         nn_batch = []
         for i in range(trees_dm.shape[0]):
             # For each tree, build NN input using the state at steps 1:steps+1.
             delta = X[:2, 1:] - trees_dm[i, :].T
             heading = X[2, 1:]
             nn_batch.append(ca.horzcat(delta.T, heading.T))
-
-        g_out = g_nn(ca.vcat([*nn_batch]))
+        ca_batch = ca.vcat([*nn_batch])
+        g_out = g_nn(ca_batch) 
 
         # Use the NN output to update both branches over the horizon.
         z_k = ca.fmax(g_out, 0.5)
@@ -308,6 +307,8 @@ class NeuralMPC:
         entropy_future_combined = entropy_future_raw* entropy_future_ripe
         entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
                                (entropy_future_combined)) * w_entropy
+
+        attraction = ca.sum1(ca.sum2(ca_batch[:,:2]**2)*entropy_future_combined)
         # Add terms to the objective.
         obj += entropy_term
         opti.minimize(obj)
@@ -316,8 +317,6 @@ class NeuralMPC:
             "ipopt": {
                 "tol": 1e-2,
                 "warm_start_init_point": "yes",
-                "bound_relax_factor": 1e-1,
-                "bound_push": 1e-8,
                 "hessian_approximation": "limited-memory",
                 "print_level": 5,
                 "sb": "no",
