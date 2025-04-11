@@ -99,7 +99,8 @@ class Logger:
 
 
 class TrajectoryGenerator:
-    def __init__(self, trajectory_type):
+    def __init__(self, trajectory_type, bridge, run_folder="baselines", random_initial_state=True):
+        self.run_folder = run_folder
         # Get trajectory mode and initialize Logger only once.
         self.trajectory_type = trajectory_type
         self.logger = Logger(trajectory_type)
@@ -194,7 +195,7 @@ class TrajectoryGenerator:
         ray_avoidance = 3.25
 
         for tree in self.tree_positions:
-            if (tree == goal_position).all():
+            if  np.linalg.norm(tree -goal_position)< 2.0:
                 continue
             diff = current_position - tree
             d = np.linalg.norm(diff)
@@ -285,7 +286,7 @@ class TrajectoryGenerator:
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         phi = math.atan2(self.y - center_y, self.x - center_x)
         radius = np.sqrt((self.x - center_x) ** 2 + (self.y - center_y) ** 2)
-        delta_phi = self.dt * 5.0 * math.pi / 180  # Angular increment (in radians)
+        delta_phi = self.dt * 7.5 * math.pi / 180  # Angular increment (in radians)
 
         while self.circle_tree_event.is_set():
             desired_x = center_x + radius * math.cos(phi)
@@ -431,7 +432,7 @@ class TrajectoryGenerator:
 
             wp_time, _ = self.move_to_waypoint(
                 current_point[0], current_point[1],
-                tolerance=0.25, observe=True, desired_heading=heading
+                tolerance=2.0, observe=True, desired_heading=heading
             )
             total_time += wp_time
         
@@ -531,12 +532,12 @@ class TrajectoryGenerator:
 
         fig.show()
 
-    def save_plot_data_csv(self, trajectory_type):
+    def save_plot_data_csv(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        baselines_dir = os.path.join(script_dir, "baselines")
+        baselines_dir = os.path.join(script_dir, self.run_folder)
         if not os.path.exists(baselines_dir):
             os.makedirs(baselines_dir)
-        filename = os.path.join(baselines_dir, f"{trajectory_type}_{self.logger.timestamp}_plot_data.csv")
+        filename = os.path.join(baselines_dir, f"{self.trajectory_type}_{self.logger.timestamp}_plot_data.csv")
         with open(filename, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             tree_positions_flat = self.tree_positions.flatten().tolist()
@@ -879,9 +880,10 @@ class TrajectoryGenerator:
 
             for idx in tree_order:
                 self.idx = idx
-                tree_pos = self.tree_positions[idx] + np.array([np.cos(np.pi/2), np.sin(np.pi/2)]) * 2
+                angle = np.pi*(np.random.random()*2 -1)
+                tree_pos = self.tree_positions[idx]
                 print(f"Moving to tree {idx} at position: ({tree_pos[0]:.2f}, {tree_pos[1]:.2f})")
-                wp_time, _ = self.move_to_waypoint(tree_pos[0], tree_pos[1], desired_heading=-np.pi/2, tolerance=0.2)
+                wp_time, _ = self.move_to_waypoint(tree_pos[0], tree_pos[1], desired_heading=None, tolerance=2.0)
                 total_time += wp_time
                 print(f"Observing tree {idx}...")
                 # Run observe_tree in a separate thread.
@@ -915,20 +917,21 @@ class TrajectoryGenerator:
             })
         total_time = 0
         total_distance = 0
-        current_pos = np.array(self.bridge.update_robot_state()).flatten()[:2]
-        observation_distance_threshold = .20
+        observation_distance_threshold = 2.0
 
         while candidates:
+            current_pos = np.array(self.bridge.update_robot_state()).flatten()[:2]
             candidates.sort(key=lambda c: (c['bayes'], np.linalg.norm(np.array(c['position']) - current_pos)))
             next_candidate = candidates[0]
-            target = np.array(next_candidate['position']) + np.array([np.cos(np.pi/2), np.sin(np.pi/2)]) * 2
+            angle = np.pi*(np.random.random()*2 -1)
+            target = np.array(next_candidate['position'])
             target_type = next_candidate['type']
             target_index = next_candidate['index']
             self.idx = next_candidate['index']
 
             print(f"Moving to {target_type} {target_index} at position: ({target[0]:.2f}, {target[1]:.2f}), bayes: {next_candidate['bayes']:.2f}")
             self.move_to_waypoint(target[0], target[1],
-                                    desired_heading=-np.pi/2,
+                                    desired_heading=None,
                                     tolerance=observation_distance_threshold,
                                     observe=(target_type == 'tree'))
 
@@ -964,8 +967,30 @@ class TrajectoryGenerator:
 
 if __name__ == '__main__':
     try:
-        mode = rospy.get_param('~trajectory_mode', 'between_rows')
-        trajectory_generator = TrajectoryGenerator(mode)
-        trajectory_generator.run()
+        bridge = BridgeClass(SENSORS)
+        # Initialize and run the trajectory generator
+        modes = ['greedy']
+        for mode in modes:
+            for test_num in range(0, 1):
+                import re
+                # Define base folder
+                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"test_for_creating_plot_{mode}")
+                os.makedirs(base_test_folder, exist_ok=True)
+
+                # Find the next test number
+                existing_runs = [
+                    int(match.group(1)) for d in os.listdir(base_test_folder)
+                    if (match := re.match(r'run_(\d+)', d)) and os.path.isdir(os.path.join(base_test_folder, d))
+                ]
+                next_test_num = max(existing_runs, default=0) + 1
+
+                # Create run folder
+                run_folder = os.path.join(base_test_folder, f"run_{next_test_num}")
+                os.makedirs(run_folder, exist_ok=True)
+
+                print(f"================== Starting Test Run {next_test_num} ==================")
+                trajectory_generator = TrajectoryGenerator(mode, bridge, run_folder=run_folder)
+                trajectory_generator.run()
+                trajectory_generator.save_plot_data_csv()
     except rospy.ROSInterruptException:
         pass
