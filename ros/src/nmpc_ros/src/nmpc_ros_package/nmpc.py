@@ -34,6 +34,11 @@ from nmpc_ros_package.ros_com_lib.sensors import create_path_from_mpc_prediction
 # Simple Neural Network
 # ---------------------------
 class MultiLayerPerceptron(torch.nn.Module):
+    # Class-level type annotations for TorchScript
+    input_layer: torch.nn.Linear
+    hidden_layer: torch.nn.ModuleList
+    out_layer: torch.nn.Linear
+
     def __init__(self, input_dim, hidden_size=64, hidden_layers=3):
         super().__init__()
         # If input_dim==3 we add an extra input for sin/cos of the angle.
@@ -57,7 +62,7 @@ class MultiLayerPerceptron(torch.nn.Module):
         return x
 
 # ---------------------------
-# Neural MPC Class (Modified Version)
+# Neural MPC Class
 # ---------------------------
 class NeuralMPC:
     def __init__(self):
@@ -70,6 +75,10 @@ class NeuralMPC:
         self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
+        self.n_control = self.nx
+        self.n_state = self.nx * 2
+        self.NUM_TARGET_TREES = 1
+        self.NUM_OBSTACLE_TREES = 100 
 
         # For storing the latest tree scores from the sensor callback.
         self.latest_trees_scores = None
@@ -96,10 +105,11 @@ class NeuralMPC:
 
         # Get tree positions from service using the sensors.py serializer logic.
         self.trees_pos = self.get_trees_poses()
+        self.num_total_trees = self.trees_pos.shape[0]
 
         # Initialize two lambda vectors: one for raw and one for ripe.
-        self.lambda_k_raw = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
-        self.lambda_k_ripe = ca.DM.ones(self.trees_pos.shape[0], 1) * 0.5
+        self.lambda_k_raw = ca.DM.ones(self.num_total_trees, 1) * 0.5
+        self.lambda_k_ripe = ca.DM.ones(self.num_total_trees, 1) * 0.5
 
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
@@ -222,39 +232,106 @@ class NeuralMPC:
         p = ca.fmax(ca.fmin(p, 1 - 1e-6), 1e-9)
         return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
 
+    def get_target_tree_indices(self, robot_position, num_target=None, entropy_threshold=0.025):
+        """
+        Returns the indexes of the 'num_target' trees (from self.trees_pos) that are closest to
+        the robot_position and have an effective entropy higher than 'entropy_threshold'.
+        Effective entropy is min(H(lambda_raw), H(lambda_ripe)).
+        If fewer than 'num_target' trees meet the criterion, the nearest ones meeting it are duplicated.
+        If no trees meet the criterion, the 'num_target' overall nearest trees are returned.
+        """
+        if num_target is None:
+            num_target = self.NUM_TARGET_TREES
+
+        # Compute Euclidean distances from the robot to each tree.
+        # Ensure robot_position is 1D array [x, y]
+        robot_pos_1d = np.array(robot_position).flatten()
+        distances = np.linalg.norm(self.trees_pos[:, :2] - robot_pos_1d, axis=1)
+
+        # Compute binary entropies for raw and ripe lambdas.
+        H_raw = self.numpy_entropy(np.array(self.lambda_k_raw.full()).flatten())
+        H_ripe = self.numpy_entropy(np.array(self.lambda_k_ripe.full()).flatten())
+
+        # Compute effective entropy (minimum of the two).
+        H_min = np.minimum(H_raw, H_ripe)
+        
+        # Get indices where effective entropy is above the threshold.
+        candidate_indices = np.where(H_min > entropy_threshold)[0]
+        if candidate_indices.size == 0:
+            # If no tree meets the entropy threshold, just take the overall nearest ones
+            print("Warning: No trees above entropy threshold. Selecting nearest trees.")
+            sorted_indices_all = np.argsort(distances)
+            return sorted_indices_all[:num_target]
+
+        # Sort candidate indices by distance.
+        sorted_candidates = candidate_indices[np.argsort(distances[candidate_indices])]
+
+        # If the number of selected candidates is less than num_target,
+        # re-add (duplicate) the nearest ones among those above threshold.
+        if sorted_candidates.size < num_target:
+            repeats = int(np.ceil(num_target / sorted_candidates.size))
+            # Duplicate the candidate array and slice the first num_target elements
+            sorted_candidates = np.tile(sorted_candidates, repeats)[:num_target]
+        # Return the first num_target indices.
+        return sorted_candidates[:num_target]
+
+    # ---------------------------
+    # NEW Function to select NEAREST tree indices (for obstacle avoidance)
+    # ---------------------------
+    def get_nearest_tree_indices(self, robot_position, num_obstacle=None):
+        """
+        Returns the indices of the 'num_obstacle' trees (from self.trees_pos)
+        that are closest to the robot_position.
+        """
+        if num_obstacle is None:
+            num_obstacle = self.NUM_OBSTACLE_TREES
+        if num_obstacle > self.num_total_trees:
+            num_obstacle = self.num_total_trees # Cannot select more trees than exist
+
+        # Ensure robot_position is 1D array [x, y]
+        robot_pos_1d = np.array(robot_position).flatten()
+        distances = np.linalg.norm(self.trees_pos - robot_pos_1d, axis=1)
+
+        # Get indices sorted by distance
+        sorted_indices = np.argsort(distances)
+
+        # Return the first 'num_obstacle' indices
+        return sorted_indices[:num_obstacle]
+
 # ---------------------------
 # MPC Optimization Function
 # ---------------------------
-    def mpc_opt(self, g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
-        nx_local = 3                   # For clarity in this function
-        n_state = nx_local * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
-        n_control = nx_local           # 3-dimensional control: [ax, ay, angular_acc]
+    def mpc_opt(self, g_nn, target_trees, target_lambdas, obstacle_trees, lb, ub, x0, steps=10):
         opti = ca.Opti()
         F_ = self.kin_model(self.nx, self.dt)  # kinematic model function
 
         # Decision variables:
-        X = opti.variable(n_state, steps + 1)
-        U = opti.variable(n_control, steps)
+        X = opti.variable(self.n_state, steps + 1) # State trajectory [x,y,th,vx,vy,om]
+        U = opti.variable(self.n_control, steps)   # Control trajectory [ax,ay,om_dot]
 
-        # Parameter vector: initial state and tree beliefs.
-        num_trees = trees.shape[0]
-        P0 = opti.parameter(n_state + num_trees*2)
-        X0 = P0[: n_state]
-        L0_raw = P0[n_state : n_state + num_trees]
-        L0_ripe = P0[n_state + num_trees : n_state + 2 * num_trees]
-        # Initialize belief evolution for both branches.
-        lambda_evol_raw = [L0_raw]
+        # --- Parameter vector: initial state, target trees/lambdas, obstacle trees ---
+        num_target_trees = target_trees.shape[0]
+        num_obstacle_trees = obstacle_trees.shape[0]
+
+        # P0 layout: [x0 (n_state), target_trees_flat (2*num_target), target_L0_raw (num_target), target_L0_ripe (num_target), obstacle_trees_flat (2*num_obstacle)]
+        param_size = self.n_state + num_target_trees * 2 + num_target_trees * 2 + num_obstacle_trees * 2
+        P0 = opti.parameter(param_size)
+
+        # Unpack parameters
+        p_idx = 0
+        X0 = P0[p_idx : p_idx + self.n_state]; p_idx += self.n_state
+        TARGET_TREES_param = P0[p_idx : p_idx + num_target_trees*2].reshape((num_target_trees, 2)); p_idx += num_target_trees*2
+        L0_raw = P0[p_idx : p_idx + num_target_trees]; p_idx += num_target_trees
+        L0_ripe = P0[p_idx : p_idx + num_target_trees]; p_idx += num_target_trees
+        OBSTACLE_TREES_param = P0[p_idx : p_idx + num_obstacle_trees*2].reshape((num_obstacle_trees, 2)); p_idx += num_obstacle_trees*2        lambda_evol_raw = [L0_raw]
         lambda_evol_ripe = [L0_ripe]
 
-        # Convert tree positions to a CasADi DM.
-        trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
-
         # Weights and safety parameters.
-        w_control = 1e-4         # Control effort weight
+        w_control = 1e-2         # Control effort weight
         w_ang = 1e-4             # Angular control weight
-        w_entropy = 1e1          # Weight for final entropy
-        w_attract = 1e-2         # Weight for low-entropy attraction
-        safe_distance = 1.0      # Safety margin (meters)
+        w_entropy = 1e1          # Weight for final entropy (applied to target trees)
+        # w_attract = 1e-2       # (Removed as focus is entropy reduction)
+        safe_distance = 1.5      # Safety margin (meters) for obstacle trees
 
         # Initialize the objective.
         obj = 0
@@ -263,7 +340,7 @@ class NeuralMPC:
         opti.subject_to(X[:, 0] == X0)
 
         # Loop over the prediction horizon.
-        for i in range(steps + 1):
+        for i in range(steps+1):
             # State bounds.
             opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
             opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
@@ -276,7 +353,7 @@ class NeuralMPC:
                 opti.subject_to(opti.bounded(-np.pi, U[-1, i], np.pi))
                 obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
             # Collision avoidance: ensure a safety margin from each tree.
-            delta = X[:2, i] - trees_dm.T
+            delta = X[:2, i] - OBSTACLE_TREES_param.T
             sq_dists = ca.diag(ca.mtimes(delta.T, delta))
             opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
 
@@ -284,11 +361,11 @@ class NeuralMPC:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
 
         nn_batch = []
-        for i in range(trees_dm.shape[0]):
+        for i in range(num_target_trees):
             # For each tree, build NN input using the state at steps 1:steps+1.
-            delta = X[:2, 1:] - trees_dm[i, :].T
-            heading = X[2, 1:]
-            nn_batch.append(ca.horzcat(delta.T, heading.T))
+            delta = X[:2, 1:] - TARGET_TREES_param[i, :].T
+            heading_target = X[2, 1:]
+            nn_batch.append(ca.horzcat(delta.T, heading_target.T))
         ca_batch = ca.vcat([*nn_batch])
         g_out = g_nn(ca_batch) 
 
@@ -305,7 +382,7 @@ class NeuralMPC:
         entropy_future_ripe = self.entropy(ca.vcat([*lambda_evol_ripe[1:]]))
         # Combine the two entropy futures with softmax weighting.
         entropy_future_combined = entropy_future_raw* entropy_future_ripe
-        entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_trees) for i in range(steps)]) *
+        entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_target_trees) for i in range(steps)]) *
                                (entropy_future_combined)) * w_entropy
 
         attraction = ca.sum1(ca.sum2(ca_batch[:,:2]**2)*entropy_future_combined)
@@ -317,6 +394,8 @@ class NeuralMPC:
             "ipopt": {
                 "tol": 1e-2,
                 "warm_start_init_point": "yes",
+                "hsllib": '/usr/local/lib/libcoinhsl.so', # Specify HSL library path if used
+                "linear_solver": 'ma27',
                 "hessian_approximation": "limited-memory",
                 "print_level": 5,
                 "sb": "no",
@@ -325,31 +404,39 @@ class NeuralMPC:
             }
         }
         opti.solver("ipopt", options)
+        inputs = [P0, opti.x]
+        outputs = [U[:, 0], X,  opti.x]
+        mpc_step_func = opti.to_function("mpc_step", inputs, outputs, ["p", "x_init"], ["u_opt", "x_pred", "x_opt"])
 
-        # Solve
-        opti.set_value(P0, ca.vertcat(x0, lambda_vals))
+        # --- Solve for the first time ---
+        # Concatenate initial parameter values correctly
+        p0_val = ca.vertcat(
+            x0,
+            target_trees.flatten(),
+            target_lambdas[:num_target_trees], # Raw lambdas
+            target_lambdas[num_target_trees:], # Ripe lambdas
+            obstacle_trees.flatten()
+        )
+        opti.set_value(P0, p0_val)
         try:
             sol = opti.solve()
-            u_opt = ca.DM(sol.value(U[:, 0]))
-            x_opt = ca.DM(sol.value(X))
-            x__opt = ca.DM(sol.value(opti.x))
-            lam_opt = ca.DM(sol.value(opti.lam_g))
-        except:
-            print("Solver failed, using initial guess")
-            u_opt = ca.DM(opti.debug.value(U[:, 0]))
-            x_opt = ca.DM(opti.debug.value(X))
-            x__opt = ca.DM(opti.debug.value(opti.x))
-            lam_opt = ca.DM(opti.debug.value(opti.lam_g))
+            u_sol = sol.value(U[:, 0])
+            x_traj_sol = sol.value(X)
+            x_dec_sol = sol.value(opti.x)
+            lam_g_sol = sol.value(opti.lam_g)
+        except Exception as e:
+            print(f"Solver failed: {e}")
+            # Fallback: return zero control and current state if solver fails
+            u_sol = ca.DM.zeros(self.n_control)
+            x_traj_sol = ca.repmat(x0, 1, steps + 1)
+            x_dec_sol = opti.initial(opti.x) # Use initial guess
+            lam_g_sol = opti.initial(opti.lam_g) # Use initial guess
 
-        inputs = [P0, opti.x, opti.lam_g]
-        outputs = [U[:, 0], X, opti.x, opti.lam_g]
-        mpc_step = opti.to_function("mpc_step", inputs, outputs)
-
-        return (mpc_step,
-                u_opt,
-                x_opt,
-                x__opt,
-                lam_opt)
+        return (mpc_step_func,
+                ca.DM(u_sol),
+                ca.DM(x_traj_sol),
+                ca.DM(x_dec_sol),
+                ca.DM(lam_g_sol))
 
     # ---------------------------
     # Simulation Function
@@ -407,9 +494,13 @@ class NeuralMPC:
         mpciter = 0
         rate = rospy.Rate(int(1/self.dt))
         warm_start = True
+        x_dec_prev = None
+        lam_g_prev = None
+        mpc_step = None
 
         # Main MPC loop.
         while mpciter < sim_time and not rospy.is_shutdown():
+            loop_iter_start = time.time()
             rospy.loginfo('Step: %d', mpciter)
             # Update state from the latest GPS callback.
             while self.current_state is None and not rospy.is_shutdown():
@@ -421,7 +512,7 @@ class NeuralMPC:
             x_k = ca.vertcat(ca.DM(current_state), vx_k)
 
             # Wait until tree scores have been received.
-            while self.latest_trees_scores is None and not rospy.is_shutdown():
+            while self.latest_trees_scores:
                 rospy.sleep(0.05)
             scores = self.latest_trees_scores.copy()
             raw_scores = scores.copy()
@@ -440,8 +531,8 @@ class NeuralMPC:
             # Update both lambda arrays using the bayes update.
             self.lambda_k_raw = self.bayes(self.lambda_k_raw, ca.DM(raw_scores))
             self.lambda_k_ripe = self.bayes(self.lambda_k_ripe, ca.DM(ripe_scores))
-            self.lambda_k_raw = np.ceil(self.lambda_k_raw * 1000) / 1000
-            self.lambda_k_ripe = np.ceil(self.lambda_k_ripe * 1000) / 1000
+            self.lambda_k_raw = self.lambda_k_raw
+            self.lambda_k_ripe = self.lambda_k_ripe
             lambda_score = (self.lambda_k_ripe > self.lambda_k_raw) * self.lambda_k_ripe + (self.lambda_k_ripe <= self.lambda_k_raw) * (1 - self.lambda_k_raw)
             rospy.loginfo("Current state x_k: %s", x_k)
             rospy.loginfo("Lambda Ripe: %s", self.lambda_k_ripe)
@@ -451,15 +542,59 @@ class NeuralMPC:
             # Publish tree markers using the helper function from sensors.py.
             tree_markers_msg = create_tree_markers(self.trees_pos, lambda_score.full().flatten())
             self.tree_markers_pub.publish(tree_markers_msg)
-            
-            lambdas_concat = ca.vertcat(self.lambda_k_raw, self.lambda_k_ripe)
+            # --- Select Trees ---
+            robot_position_xy = np.array(current_state[:2])
+            target_indices = self.get_target_tree_indices(robot_position_xy, num_target=self.NUM_TARGET_TREES)
+            obstacle_indices = self.get_nearest_tree_indices(robot_position_xy, num_obstacle=self.NUM_OBSTACLE_TREES)
+
+            target_trees_subset = self.trees_pos[target_indices, :2] # Only need x,y for target trees as well
+            obstacle_trees_subset = self.trees_pos[obstacle_indices, :2] # Only x,y needed
+
+            # Get corresponding lambda values for TARGET trees
+            target_lambdas_raw = self.lambda_k_raw[target_indices]
+            target_lambdas_ripe = self.lambda_k_ripe[target_indices]
+            target_lambdas_subset = ca.vertcat(target_lambdas_raw, target_lambdas_ripe)
+            lambda_score = (self.lambda_k_ripe > self.lambda_k_raw) * self.lambda_k_ripe + \
+                           (self.lambda_k_ripe <= self.lambda_k_raw) * (1 - self.lambda_k_raw)
+            self.bridge.pub_data({
+                "tree_markers": {"trees_pos": self.trees_pos, "lambda": lambda_score.full().flatten()}
+            })
+
             step_start_time = time.time()
-            if warm_start:
-                # Concatenate the two lambda arrays for the MPC parameter.
-                mpc_step, u, x_traj, x_dec, lam = self.mpc_opt(g_nn, self.trees_pos, lb, ub, x_k, lambdas_concat, self.mpc_horizon)
-                warm_start = False
-            else:
-                u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambdas_concat), x_dec, lam)
+            try:
+                if warm_start or mpc_step is None:
+                    print("Running MPC opt (first step / cold start)...")
+                    mpc_step, u, x_traj, x_dec_prev, lam_g_prev = self.mpc_opt(
+                        g_nn, target_trees_subset, target_lambdas_subset, obstacle_trees_subset, lb, ub, x_k, steps=self.N
+                    )
+                    warm_start = False
+                    print("MPC opt finished.")
+                else:
+                    print("Running MPC step (warm start)...")
+                    # Construct parameter vector for mpc_step
+                    P0_val = ca.vertcat(
+                        x_k,
+                        target_trees_subset.flatten(),
+                        target_lambdas_raw,
+                        target_lambdas_ripe,
+                        obstacle_trees_subset.flatten()
+                    )
+                    # Call the compiled MPC step function
+                    u, x_traj, x_dec_prev = mpc_step(P0_val, x_dec_prev)
+                    print("MPC step finished.")
+
+                step_duration = time.time() - step_start_time
+                durations.append(step_duration)
+                print(f"MPC step duration: {step_duration:.4f} s")
+
+            except Exception as e:
+                rospy.logerr(f"Error during MPC optimization at step {mpciter}: {e}")
+                # Implement fallback behavior (e.g., stop the robot, hover, use previous command)
+                u = ca.DM.zeros(self.n_control) # Command zero acceleration
+                x_traj = ca.repmat(x_k, 1, self.N + 1) # Predict staying still
+                warm_start = True # Force re-optimization next time
+                print("!!! MPC Solver Failed - Commanding Zero Acceleration !!!")
+
             durations.append(time.time() - step_start_time)
             # Log the MPC velocity command.
             u_np = np.array(u.full()).flatten()
@@ -511,8 +646,17 @@ class NeuralMPC:
             mpciter += 1
             rospy.loginfo("Entropy: %s", entropy_k)
             if all( v <= 0.025 for v in entropy_k.full().flatten()):
+                rospy.loginfo("Entropy target reached.")
                 break
-            rate.sleep()
+
+            # Ensure loop runs at desired rate (approx self.dt)
+            loop_elapsed = time.time() - loop_iter_start
+            sleep_time = self.dt - loop_elapsed
+            if sleep_time > 0:
+                rate.sleep() # Use ROS rate limiter
+            else:
+                 print(f"Warning: Loop iteration {mpciter} took {loop_elapsed:.4f}s, longer than dt={self.dt}s")
+
 
         # ---------------------------
         # Final Metrics Calculation and CSV Output
