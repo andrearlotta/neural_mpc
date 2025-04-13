@@ -71,15 +71,16 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 5
-        self.dt = 0.5
+        self.N = 20
+        self.dt = 0.25
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
         self.n_control = self.nx
         self.n_state = self.nx * 2
         self.NUM_TARGET_TREES = 1
-        self.NUM_OBSTACLE_TREES = 100 
+        self.NUM_OBSTACLE_TREES = 1 
 
+        self.entropy_target = self.entropy_f(self.NUM_TARGET_TREES)
         # For storing the latest tree scores from the sensor callback.
         self.latest_trees_scores = None
         # For storing the latest robot state from the gps callback.
@@ -97,7 +98,7 @@ class NeuralMPC:
         self.robot_state_thread.daemon = True
         self.robot_state_thread.start()
         # Subscribers
-        rospy.Subscriber("tree_scores", Float32MultiArray, self.tree_scores_callback)
+        rospy.Subscriber("agent_0/tree_scores", Float32MultiArray, self.tree_scores_callback)
         # Publishers
         self.cmd_pose_pub = rospy.Publisher("agent_0/cmd/pose", Pose, queue_size=10)
         self.pred_path_pub = rospy.Publisher("agent_0/predicted_path", Path, queue_size=10)
@@ -106,6 +107,7 @@ class NeuralMPC:
         # Get tree positions from service using the sensors.py serializer logic.
         self.trees_pos = self.get_trees_poses()
         self.num_total_trees = self.trees_pos.shape[0]
+        self.entropy_entire_field = self.entropy_f(self.num_total_trees)
 
         # Initialize two lambda vectors: one for raw and one for ripe.
         self.lambda_k_raw = ca.DM.ones(self.num_total_trees, 1) * 0.5
@@ -220,17 +222,18 @@ class NeuralMPC:
            lambda_next = (lambda_prev * z) / (lambda_prev * z + (1 - lambda_prev) * (1 - z))
         """
         prod = lambda_prev * z
-        denom = prod + (1 - lambda_prev) * (1 - z) + 1e-9
+        denom = prod + (1 - lambda_prev) * (1 - z)
         return prod / denom
 
     @staticmethod
-    def entropy(p):
+    def entropy_f(num_targets):
         """
         Compute the binary entropy of a probability p.
         Values are clipped to avoid log(0).
         """
-        p = ca.fmax(ca.fmin(p, 1 - 1e-6), 1e-9)
-        return (-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
+        p = ca.MX.sym(f'input_entropy_f{num_targets}_dim', num_targets)
+        output = -4*(p-0.5)**2 + 1 #(-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
+        return ca.Function(f'entropy_f_{num_targets}_dim', [p], [output])
 
     def get_target_tree_indices(self, robot_position, num_target=None, entropy_threshold=0.025):
         """
@@ -249,11 +252,11 @@ class NeuralMPC:
         distances = np.linalg.norm(self.trees_pos[:, :2] - robot_pos_1d, axis=1)
 
         # Compute binary entropies for raw and ripe lambdas.
-        H_raw = self.numpy_entropy(np.array(self.lambda_k_raw.full()).flatten())
-        H_ripe = self.numpy_entropy(np.array(self.lambda_k_ripe.full()).flatten())
+        H_raw = self.entropy_entire_field(self.lambda_k_raw)
+        H_ripe = self.entropy_entire_field(self.lambda_k_ripe)
 
         # Compute effective entropy (minimum of the two).
-        H_min = np.minimum(H_raw, H_ripe)
+        H_min = ca.fmin(H_raw, H_ripe).full()
         
         # Get indices where effective entropy is above the threshold.
         candidate_indices = np.where(H_min > entropy_threshold)[0]
@@ -323,15 +326,16 @@ class NeuralMPC:
         TARGET_TREES_param = P0[p_idx : p_idx + num_target_trees*2].reshape((num_target_trees, 2)); p_idx += num_target_trees*2
         L0_raw = P0[p_idx : p_idx + num_target_trees]; p_idx += num_target_trees
         L0_ripe = P0[p_idx : p_idx + num_target_trees]; p_idx += num_target_trees
-        OBSTACLE_TREES_param = P0[p_idx : p_idx + num_obstacle_trees*2].reshape((num_obstacle_trees, 2)); p_idx += num_obstacle_trees*2        lambda_evol_raw = [L0_raw]
+        OBSTACLE_TREES_param = P0[p_idx : p_idx + num_obstacle_trees*2].reshape((num_obstacle_trees, 2)); p_idx += num_obstacle_trees*2        
+        lambda_evol_raw = [L0_raw]
         lambda_evol_ripe = [L0_ripe]
 
         # Weights and safety parameters.
-        w_control = 1e-2         # Control effort weight
+        w_control = 1e-4         # Control effort weight
         w_ang = 1e-4             # Angular control weight
-        w_entropy = 1e1          # Weight for final entropy (applied to target trees)
-        # w_attract = 1e-2       # (Removed as focus is entropy reduction)
-        safe_distance = 1.5      # Safety margin (meters) for obstacle trees
+        w_entropy = 1e2          # Weight for final entropy
+        w_attract = 1e-2         # Weight for low-entropy attraction
+        safe_distance = 1.0      # Safety margin (meters)
 
         # Initialize the objective.
         obj = 0
@@ -349,13 +353,13 @@ class NeuralMPC:
             opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
 
             if i < steps:
-                opti.subject_to(opti.bounded(-5.0, U[0:2, i],5.0))
+                opti.subject_to(opti.bounded(-10.0, U[0:2, i],10.0))
                 opti.subject_to(opti.bounded(-np.pi, U[-1, i], np.pi))
-                obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
+                #obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
             # Collision avoidance: ensure a safety margin from each tree.
             delta = X[:2, i] - OBSTACLE_TREES_param.T
             sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-            opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
+            #opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
 
             if i < steps:
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
@@ -367,36 +371,22 @@ class NeuralMPC:
             heading_target = X[2, 1:]
             nn_batch.append(ca.horzcat(delta.T, heading_target.T))
         ca_batch = ca.vcat([*nn_batch])
-        g_out = g_nn(ca_batch) 
+        g_out = g_nn(ca_batch)
 
         # Use the NN output to update both branches over the horizon.
-        z_k = ca.fmax(g_out, 0.5)
-        for i in range(steps):
-            lambda_next_raw = self.bayes(lambda_evol_raw[-1], z_k[i::steps])
-            lambda_evol_raw.append(lambda_next_raw)
-            lambda_next_ripe = self.bayes(lambda_evol_ripe[-1], z_k[i::steps])
-            lambda_evol_ripe.append(lambda_next_ripe)
+        z_k = ca.exp(-(ca.sum2(ca_batch[:,:2]**2))/(16.0))
+        entropy_term = ca.sum1(g_out) *ca.exp(-(ca.sum2(ca_batch[(steps-1)::steps,:2]**2))/(16.0))# ca.sum1(entropy_future_combined)#ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_target_trees) for i in range(steps)]) *
+                        #       (entropy_future_combined)) * w_entropy
 
-        # Compute the entropy evolution for each branch.
-        entropy_future_raw = self.entropy(ca.vcat([*lambda_evol_raw[1:]]))
-        entropy_future_ripe = self.entropy(ca.vcat([*lambda_evol_ripe[1:]]))
-        # Combine the two entropy futures with softmax weighting.
-        entropy_future_combined = entropy_future_raw* entropy_future_ripe
-        entropy_term = ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_target_trees) for i in range(steps)]) *
-                               (entropy_future_combined)) * w_entropy
-
-        attraction = ca.sum1(ca.sum2(ca_batch[:,:2]**2)*entropy_future_combined)
+        attraction = 0.1*ca.exp(-(ca.sum2(ca_batch[(steps-1)::steps,:2]**2))/(12.5**2))
         # Add terms to the objective.
         obj += entropy_term
-        opti.minimize(obj)
+        opti.minimize(-(obj+attraction))
         # Solver settings
         options = {
-            "ipopt": {
-                "tol": 1e-2,
+            "ipopt": {          
+                "tol":1e-2,
                 "warm_start_init_point": "yes",
-                "hsllib": '/usr/local/lib/libcoinhsl.so', # Specify HSL library path if used
-                "linear_solver": 'ma27',
-                "hessian_approximation": "limited-memory",
                 "print_level": 5,
                 "sb": "no",
                 "mu_strategy": "monotone",
@@ -404,9 +394,8 @@ class NeuralMPC:
             }
         }
         opti.solver("ipopt", options)
-        inputs = [P0, opti.x]
-        outputs = [U[:, 0], X,  opti.x]
-        mpc_step_func = opti.to_function("mpc_step", inputs, outputs, ["p", "x_init"], ["u_opt", "x_pred", "x_opt"])
+        inputs = [P0, opti.x, opti.lam_g]
+        outputs = [U[:, 0], X,  opti.x, opti.lam_g]
 
         # --- Solve for the first time ---
         # Concatenate initial parameter values correctly
@@ -418,19 +407,14 @@ class NeuralMPC:
             obstacle_trees.flatten()
         )
         opti.set_value(P0, p0_val)
-        try:
-            sol = opti.solve()
-            u_sol = sol.value(U[:, 0])
-            x_traj_sol = sol.value(X)
-            x_dec_sol = sol.value(opti.x)
-            lam_g_sol = sol.value(opti.lam_g)
-        except Exception as e:
-            print(f"Solver failed: {e}")
-            # Fallback: return zero control and current state if solver fails
-            u_sol = ca.DM.zeros(self.n_control)
-            x_traj_sol = ca.repmat(x0, 1, steps + 1)
-            x_dec_sol = opti.initial(opti.x) # Use initial guess
-            lam_g_sol = opti.initial(opti.lam_g) # Use initial guess
+
+        sol = opti.solve()
+        u_sol = sol.value(U[:, 0])
+        x_traj_sol = sol.value(X)
+        x_dec_sol = sol.value(opti.x)
+        lam_g_sol = sol.value(opti.lam_g)
+        mpc_step_func = opti.to_function("mpc_step", inputs, outputs, ["p", "x_init", "x_lam"], ["u_opt", "x_pred", "x_opt", "lam_opt"])
+
 
         return (mpc_step_func,
                 ca.DM(u_sol),
@@ -460,7 +444,7 @@ class NeuralMPC:
                                      hidden_layers=self.hidden_layers)
         model.load_state_dict(torch.load(self.get_latest_best_model(), weights_only=True))
         model.eval()
-        g_nn = l4c.L4CasADi(model, batched=True, device='cuda')
+        g_nn = l4c.L4CasADi(model, batched=True, device='cuda', generate_jac_jac=True, generate_adj1=False, generate_jac_adj1=False)
 
 
         # Initialize robot state from the latest GPS callback.
@@ -512,7 +496,7 @@ class NeuralMPC:
             x_k = ca.vertcat(ca.DM(current_state), vx_k)
 
             # Wait until tree scores have been received.
-            while self.latest_trees_scores:
+            while self.latest_trees_scores is None:
                 rospy.sleep(0.05)
             scores = self.latest_trees_scores.copy()
             raw_scores = scores.copy()
@@ -547,8 +531,8 @@ class NeuralMPC:
             target_indices = self.get_target_tree_indices(robot_position_xy, num_target=self.NUM_TARGET_TREES)
             obstacle_indices = self.get_nearest_tree_indices(robot_position_xy, num_obstacle=self.NUM_OBSTACLE_TREES)
 
-            target_trees_subset = self.trees_pos[target_indices, :2] # Only need x,y for target trees as well
-            obstacle_trees_subset = self.trees_pos[obstacle_indices, :2] # Only x,y needed
+            target_trees_subset = self.trees_pos[target_indices]
+            obstacle_trees_subset = self.trees_pos[obstacle_indices]
 
             # Get corresponding lambda values for TARGET trees
             target_lambdas_raw = self.lambda_k_raw[target_indices]
@@ -556,9 +540,6 @@ class NeuralMPC:
             target_lambdas_subset = ca.vertcat(target_lambdas_raw, target_lambdas_ripe)
             lambda_score = (self.lambda_k_ripe > self.lambda_k_raw) * self.lambda_k_ripe + \
                            (self.lambda_k_ripe <= self.lambda_k_raw) * (1 - self.lambda_k_raw)
-            self.bridge.pub_data({
-                "tree_markers": {"trees_pos": self.trees_pos, "lambda": lambda_score.full().flatten()}
-            })
 
             step_start_time = time.time()
             try:
@@ -580,7 +561,7 @@ class NeuralMPC:
                         obstacle_trees_subset.flatten()
                     )
                     # Call the compiled MPC step function
-                    u, x_traj, x_dec_prev = mpc_step(P0_val, x_dec_prev)
+                    u, x_traj, x_dec_prev, lam_g_prev = mpc_step(P0_val, x_dec_prev, lam_g_prev)
                     print("MPC step finished.")
 
                 step_duration = time.time() - step_start_time
@@ -636,7 +617,7 @@ class NeuralMPC:
             total_distance += distance_step
             prev_x, prev_y = curr_x, curr_y
 
-            entropy_k = ca.fmin(self.entropy(self.lambda_k_raw), self.entropy(self.lambda_k_ripe))
+            entropy_k = ca.fmin(self.entropy_entire_field(self.lambda_k_raw), self.entropy_entire_field(self.lambda_k_ripe))
             lambda_history.append(lambda_score.full().flatten().tolist())
             lambda_ripe_history.append(self.lambda_k_ripe)
             lambda_raw_history.append(self.lambda_k_raw)
@@ -770,7 +751,7 @@ class NeuralMPC:
                 z_vals = np.where(distance > 10, 0.5, z_vals)
                 z_dm = ca.DM(z_vals)
                 lambda_k = self.bayes(lambda_k, z_dm)
-                current_entropy = ca.sum1(self.entropy(lambda_k)).full().flatten()[0]
+                current_entropy = ca.sum1(self.entropy_entire_field(lambda_k)).full().flatten()[0]
                 entropy_mpc_pred_k.append(current_entropy)
             entropy_mpc_pred.append(entropy_mpc_pred_k)
         entropy_mpc_pred = np.array(entropy_mpc_pred)
@@ -1022,7 +1003,6 @@ class NeuralMPC:
 # Main Execution
 # ---------------------------
 if __name__ == "__main__":
-    rospy.init_node("neural_mpc_node", anonymous=True)
     mpc = NeuralMPC()
     sim_results = mpc.run_simulation()
     # Optionally, call the plotting method:
