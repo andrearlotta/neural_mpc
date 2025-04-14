@@ -71,13 +71,13 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 5
-        self.dt = 0.25
+        self.N = 10
+        self.dt = 0.5
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
         self.n_control = self.nx
         self.n_state = self.nx * 2
-        self.NUM_TARGET_TREES = 25
+        self.NUM_TARGET_TREES = 9
         self.NUM_OBSTACLE_TREES = 2
 
         self.entropy_target = self.entropy_f(self.NUM_TARGET_TREES)
@@ -344,7 +344,7 @@ class NeuralMPC:
         obj = 0
         # Initial condition
         opti.subject_to(X[:, 0] == X0)
-        Q_dist = 4.0 
+        Q_dist = 1.0
 
         nn_batch = []
         # Dynamics + bounds
@@ -356,7 +356,7 @@ class NeuralMPC:
             opti.subject_to(opti.bounded(-np.pi/4, X[5, i], np.pi/4))
 
             if i < steps:
-                opti.subject_to(opti.bounded(-5.0, U[0:2, i], 5.0))
+                opti.subject_to(opti.bounded(-10.0, U[0:2, i], 10.0))
                 opti.subject_to(opti.bounded(-np.pi, U[2, i], np.pi))
                 # Add control effort penalty
                 obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
@@ -373,7 +373,7 @@ class NeuralMPC:
             for j in range(num_target_trees):
                 obj_j_pos = TARGET_TREES_param[:, j]
                 diff = X[:2, i + 1] - obj_j_pos
-                distances_sq.append(ca.sumsqr(diff))
+                distances_sq.append(ca.sumsqr(diff) +1e-6)
                 heading_target = X[2, i+1]
                 nn_batch.append(ca.horzcat(diff.T, heading_target))  
 
@@ -383,35 +383,37 @@ class NeuralMPC:
             min_dist_sq = distances_sq[0]
             for j in range(1, num_target_trees):
                 min_dist_sq = ca.fmin(min_dist_sq, distances_sq[j])
-            #obj = obj + Q_dist * ca.sqrt(min_dist_sq + 1e-6)
+            obj = obj - Q_dist * ca.exp(-( min_dist_sq + 1e-6)/(100.0))
             # Optional: Penalize large control inputs or changes in control inputs
-            obj = obj + .5 * ca.sumsqr(U[:, i])
-            if i > 0:
-                obj = obj + 0.0001 * ca.sumsqr(U[:, i] - U[:, i-1]) # Penalize change
+            obj = obj + 1e-4 * ca.sumsqr(U[:2, i])
+            #if i > 0:
+            #obj = obj + 0.00001 * ca.sumsqr(U[:, i] - U[:, i-1]) # Penalize change
 
         ca_batch = ca.vcat([*nn_batch])
         g_out = g_nn(ca_batch) 
 
         # Use the NN output to update both branches over the horizon.
-        z_k = ca.fmax(g_out, 0.5).reshape((num_target_trees,steps))
+        z_k = ca.fmax(g_out, 0.5).reshape((steps,num_target_trees))
         for i in range(steps):
-            lambda_next_raw = self.bayes(lambda_evol_raw[-1], z_k[:,i])
+            lambda_next_raw = self.bayes(lambda_evol_raw[-1], z_k[i,:].T)
             lambda_evol_raw.append(lambda_next_raw)
-            lambda_next_ripe = self.bayes(lambda_evol_ripe[-1], z_k[:,i])
+            lambda_next_ripe = self.bayes(lambda_evol_ripe[-1], z_k[i,:].T)
             lambda_evol_ripe.append(lambda_next_ripe)
-
-        entropy_term = ca.sum1(g_out)
-        opti.minimize(obj - 10*entropy_term)
-
-        # Solver settings
+        entropy_obj = 0
+        
+        for i in range(1, steps+1):
+            entropy_future_raw = self.entropy_target(lambda_evol_raw[i])
+            entropy_past_raw = self.entropy_target(lambda_evol_raw[i-1])
+            entropy_obj += ca.sum1(entropy_future_raw - entropy_past_raw)/ca.sum1(entropy_past_raw)
+        
+        opti.minimize(obj + 10*entropy_obj)
         options = {
             "ipopt": {
-                "tol" :1e-2,
                 "warm_start_init_point": "yes",
                 "print_level": 0,
                 "sb": "no",
                 "mu_strategy": "monotone",
-                "max_iter": 3000,
+                "max_iter": 500,
             }
         }
         opti.solver("ipopt", options)
@@ -674,7 +676,7 @@ class NeuralMPC:
         avg_trans_speed = sum_trans_speed / total_commands if total_commands > 0 else 0.0
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        baselines_dir = os.path.join(script_dir, "baselines")
+        baselines_dir = os.path.join(script_dir, "../../baselines")
         os.makedirs(baselines_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         perf_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
