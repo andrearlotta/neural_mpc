@@ -71,32 +71,25 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 20
+        self.N = 5
         self.dt = 0.25
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
         self.n_control = self.nx
         self.n_state = self.nx * 2
-        self.NUM_TARGET_TREES = 1
-        self.NUM_OBSTACLE_TREES = 1 
+        self.NUM_TARGET_TREES = 25
+        self.NUM_OBSTACLE_TREES = 2
 
         self.entropy_target = self.entropy_f(self.NUM_TARGET_TREES)
         # For storing the latest tree scores from the sensor callback.
         self.latest_trees_scores = None
         # For storing the latest robot state from the gps callback.
-        self.current_state = None
+
 
         rospy.init_node("nmpc_node", anonymous=True, log_level=rospy.DEBUG)
         
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-        # Variable to hold the current robot state [x, y, yaw]
-        self.current_state = None
-
-        # Start the robot state update thread at 30 Hz.
-        self.robot_state_thread = threading.Thread(target=self.robot_state_update_thread)
-        self.robot_state_thread.daemon = True
-        self.robot_state_thread.start()
         # Subscribers
         rospy.Subscriber("agent_0/tree_scores", Float32MultiArray, self.tree_scores_callback)
         # Publishers
@@ -122,25 +115,23 @@ class NeuralMPC:
 
     def robot_state_update_thread(self):
         """Continuously update the robot's state using TF at 30 Hz."""
-        rate = rospy.Rate(30)  # 30 Hz update rate
-        while not rospy.is_shutdown():
-            try:
-                # Look up the transform from 'map' to 'drone_base_link'
-                trans = self.tf_buffer.lookup_transform('map', 'drone_base_link', rospy.Time(0))
-                # Extract the yaw angle from the quaternion
-                (_, _, yaw) = tf.transformations.euler_from_quaternion([
-                    trans.transform.rotation.x,
-                    trans.transform.rotation.y,
-                    trans.transform.rotation.z,
-                    trans.transform.rotation.w
-                ])
-                # Update current_state with [x, y, yaw]
-                self.current_state = [trans.transform.translation.x,
-                                      trans.transform.translation.y,
-                                      yaw]
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-                rospy.logwarn("Failed to get transform: %s", e)
-            rate.sleep()
+        try:
+            # Look up the transform from 'map' to 'drone_base_link'
+            trans = self.tf_buffer.lookup_transform('map', 'drone_base_link', rospy.Time())
+            # Extract the yaw angle from the quaternion
+            (_, _, yaw) = tf.transformations.euler_from_quaternion([
+                trans.transform.rotation.x,
+                trans.transform.rotation.y,
+                trans.transform.rotation.z,
+                trans.transform.rotation.w
+            ])
+            # Update current_state with [x, y, yaw]
+            return [trans.transform.translation.x,
+                                  trans.transform.translation.y,
+                                  yaw]
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn("Failed to get transform: %s", e)
+            return None
 
     def tree_scores_callback(self, msg):
         """
@@ -202,18 +193,36 @@ class NeuralMPC:
 
     @staticmethod
     def kin_model(nx, dt):
-        """
-        Kinematic model: state X = [x, y, theta, vx, vy, omega] and control U = [ax, ay, angular_acc].
-        Uses simple Euler integration.
-        """
-        X = ca.MX.sym('X', nx * 2)  # 6 states
-        U = ca.MX.sym('U', nx)      # 3 controls
-        rhs = ca.vertcat(X[nx:], U)
-        f = ca.Function('f', [X, U], [rhs])
-        intg_opts = {"number_of_finite_elements": 1, "simplify": 1}
-        intg = ca.integrator('intg', 'rk', {'x': X, 'p': U, 'ode': f(X, U)}, 0, dt, intg_opts)
-        xf = intg(x0=X, p=U)['xf']
-        return ca.Function('F', [X, U], [xf])
+        nx = 6
+        # Control: [ax, ay, az]
+        nu = 3
+        
+        # Continuous time dynamics (x_dot = f(x, u))
+        # Symbolics
+        x_sym = ca.SX.sym('x', nx) # State symbolic variable
+        u_sym = ca.SX.sym('u', nu) # Control symbolic variable
+        
+        # Unpack state and control for clarity
+        px, py, pw, vx, vy, vw = [x_sym[i] for i in range(nx)]
+        ax, ay, aw = [u_sym[i] for i in range(nu)]
+        
+        # x_dot = [vx, vy, vw, ax, ay, aw]
+        x_dot = ca.vertcat(vx, vy, vw, ax, ay, aw)
+        
+        # Create a CasADi function for continuous dynamics
+        f_continuous = ca.Function('f_cont', [x_sym, u_sym], [x_dot], ['x', 'u'], ['x_dot'])
+        
+        # Discrete time dynamics (using RK4 integration for better accuracy)
+        # Note: Simple Euler integration could also be used: x_next = x_sym + dt * x_dot
+        k1 = f_continuous(x_sym, u_sym)
+        k2 = f_continuous(x_sym + dt / 2 * k1, u_sym)
+        k3 = f_continuous(x_sym + dt / 2 * k2, u_sym)
+        k4 = f_continuous(x_sym + dt * k3, u_sym)
+        x_next = x_sym + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        
+        # Create a CasADi function for discrete dynamics
+        F = ca.Function('F', [x_sym, u_sym], [x_next], ['x_k', 'u_k'], ['x_k1'])
+        return F
 
     @staticmethod
     def bayes(lambda_prev, z):
@@ -306,88 +315,100 @@ class NeuralMPC:
 # ---------------------------
     def mpc_opt(self, g_nn, target_trees, target_lambdas, obstacle_trees, lb, ub, x0, steps=10):
         opti = ca.Opti()
-        F_ = self.kin_model(self.nx, self.dt)  # kinematic model function
+        F_ = self.kin_model(self.nx, self.dt)
 
-        # Decision variables:
-        X = opti.variable(self.n_state, steps + 1) # State trajectory [x,y,th,vx,vy,om]
-        U = opti.variable(self.n_control, steps)   # Control trajectory [ax,ay,om_dot]
+        # Decision variables
+        X = opti.variable(self.n_state, steps + 1)
+        U = opti.variable(self.n_control, steps)
 
-        # --- Parameter vector: initial state, target trees/lambdas, obstacle trees ---
+        # Parameters
         num_target_trees = target_trees.shape[0]
         num_obstacle_trees = obstacle_trees.shape[0]
-
-        # P0 layout: [x0 (n_state), target_trees_flat (2*num_target), target_L0_raw (num_target), target_L0_ripe (num_target), obstacle_trees_flat (2*num_obstacle)]
-        param_size = self.n_state + num_target_trees * 2 + num_target_trees * 2 + num_obstacle_trees * 2
+        param_size = self.n_state + num_target_trees * 4 + num_obstacle_trees * 2
         P0 = opti.parameter(param_size)
 
-        # Unpack parameters
         p_idx = 0
         X0 = P0[p_idx : p_idx + self.n_state]; p_idx += self.n_state
-        TARGET_TREES_param = P0[p_idx : p_idx + num_target_trees*2].reshape((num_target_trees, 2)); p_idx += num_target_trees*2
+        TARGET_TREES_param = P0[p_idx : p_idx + num_target_trees*2].reshape((num_target_trees,2)).T; p_idx += num_target_trees*2
         L0_raw = P0[p_idx : p_idx + num_target_trees]; p_idx += num_target_trees
         L0_ripe = P0[p_idx : p_idx + num_target_trees]; p_idx += num_target_trees
-        OBSTACLE_TREES_param = P0[p_idx : p_idx + num_obstacle_trees*2].reshape((num_obstacle_trees, 2)); p_idx += num_obstacle_trees*2        
+        OBSTACLE_TREES_param = P0[p_idx : p_idx + num_obstacle_trees*2].reshape((num_obstacle_trees,2)).T
         lambda_evol_raw = [L0_raw]
         lambda_evol_ripe = [L0_ripe]
 
-        # Weights and safety parameters.
-        w_control = 1e-4         # Control effort weight
-        w_ang = 1e-4             # Angular control weight
-        w_entropy = 1e2          # Weight for final entropy
-        w_attract = 1e-2         # Weight for low-entropy attraction
-        safe_distance = 1.0      # Safety margin (meters)
-
-        # Initialize the objective.
+        # Weights
+        w_control = 1
+        w_ang = 1
+        w_attract = 1e0
+        safe_distance = 1.0
         obj = 0
-
-        # Initial condition constraint.
+        # Initial condition
         opti.subject_to(X[:, 0] == X0)
+        Q_dist = 4.0 
 
-        # Loop over the prediction horizon.
-        for i in range(steps+1):
-            # State bounds.
+        nn_batch = []
+        # Dynamics + bounds
+        for i in range(steps):
             opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
             opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
             opti.subject_to(opti.bounded(-3*np.pi, X[2, i], +3*np.pi))
-            opti.subject_to(opti.bounded(-2.00, X[3:5, i],2.00))
-            opti.subject_to(opti.bounded(-3.14/4, X[5, i], 3.14 / 4))
+            opti.subject_to(opti.bounded(-2.0, X[3:5, i], 2.0))
+            opti.subject_to(opti.bounded(-np.pi/4, X[5, i], np.pi/4))
 
             if i < steps:
-                opti.subject_to(opti.bounded(-10.0, U[0:2, i],10.0))
-                opti.subject_to(opti.bounded(-np.pi, U[-1, i], np.pi))
-                #obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
-            # Collision avoidance: ensure a safety margin from each tree.
-            delta = X[:2, i] - OBSTACLE_TREES_param.T
-            sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-            #opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
-
-            if i < steps:
+                opti.subject_to(opti.bounded(-5.0, U[0:2, i], 5.0))
+                opti.subject_to(opti.bounded(-np.pi, U[2, i], np.pi))
+                # Add control effort penalty
+                obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
+                # Dynamics
                 opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
 
-        nn_batch = []
-        for i in range(num_target_trees):
-            # For each tree, build NN input using the state at steps 1:steps+1.
-            delta = X[:2, 1:] - TARGET_TREES_param[i, :].T
-            heading_target = X[2, 1:]
-            nn_batch.append(ca.horzcat(delta.T, heading_target.T))
+            # Collision avoidance
+            for j in range(num_obstacle_trees):
+                obs_j_pos = OBSTACLE_TREES_param[:, j]
+                dist_sq_obs = ca.sumsqr(X[:2, i] - obs_j_pos)
+                opti.subject_to(dist_sq_obs >= safe_distance**2)
+
+            distances_sq = []
+            for j in range(num_target_trees):
+                obj_j_pos = TARGET_TREES_param[:, j]
+                diff = X[:2, i + 1] - obj_j_pos
+                distances_sq.append(ca.sumsqr(diff))
+                heading_target = X[2, i+1]
+                nn_batch.append(ca.horzcat(diff.T, heading_target))  
+
+            # Find the minimum squared distance
+            # CasADi doesn't have a direct min over a list in the same way Python does
+            # We build it up using fmin
+            min_dist_sq = distances_sq[0]
+            for j in range(1, num_target_trees):
+                min_dist_sq = ca.fmin(min_dist_sq, distances_sq[j])
+            #obj = obj + Q_dist * ca.sqrt(min_dist_sq + 1e-6)
+            # Optional: Penalize large control inputs or changes in control inputs
+            obj = obj + .5 * ca.sumsqr(U[:, i])
+            if i > 0:
+                obj = obj + 0.0001 * ca.sumsqr(U[:, i] - U[:, i-1]) # Penalize change
+
         ca_batch = ca.vcat([*nn_batch])
-        g_out = g_nn(ca_batch)
+        g_out = g_nn(ca_batch) 
 
         # Use the NN output to update both branches over the horizon.
-        z_k = ca.exp(-(ca.sum2(ca_batch[:,:2]**2))/(16.0))
-        entropy_term = ca.sum1(g_out) *ca.exp(-(ca.sum2(ca_batch[(steps-1)::steps,:2]**2))/(16.0))# ca.sum1(entropy_future_combined)#ca.sum1(ca.vcat([ca.exp(-2*i)*ca.DM.ones(num_target_trees) for i in range(steps)]) *
-                        #       (entropy_future_combined)) * w_entropy
+        z_k = ca.fmax(g_out, 0.5).reshape((num_target_trees,steps))
+        for i in range(steps):
+            lambda_next_raw = self.bayes(lambda_evol_raw[-1], z_k[:,i])
+            lambda_evol_raw.append(lambda_next_raw)
+            lambda_next_ripe = self.bayes(lambda_evol_ripe[-1], z_k[:,i])
+            lambda_evol_ripe.append(lambda_next_ripe)
 
-        attraction = 0.1*ca.exp(-(ca.sum2(ca_batch[(steps-1)::steps,:2]**2))/(12.5**2))
-        # Add terms to the objective.
-        obj += entropy_term
-        opti.minimize(-(obj+attraction))
+        entropy_term = ca.sum1(g_out)
+        opti.minimize(obj - 10*entropy_term)
+
         # Solver settings
         options = {
-            "ipopt": {          
-                "tol":1e-2,
+            "ipopt": {
+                "tol" :1e-2,
                 "warm_start_init_point": "yes",
-                "print_level": 5,
+                "print_level": 0,
                 "sb": "no",
                 "mu_strategy": "monotone",
                 "max_iter": 3000,
@@ -401,10 +422,10 @@ class NeuralMPC:
         # Concatenate initial parameter values correctly
         p0_val = ca.vertcat(
             x0,
-            target_trees.flatten(),
+            ca.reshape(target_trees, 2* self.NUM_TARGET_TREES, 1),
             target_lambdas[:num_target_trees], # Raw lambdas
             target_lambdas[num_target_trees:], # Ripe lambdas
-            obstacle_trees.flatten()
+            ca.reshape(obstacle_trees, 2* self.NUM_OBSTACLE_TREES, 1)
         )
         opti.set_value(P0, p0_val)
 
@@ -429,10 +450,11 @@ class NeuralMPC:
         F_ = self.kin_model(self.nx, self.dt)
         lb, ub = self.get_domain(self.trees_pos)
         self.mpc_horizon = self.N
-
+        current_state = None
         # Wait until a GPS message has been received.
         rospy.loginfo("Waiting for GPS data...")
-        while self.current_state is None and not rospy.is_shutdown():
+        while current_state is None and not rospy.is_shutdown():
+            current_state =  self.robot_state_update_thread()
             rospy.sleep(0.05)
         rospy.loginfo("GPS data received.")
 
@@ -448,7 +470,7 @@ class NeuralMPC:
 
 
         # Initialize robot state from the latest GPS callback.
-        initial_state = self.current_state  # [x, y, theta]
+        initial_state = current_state  # [x, y, theta]
         vx_k = ca.DM.zeros(self.nx)  # velocity component: [vx, vy, omega]
         x_k = ca.vertcat(ca.DM(initial_state), vx_k)
 
@@ -481,15 +503,16 @@ class NeuralMPC:
         x_dec_prev = None
         lam_g_prev = None
         mpc_step = None
-
+        current_state = None
         # Main MPC loop.
         while mpciter < sim_time and not rospy.is_shutdown():
             loop_iter_start = time.time()
             rospy.loginfo('Step: %d', mpciter)
             # Update state from the latest GPS callback.
-            while self.current_state is None and not rospy.is_shutdown():
+            current_state =  self.robot_state_update_thread()
+            while current_state is None and not rospy.is_shutdown():
+                current_state = self.robot_state_update_thread()
                 rospy.sleep(0.05)
-            current_state = self.current_state
             current_sim_time = time.time() - sim_start_time
             pose_history.append(current_state)
             time_history.append(current_sim_time)
@@ -555,10 +578,10 @@ class NeuralMPC:
                     # Construct parameter vector for mpc_step
                     P0_val = ca.vertcat(
                         x_k,
-                        target_trees_subset.flatten(),
+                        ca.reshape(target_trees_subset, 2* self.NUM_TARGET_TREES, 1),
                         target_lambdas_raw,
                         target_lambdas_ripe,
-                        obstacle_trees_subset.flatten()
+                        ca.reshape(obstacle_trees_subset, 2* self.NUM_OBSTACLE_TREES, 1)
                     )
                     # Call the compiled MPC step function
                     u, x_traj, x_dec_prev, lam_g_prev = mpc_step(P0_val, x_dec_prev, lam_g_prev)
@@ -633,6 +656,7 @@ class NeuralMPC:
             # Ensure loop runs at desired rate (approx self.dt)
             loop_elapsed = time.time() - loop_iter_start
             sleep_time = self.dt - loop_elapsed
+            current_state = None
             if sleep_time > 0:
                 rate.sleep() # Use ROS rate limiter
             else:
