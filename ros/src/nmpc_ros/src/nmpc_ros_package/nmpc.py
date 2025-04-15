@@ -337,81 +337,73 @@ class NeuralMPC:
         lambda_evol_ripe = [L0_ripe]
 
         # Weights
-        w_control = 1
-        w_ang = 1
-        w_attract = 1e0
         safe_distance = 1.0
         obj = 0
         # Initial condition
         opti.subject_to(X[:, 0] == X0)
-        Q_dist = 1.0
-
-        nn_batch = []
+        ca_batch = []
         # Dynamics + bounds
         for i in range(steps):
-            opti.subject_to(opti.bounded(lb[0] - 3., X[0, i], ub[0] + 3.))
-            opti.subject_to(opti.bounded(lb[1] - 3., X[1, i], ub[1] + 3.))
+            opti.subject_to(opti.bounded(lb[0] - 10., X[0, i], ub[0] + 10.))
+            opti.subject_to(opti.bounded(lb[1] - 10., X[1, i], ub[1] + 10.))
             opti.subject_to(opti.bounded(-3*np.pi, X[2, i], +3*np.pi))
             opti.subject_to(opti.bounded(-2.0, X[3:5, i], 2.0))
-            opti.subject_to(opti.bounded(-np.pi/4, X[5, i], np.pi/4))
+            opti.subject_to(opti.bounded(-np.pi/2, X[5, i], np.pi/2))
 
-            if i < steps:
-                opti.subject_to(opti.bounded(-10.0, U[0:2, i], 10.0))
-                opti.subject_to(opti.bounded(-np.pi, U[2, i], np.pi))
-                # Add control effort penalty
-                obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
-                # Dynamics
-                opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
+            opti.subject_to(opti.bounded(-5.0, U[0:2, i], 5.0))
+            opti.subject_to(opti.bounded(-np.pi, U[2, i], np.pi))
+            opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
 
             # Collision avoidance
             for j in range(num_obstacle_trees):
                 obs_j_pos = OBSTACLE_TREES_param[:, j]
-                dist_sq_obs = ca.sumsqr(X[:2, i] - obs_j_pos)
+                dist_sq_obs = ca.sumsqr(X[:2, i+1] - obs_j_pos)
                 opti.subject_to(dist_sq_obs >= safe_distance**2)
 
             distances_sq = []
+            nn_batch = []
             for j in range(num_target_trees):
                 obj_j_pos = TARGET_TREES_param[:, j]
                 diff = X[:2, i + 1] - obj_j_pos
                 distances_sq.append(ca.sumsqr(diff) +1e-6)
                 heading_target = X[2, i+1]
-                nn_batch.append(ca.horzcat(diff.T, heading_target))  
+                nn_batch.append(ca.horzcat(diff.T, heading_target))
+            ca_batch.append(ca.vcat([*nn_batch]))
 
             # Find the minimum squared distance
-            # CasADi doesn't have a direct min over a list in the same way Python does
-            # We build it up using fmin
+            Q_dist = 1.
+            R_xy = 1e-2
+            R_theta = 1e-6
             min_dist_sq = distances_sq[0]
             for j in range(1, num_target_trees):
                 min_dist_sq = ca.fmin(min_dist_sq, distances_sq[j])
-            obj = obj - Q_dist * ca.exp(-( min_dist_sq + 1e-6)/(100.0))
+            #obj = obj - Q_dist * ca.exp(-( ca.sqrt(min_dist_sq) - 2.0)**2/(2*8**2))
             # Optional: Penalize large control inputs or changes in control inputs
-            obj = obj + 1e-4 * ca.sumsqr(U[:2, i])
-            #if i > 0:
-            #obj = obj + 0.00001 * ca.sumsqr(U[:, i] - U[:, i-1]) # Penalize change
+            obj = obj + R_xy * ca.sumsqr(U[:2, i]) + R_theta * ca.sumsqr(U[2, i])
 
-        ca_batch = ca.vcat([*nn_batch])
-        g_out = g_nn(ca_batch) 
-
+        g_out = g_nn(ca.vcat(ca_batch)) 
         # Use the NN output to update both branches over the horizon.
-        z_k = ca.fmax(g_out, 0.5).reshape((steps,num_target_trees))
+        z_k = ca.fmax(g_out, 0.5)
         for i in range(steps):
-            lambda_next_raw = self.bayes(lambda_evol_raw[-1], z_k[i,:].T)
+            lambda_next_raw = self.bayes(lambda_evol_raw[-1], z_k[i*num_target_trees:(i+1)*num_target_trees])
             lambda_evol_raw.append(lambda_next_raw)
-            lambda_next_ripe = self.bayes(lambda_evol_ripe[-1], z_k[i,:].T)
+            lambda_next_ripe = self.bayes(lambda_evol_ripe[-1], z_k[i*num_target_trees:(i+1)*num_target_trees])
             lambda_evol_ripe.append(lambda_next_ripe)
         entropy_obj = 0
-        
+
         for i in range(1, steps+1):
             entropy_future_raw = self.entropy_target(lambda_evol_raw[i])
             entropy_past_raw = self.entropy_target(lambda_evol_raw[i-1])
-            entropy_obj += ca.sum1(entropy_future_raw - entropy_past_raw)/ca.sum1(entropy_past_raw)
+            entropy_obj += ca.exp(-0.5*i)*ca.sum1(entropy_past_raw - entropy_future_raw)/ca.sum1(entropy_past_raw)
         
-        opti.minimize(obj + 10*entropy_obj)
+        opti.minimize(obj - 10*entropy_obj)
         options = {
             "ipopt": {
+                #"tol":1e-2,
                 "warm_start_init_point": "yes",
                 "print_level": 0,
                 "sb": "no",
+                #"hessian_approximation":'limited-memory',
                 "mu_strategy": "monotone",
                 "max_iter": 500,
             }
@@ -594,6 +586,7 @@ class NeuralMPC:
                 print(f"MPC step duration: {step_duration:.4f} s")
 
             except Exception as e:
+                print(1/0)
                 rospy.logerr(f"Error during MPC optimization at step {mpciter}: {e}")
                 # Implement fallback behavior (e.g., stop the robot, hover, use previous command)
                 u = ca.DM.zeros(self.n_control) # Command zero acceleration
