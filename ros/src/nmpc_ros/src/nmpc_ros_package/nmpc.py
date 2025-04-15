@@ -72,7 +72,7 @@ class NeuralMPC:
         self.nn_input_dim = 3
 
         self.N = 10
-        self.dt = 0.5
+        self.dt = 0.2
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
         self.n_control = self.nx
@@ -371,13 +371,13 @@ class NeuralMPC:
             ca_batch.append(ca.vcat([*nn_batch]))
 
             # Find the minimum squared distance
-            Q_dist = 1.
+            Q_dist = .1
             R_xy = 1e-2
-            R_theta = 1e-6
+            R_theta = 1e-2
             min_dist_sq = distances_sq[0]
             for j in range(1, num_target_trees):
                 min_dist_sq = ca.fmin(min_dist_sq, distances_sq[j])
-            #obj = obj - Q_dist * ca.exp(-( ca.sqrt(min_dist_sq) - 2.0)**2/(2*8**2))
+            obj = obj - Q_dist * ca.exp(-( ca.sqrt(min_dist_sq) - 2.0)**2/(2*8**2))
             # Optional: Penalize large control inputs or changes in control inputs
             obj = obj + R_xy * ca.sumsqr(U[:2, i]) + R_theta * ca.sumsqr(U[2, i])
 
@@ -394,16 +394,16 @@ class NeuralMPC:
         for i in range(1, steps+1):
             entropy_future_raw = self.entropy_target(lambda_evol_raw[i])
             entropy_past_raw = self.entropy_target(lambda_evol_raw[i-1])
-            entropy_obj += ca.exp(-0.5*i)*ca.sum1(entropy_past_raw - entropy_future_raw)/ca.sum1(entropy_past_raw)
-        
+            #entropy_obj += ca.exp(-0.5*i)*ca.sum1(entropy_past_raw - entropy_future_raw)/ca.sum1(entropy_past_raw)
+            entropy_obj += ca.exp(-0.5*i)*ca.logsumexp(-entropy_future_raw)
         opti.minimize(obj - 10*entropy_obj)
         options = {
             "ipopt": {
-                #"tol":1e-2,
+                "tol":1e-5,
                 "warm_start_init_point": "yes",
                 "print_level": 0,
                 "sb": "no",
-                #"hessian_approximation":'limited-memory',
+                "hessian_approximation":'limited-memory',
                 "mu_strategy": "monotone",
                 "max_iter": 500,
             }
@@ -490,7 +490,7 @@ class NeuralMPC:
         prev_x = float(x_k[0])
         prev_y = float(x_k[1])
 
-        sim_time = 2800  # Total simulation time in seconds
+        sim_time = 5600  # Total simulation time in seconds
         mpciter = 0
         rate = rospy.Rate(int(1/self.dt))
         warm_start = True
@@ -535,10 +535,10 @@ class NeuralMPC:
             self.lambda_k_raw = self.lambda_k_raw
             self.lambda_k_ripe = self.lambda_k_ripe
             lambda_score = (self.lambda_k_ripe > self.lambda_k_raw) * self.lambda_k_ripe + (self.lambda_k_ripe <= self.lambda_k_raw) * (1 - self.lambda_k_raw)
-            rospy.loginfo("Current state x_k: %s", x_k)
-            rospy.loginfo("Lambda Ripe: %s", self.lambda_k_ripe)
-            rospy.loginfo("Lambda Raw: %s", self.lambda_k_raw)
-            rospy.loginfo("Current tree scores: %s", lambda_score.full().flatten())
+            #rospy.loginfo("Current state x_k: %s", x_k)
+            #rospy.loginfo("Lambda Ripe: %s", self.lambda_k_ripe)
+            #rospy.loginfo("Lambda Raw: %s", self.lambda_k_raw)
+            #rospy.loginfo("Current tree scores: %s", lambda_score.full().flatten())
 
             # Publish tree markers using the helper function from sensors.py.
             tree_markers_msg = create_tree_markers(self.trees_pos, lambda_score.full().flatten())
@@ -643,7 +643,7 @@ class NeuralMPC:
             all_trajectories.append(x_traj[:self.nx, :].full())
 
             mpciter += 1
-            rospy.loginfo("Entropy: %s", entropy_k)
+            rospy.loginfo("Entropy: %s", entropy_history[-1])
             if all( v <= 0.025 for v in entropy_k.full().flatten()):
                 rospy.loginfo("Entropy target reached.")
                 break
