@@ -34,7 +34,6 @@ from nmpc_ros_package.ros_com_lib.sensors import create_path_from_mpc_prediction
 # Simple Neural Network
 # ---------------------------
 class MultiLayerPerceptron(torch.nn.Module):
-    # Class-level type annotations for TorchScript
     input_layer: torch.nn.Linear
     hidden_layer: torch.nn.ModuleList
     out_layer: torch.nn.Linear
@@ -337,6 +336,8 @@ class NeuralMPC:
         lambda_evol_ripe = [L0_ripe]
 
         # Weights
+        
+        attraction = 0
         safe_distance = 1.0
         obj = 0
         # Initial condition
@@ -370,14 +371,14 @@ class NeuralMPC:
                 nn_batch.append(ca.horzcat(diff.T, heading_target))
             ca_batch.append(ca.vcat([*nn_batch]))
 
-            # Find the minimum squared distance
-            Q_dist = .1
+            # Find the minimum squ10.0ed distance
+            Q_dist = 10.0
             R_xy = 1e-2
             R_theta = 1e-2
             min_dist_sq = distances_sq[0]
             for j in range(1, num_target_trees):
                 min_dist_sq = ca.fmin(min_dist_sq, distances_sq[j])
-            obj = obj - Q_dist * ca.exp(-( ca.sqrt(min_dist_sq) - 2.0)**2/(2*8**2))
+            attraction = attraction - Q_dist * ca.exp(-( ca.sqrt(min_dist_sq) - 2.0)**2/(2*100**2))
             # Optional: Penalize large control inputs or changes in control inputs
             obj = obj + R_xy * ca.sumsqr(U[:2, i]) + R_theta * ca.sumsqr(U[2, i])
 
@@ -394,9 +395,18 @@ class NeuralMPC:
         for i in range(1, steps+1):
             entropy_future_raw = self.entropy_target(lambda_evol_raw[i])
             entropy_past_raw = self.entropy_target(lambda_evol_raw[i-1])
+            entropy_future_ripe = self.entropy_target(lambda_evol_ripe[i])
+            entropy_past_ripe = self.entropy_target(lambda_evol_ripe[i-1])           
+            #entropy_obj += ca.exp(-0.5*i)*ca.sum1(entropy_past_raw - entropy_future_raw)/ca.#sum1(entropy_past_raw)
             #entropy_obj += ca.exp(-0.5*i)*ca.sum1(entropy_past_raw - entropy_future_raw)/ca.sum1(entropy_past_raw)
-            entropy_obj += ca.exp(-0.5*i)*ca.logsumexp(-entropy_future_raw)
-        opti.minimize(obj - 10*entropy_obj)
+            entropy_future = ca.fmin(entropy_future_ripe,entropy_future_raw)
+            entropy_obj += ca.exp(-0.5*i)*ca.logsumexp(-10*entropy_future)
+
+        opti.minimize(obj + ca.if_else( ca.mmin(ca.sum1((X0[:2]-TARGET_TREES_param)**2)) > 12.0,
+                                        attraction,  
+                                        - 10*entropy_obj))
+
+                                        
         options = {
             "ipopt": {
                 "tol":1e-5,
