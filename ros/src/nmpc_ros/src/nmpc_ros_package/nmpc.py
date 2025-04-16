@@ -345,8 +345,8 @@ class NeuralMPC:
         ca_batch = []
         # Dynamics + bounds
         for i in range(steps):
-            opti.subject_to(opti.bounded(lb[0] - 10., X[0, i], ub[0] + 10.))
-            opti.subject_to(opti.bounded(lb[1] - 10., X[1, i], ub[1] + 10.))
+            opti.subject_to(opti.bounded(lb[0] - 3.0, X[0, i], ub[0] + 3.0))
+            opti.subject_to(opti.bounded(lb[1] - 3.0, X[1, i], ub[1] + 3.0))
             opti.subject_to(opti.bounded(-3*np.pi, X[2, i], +3*np.pi))
             opti.subject_to(opti.bounded(-2.0, X[3:5, i], 2.0))
             opti.subject_to(opti.bounded(-np.pi/2, X[5, i], np.pi/2))
@@ -400,19 +400,35 @@ class NeuralMPC:
             #entropy_obj += ca.exp(-0.5*i)*ca.sum1(entropy_past_raw - entropy_future_raw)/ca.#sum1(entropy_past_raw)
             #entropy_obj += ca.exp(-0.5*i)*ca.sum1(entropy_past_raw - entropy_future_raw)/ca.sum1(entropy_past_raw)
             entropy_future = ca.fmin(entropy_future_ripe,entropy_future_raw)
-            entropy_obj += ca.exp(-0.5*i)*ca.logsumexp(-10*entropy_future)
+            entropy_obj += ca.exp(-2*i)*ca.logsumexp(-20*entropy_future)
 
-        opti.minimize(obj + ca.if_else( ca.mmin(ca.sum1((X0[:2]-TARGET_TREES_param)**2)) > 12.0,
-                                        attraction,  
-                                        - 10*entropy_obj))
 
-                                        
+        sq_dist_to_targets = ca.sum1((X0[:2] - TARGET_TREES_param)**2)
+        min_sq_dist = ca.mmin(sq_dist_to_targets)
+
+        # 2. Define sigmoid parameters
+        threshold_sq_dist = 9.0
+        sigmoid_steepness = 10.0
+        # 3. Calculate the sigmoid factor
+        # This factor smoothly goes from ~0 (when min_sq_dist << 12) to ~1 (when min_sq_dist >> 12)
+        sigmoid_factor = 1.0 / (1.0 + ca.exp(-sigmoid_steepness * (min_sq_dist - threshold_sq_dist)))
+
+        # 4. Apply the modulation to the attraction term
+        modulated_attraction_term = attraction * sigmoid_factor
+
+        opti.minimize(obj - 10*entropy_obj + modulated_attraction_term)                                 
         options = {
             "ipopt": {
                 "tol":1e-5,
                 "warm_start_init_point": "yes",
                 "print_level": 0,
                 "sb": "no",
+                "warm_start_bound_push": 1e-8,
+                "warm_start_mult_bound_push": 1e-8,
+                "mu_init": 1e-5,
+                "bound_relax_factor": 1e-9,
+                "hsllib": '/usr/local/lib/libcoinhsl.so', # Specify HSL library path if used
+                "linear_solver": 'ma27',
                 "hessian_approximation":'limited-memory',
                 "mu_strategy": "monotone",
                 "max_iter": 500,
@@ -609,7 +625,7 @@ class NeuralMPC:
             u_np = np.array(u.full()).flatten()
 
             # Compute the command pose.
-            cmd_pose = F_(x_k, u[:, 0])
+            cmd_pose = F_(x_k, u[:, 0]*0.9)
 
             # Publish predicted path.
             predicted_path_msg = create_path_from_mpc_prediction(x_traj[:self.nx, 1:])
@@ -667,7 +683,7 @@ class NeuralMPC:
             else:
                  print(f"Warning: Loop iteration {mpciter} took {loop_elapsed:.4f}s, longer than dt={self.dt}s")
 
-
+            rospy.sleep(0.1) 
         # ---------------------------
         # Final Metrics Calculation and CSV Output
         # ---------------------------
