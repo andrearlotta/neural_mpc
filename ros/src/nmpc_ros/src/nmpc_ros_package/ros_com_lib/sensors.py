@@ -83,7 +83,7 @@ def create_tree_markers(trees_pos, scores):
         sphere_marker.color.b = 0.0
         markers.markers.append(sphere_marker)
         
-        # Text marker for the score
+        """# Text marker for the score
         text_marker = Marker()
         text_marker.header.frame_id = 'map'
         text_marker.header.stamp = rospy.Time.now()
@@ -91,12 +91,12 @@ def create_tree_markers(trees_pos, scores):
         text_marker.id = i * 2 + 1
         text_marker.type = Marker.TEXT_VIEW_FACING
         text_marker.action = Marker.ADD
-        text_marker.pose.position = Point(x=tree_pos[0], y=tree_pos[1], z=3)
+        text_marker.pose.position = Point(x=tree_pos[0], y=tree_pos[1], z=4)
         text_marker.text = f"Score: {score:.2f}"
         text_marker.scale.z = 0.2
         text_marker.color.a = 1.0
         text_marker.color.r = text_marker.color.g = text_marker.color.b = 1.0
-        markers.markers.append(text_marker)
+        markers.markers.append(text_marker)"""
     
     return markers
 
@@ -137,7 +137,7 @@ SENSORS = [
   { 
     "name":  "tree_scores",
     "type":  Float32MultiArray,
-    "topic": "tree_scores",
+    "topic": "agent_0/tree_scores",
     "mode":  "sub",
     "serializer": lambda array_msg: np.array(array_msg.data).reshape(-1,1),
   },
