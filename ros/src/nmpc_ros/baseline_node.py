@@ -969,9 +969,9 @@ if __name__ == '__main__':
     try:
         bridge = BridgeClass(SENSORS)
         # Initialize and run the trajectory generator
-        modes = ['greedy']
+        modes = ['greedy', 'tree_to_tree', 'between_rows']
         for mode in modes:
-            for test_num in range(0, 1):
+            for test_num in range(0, 2):
                 import re
                 # Define base folder
                 base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"test_for_creating_plot_{mode}")
