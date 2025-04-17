@@ -64,7 +64,7 @@ class MultiLayerPerceptron(torch.nn.Module):
 # Neural MPC Class
 # ---------------------------
 class NeuralMPC:
-    def __init__(self):
+    def __init__(self, run_dir=None, initial_randomic=False):
         # Global Constants and Parameters
         self.hidden_size = 64
         self.hidden_layers = 3
@@ -106,6 +106,8 @@ class NeuralMPC:
 
         # MPC horizon (number of steps)
         self.mpc_horizon = self.N
+        self.baselines_dir = os.path.join( os.path.dirname(os.path.abspath(__file__)), "../../baselines") if run_dir is None else run_dir
+        self.initial_randomic = initial_randomic
 
     # ---------------------------
     # Callback Functions
@@ -307,9 +309,9 @@ class NeuralMPC:
         # Return the first 'num_obstacle' indices
         return sorted_indices[:num_obstacle]
 
-# ---------------------------
-# MPC Optimization Function
-# ---------------------------
+    # ---------------------------
+    # MPC Optimization Function
+    # ---------------------------
     def mpc_opt(self, g_nn, target_trees, target_lambdas, obstacle_trees, lb, ub, x0, steps=10):
         opti = ca.Opti()
         F_ = self.kin_model(self.nx, self.dt)
@@ -454,6 +456,25 @@ class NeuralMPC:
                 ca.DM(x_dec_sol),
                 ca.DM(lam_g_sol))
 
+    def generate_random_initial_state(self, lb, ub, margin=1.5):
+        """
+        Generate a random initial state [x, y, theta] such that:
+         - x is in [lb[0], ub[0]] and y in [lb[1], ub[1]]
+         - The position is at least `margin` meters away from every tree.
+         - theta is chosen uniformly from [-pi, pi].
+        """
+        while True:
+            x = np.random.uniform(lb[0], ub[0])
+            y = np.random.uniform(lb[1], ub[1])
+            valid = True
+            for tree in self.trees_pos:
+                if np.linalg.norm(np.array([x, y]) - tree) < margin:
+                    valid = False
+                    break
+            if valid:
+                theta = np.random.uniform(-np.pi, np.pi)
+                return np.array([x, y, theta]).reshape(-1,1)
+
     # ---------------------------
     # Simulation Function
     # ---------------------------
@@ -462,6 +483,19 @@ class NeuralMPC:
         lb, ub = self.get_domain(self.trees_pos)
         self.mpc_horizon = self.N
         current_state = None
+
+        if self.initial_randomic:
+            current_state = self.generate_random_initial_state(lb, ub, margin=1.5)
+            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(current_state[2]))
+            cmd_pose_msg = Pose()
+            cmd_pose_msg.position = Point(x=float(current_state[0]), y=float(current_state[1]), z=0.0)
+            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                  y=quaternion[1],
+                                                  z=quaternion[2],
+                                                  w=quaternion[3])
+            self.cmd_pose_pub.publish(cmd_pose_msg)    
+            rospy.sleep(1.5)
+
         # Wait until a GPS message has been received.
         rospy.loginfo("Waiting for GPS data...")
         while current_state is None and not rospy.is_shutdown():
@@ -659,11 +693,10 @@ class NeuralMPC:
         avg_yaw = sum_yaw / total_commands if total_commands > 0 else 0.0
         avg_trans_speed = sum_trans_speed / total_commands if total_commands > 0 else 0.0
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        baselines_dir = os.path.join(script_dir, "../../baselines")
-        os.makedirs(baselines_dir, exist_ok=True)
+
+        os.makedirs(self.baselines_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        perf_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
+        perf_csv = os.path.join(self.baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
         with open(perf_csv, mode='w', newline='') as perf_file:
             headers = [
                 "Total Execution Time (s)",
@@ -686,7 +719,7 @@ class NeuralMPC:
             for label, value in zip(headers, values):
                 writer.writerow([label, value])
 
-        vel_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
+        vel_csv = os.path.join(self.baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
         with open(vel_csv, mode='w', newline='') as vel_file:
             writer = csv.writer(vel_file)
             writer.writerow(["Time (s)", "Tag", "x_velocity", "y_velocity", "yaw_velocity"])
@@ -695,7 +728,7 @@ class NeuralMPC:
         rospy.loginfo("Performance metrics saved to %s", perf_csv)
         rospy.loginfo("Velocity command log saved to %s", vel_csv)
 
-        plot_csv = os.path.join(baselines_dir, f"mpc_{timestamp}_plot_data.csv")
+        plot_csv = os.path.join(self.baselines_dir, f"mpc_{timestamp}_plot_data.csv")
         with open(plot_csv, mode='w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             tree_positions_flat = self.trees_pos.flatten().tolist()
