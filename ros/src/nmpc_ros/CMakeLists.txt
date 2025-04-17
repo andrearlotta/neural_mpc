@@ -79,6 +79,7 @@ catkin_install_python(PROGRAMS
   nmpc_ros_node_decay.py
   multi_nmpc_ros_node.py
   multi_data_association_node.py
+  fov_mpc.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
