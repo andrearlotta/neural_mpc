@@ -407,8 +407,7 @@ class TrajectoryGenerator:
         Generate a mower path that includes external rows outside the tree grid.
 
         The path now includes external rows to the left and right of the tree grid,
-        along with the existing rows between the trees.
-        """
+        along with the existing rows between the trees.        """
         if len(self.tree_positions) == 0:
             return []
 
@@ -418,7 +417,9 @@ class TrajectoryGenerator:
         y_min = np.min(self.tree_positions[:, 1]) - offset
         y_max = np.max(self.tree_positions[:, 1]) + offset
 
+        # Use initial position and orientation
         [drone_x],[drone_y],[_] = self.bridge.update_robot_state()
+
 
         def find_nearest_vertex(drone_x, drone_y, x_min_inner, x_max_inner, y_min_inner, y_max_inner):
             # Define the four vertices of the inner field
@@ -480,8 +481,9 @@ class TrajectoryGenerator:
                 for y in y_coords:
                     waypoints.append((x, y, fixed_heading))
                 y_coords = y_coords[::-1]       
-
+        print( fixed_heading , axis)
         return waypoints
+
 
     def run_between_rows_trajectory(self):
         """
@@ -717,7 +719,8 @@ class TrajectoryGenerator:
     def run(self):
         """
         Main method that runs the trajectory generation based on the specified mode.
-        After completion, the trajectory and entropy reduction are plotted.
+        After completion, the trajectory and entropy r
+            eduction are plotted.
         """
         if self.trajectory_type == "between_rows":
             self.is_mower = True
@@ -739,7 +742,7 @@ if __name__ == '__main__':
     try:
         bridge = BridgeClass(SENSORS)
         # Initialize and run the trajectory generator
-        modes = ['between_rows']
+        modes = ['greedy', 'tree_to_tree', 'between_rows']
         for mode in modes:
             for test_num in range(0, 2):
                 import re

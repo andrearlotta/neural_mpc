@@ -46,9 +46,9 @@ def load_csv_data(csv_path):
 
 def main():
     # Define baseline modes and directories
-    modes = ["greedy", "mpc"]
+    modes = ["mpc_n1", "mpc_n2", "mpc_n3"]
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    baselines_dir = os.path.join(script_dir, "baselines")
+    baselines_dir = os.path.join(script_dir, "src/baselines")
 
     # Collect data for each mode
     all_data = []
@@ -67,38 +67,42 @@ def main():
         print("No data to plot")
         return
 
-    # Create a separate figure for each mode/test
-    for mode, data in all_data:
+    # Create a single figure with each mpc
+    fig = make_subplots(
+        rows=1, cols=2,
+        column_widths=[0.7, 0.3],  # Rapporto tra le colonne
+        subplot_titles=["Drone Trajectory", "Entropy Over Time"],  
+        specs=[[{"type": "scatter"}, {"type": "scatter"}]],
+        horizontal_spacing=0.1
+    )
+
+    # Lista di colori per distinguere le diverse modalità
+    colors = ["orange", "blue", "green"]
+
+    # Iterazione su tutte le modalità
+    for i, (mode, data) in enumerate(all_data):
         time, x, y, theta, entropy, lambda_hist, trees = data
+        color = colors[i % len(colors)]  # Per assegnare un colore diverso a ciascuna modalità
 
-        fig = make_subplots(
-            rows=1, cols=2,
-            column_widths=[0.7, 0.3],  # Added column width ratio
-            subplot_titles=["Drone Trajectory", "Entropy Over Time"],  # Updated titles
-            specs=[[{"type": "scatter"}, {"type": "scatter"}]],
-            horizontal_spacing=0.1
-        )
-
-        # Add trajectory plot on left subplot (col=1)
+        # Aggiunta della traiettoria alla subplot sinistra
         fig.add_trace(
             go.Scatter(
                 x=x, y=y, mode="lines+markers",
-                line=dict(color="orange", width=4),  # Increased line width
-                marker=dict(size=5, color="orange"),
-                name="Drone Trajectory",  # Updated trace name
-                showlegend=False
+                line=dict(color=color, width=4),
+                marker=dict(size=5, color=color),
+                name=f"Trajectory {mode}"
             ),
             row=1, col=1
         )
 
-        # Add trees with lambda coloring (if available)
+        # Aggiunta degli alberi con colorazione basata su lambda (Per ora lascia cosi poi lambda diventano quelli su cui fanno consenso)
         if trees is not None:
             num_trees = trees.shape[0]
-            for i in range(num_trees):
-                final_lambda = lambda_hist[-1, i] if lambda_hist.size > 0 else 0.5
+            for j in range(num_trees):
+                final_lambda = lambda_hist[-1, j] if lambda_hist.size > 0 else 0.5
                 fig.add_trace(
                     go.Scatter(
-                        x=[trees[i, 0]], y=[trees[i, 1]],
+                        x=[trees[j, 0]], y=[trees[j, 1]],
                         mode="markers+text",
                         marker=dict(
                             size=10,
@@ -108,61 +112,61 @@ def main():
                             cmax=1,
                             showscale=False
                         ),
-                        text=str(i),
+                        text=str(j),
                         textposition="top center",
-                        textfont=dict(size=14),  # Added text font size
+                        textfont=dict(size=14),
                         showlegend=False
                     ),
                     row=1, col=1
                 )
 
-        # Add orientation arrows on the trajectory subplot (col=1)
+        # Aggiunta delle frecce di orientazione
         arrow_length = 0.5
         annotations = []
-        xref = "x1"
-        yref = "y1"
         for x0, y0, t in zip(x, y, theta):
             x1 = x0 + arrow_length * np.cos(t)
             y1 = y0 + arrow_length * np.sin(t)
             annotations.append(dict(
                 x=x1, y=y1, ax=x0, ay=y0,
-                xref=xref, yref=yref,
-                axref=xref, ayref=yref,
+                xref="x1", yref="y1",
+                axref="x1", ayref="y1",
                 showarrow=True, arrowhead=3,
-                arrowwidth=1.5, arrowcolor="orange"
+                arrowwidth=1.5, arrowcolor=color
             ))
-        fig.update_layout(annotations=annotations)
 
-        # Add entropy plot on right subplot (col=2)
+        # Aggiunta dell'entropia alla subplot destra
         fig.add_trace(
             go.Scatter(
                 x=time, y=entropy, mode="lines+markers",
-                line=dict(color="blue", width=4),  # Increased line width
-                marker=dict(size=5, color="blue"),
-                name="Entropy",
-                showlegend=False
+                line=dict(color=color, width=4),
+                marker=dict(size=5, color=color),
+                name=f"Entropy {mode}"
             ),
             row=1, col=2
         )
 
-        # Set axis labels with units
-        fig.update_xaxes(title_text="X Position (m)", row=1, col=1)  # Added unit
-        fig.update_yaxes(title_text="Y Position (m)", row=1, col=1)  # Added unit
-        fig.update_xaxes(title_text="Time (s)", row=1, col=2)
-        fig.update_yaxes(title_text="Entropy (bits)", row=1, col=2)  # Added unit
+    # Aggiunta delle annotazioni delle frecce di orientazione
+    fig.update_layout(annotations=annotations)
 
-        # Final layout adjustments
-        fig.update_layout(
-            title_text="Drone Trajectory and Entropy",  # Simplified title
-            height=600,
-            template="plotly_white"
-        )
+    # Impostazione delle etichette degli assi
+    fig.update_xaxes(title_text="X Position (m)", row=1, col=1)
+    fig.update_yaxes(title_text="Y Position (m)", row=1, col=1)
+    fig.update_xaxes(title_text="Time (s)", row=1, col=2)
+    fig.update_yaxes(title_text="Entropy (bits)", row=1, col=2)
 
-        # Save each figure to a separate HTML file
-        output_path = os.path.join(baselines_dir, f"{mode}_baseline_comparison.html")
-        fig.write_html(output_path)
-        print(f"Saved comparison plot for {mode} to: {output_path}")
-        fig.show()
+    # Configurazione finale del layout
+    fig.update_layout(
+        title_text="Drone Trajectories and Entropy Comparison",
+        height=600,
+        template="plotly_white"
+    )
+
+    # Save plot
+    output_path = os.path.join(baselines_dir, "multi_plot.html")
+    fig.write_html(output_path)
+    print(f"Saved combined comparison plot to: {output_path}")
+
+    fig.show()
 
 if __name__ == "__main__":
     main()
