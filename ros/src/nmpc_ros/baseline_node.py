@@ -29,11 +29,11 @@ class PIDController:
 
 
 class Logger:
-    def __init__(self, trajectory_type, filename='performance_metrics.csv'):
+    def __init__(self, trajectory_type, run_folder="baselines", filename='performance_metrics.csv'):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.timestamp = time.strftime("%Y%m%d_%H%M%S")  # Current timestamp
         # Create a filename that includes trajectory type and timestamp
-        self.filename = os.path.join(os.path.join(script_dir, "baselines"),
+        self.filename = os.path.join(os.path.join(script_dir, run_folder),
                                      f"{trajectory_type}_{self.timestamp}_{filename}")
 
         self.csv_file = open(self.filename, 'w', newline='')
@@ -46,7 +46,7 @@ class Logger:
         self.total_distance = 0
 
         # Open an additional CSV file to log injected velocity commands.
-        self.velocity_filename = os.path.join(os.path.join(script_dir, "baselines"),
+        self.velocity_filename = os.path.join(os.path.join(script_dir,run_folder),
                                               f"{trajectory_type}_{self.timestamp}_velocity_commands.csv")
         self.velocity_csv_file = open(self.velocity_filename, 'w', newline='')
         self.velocity_csv_writer = csv.writer(self.velocity_csv_file)
@@ -103,7 +103,7 @@ class TrajectoryGenerator:
         self.run_folder = run_folder
         # Get trajectory mode and initialize Logger only once.
         self.trajectory_type = trajectory_type
-        self.logger = Logger(trajectory_type)
+        self.logger = Logger(trajectory_type, run_folder)
 
         # New history lists for storing poses and bayesian (lambda) values
         self.pose_history = []      # Each entry: [x, y, theta]
@@ -111,18 +111,24 @@ class TrajectoryGenerator:
         self.entropy_history = []
         self.time_history = []
 
+        self.is_mower = self.trajectory_type == 'between_rows'
         # Initialize PID controllers.
-        self.pid_controller_x = PIDController(kp=3.0, kd=1)
-        self.pid_controller_y = PIDController(kp=3.0, kd=1)
-        self.pid_controller_yaw = PIDController(kp=.25, kd=0.1)
+        self.pid_controller_x = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
+        self.pid_controller_y = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
+        self.pid_controller_yaw = PIDController(kp=3.0 if self.is_mower else .25, kd=0.1)
 
         self.idx = None
-        self.is_mower = False
+
         self.circle_tree_event = threading.Event()
         # Bridge for robot state and sensor data.
-        self.bridge = BridgeClass(SENSORS)
-        # Get tree positions from the server.
+        self.bridge = bridge
         self.tree_positions = np.array(self.bridge.call_server({"trees_poses": None})["trees_poses"])
+        lb, ub = self.get_domain(self.tree_positions)
+        initial_state = self.generate_random_initial_state(lb, ub, margin=1.75)
+        print(f"Initial State: {initial_state}")
+        # Publish the initial random position.
+        if random_initial_state: self.bridge.pub_data({ "cmd_pose": initial_state})
+        rospy.sleep(2.5)
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         self.lambda_values = np.full(len(self.tree_positions), 0.5)  # Initialize lambda
 
@@ -130,7 +136,7 @@ class TrajectoryGenerator:
             "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
         })
 
-        self.max_velocity = 0.50 if self.is_mower else 1.5          # Maximum velocity of the robot
+        self.max_velocity = .95 if self.is_mower else 1.5          # Maximum velocity of the robot
         self.max_yaw_velocity = np.pi/4      # Maximum yaw velocity (rad/s)
 
         self.dt = 0.1
@@ -142,6 +148,73 @@ class TrajectoryGenerator:
         self.measurement_timer = rospy.Timer(rospy.Duration(0.5), self.measurement_callback)
         while self.bridge.get_data()["tree_scores"] is None:
             pass
+
+    def generate_random_initial_state(self, lb, ub, margin=1.25):
+        """
+        Generate a random initial state [x, y, theta].
+        - If mode is 'tree_to_tree', start outside the field bounds.
+        - If mode is 'between_rows', start from one of the four field corners.
+        """
+        threshold = 1.5  # Extra margin
+        direction_map = {'N': np.pi/2, 'E': 0, 'S': -np.pi/2, 'W': np.pi}
+        orientations = ['N', 'S', 'E', 'W']
+
+        while True:
+            if self.trajectory_type == "tree_to_tree":
+                # Generate x outside the x domain
+                if np.random.rand() < 0.5:
+                    x = np.random.uniform(lb[0] - threshold, lb[0])
+                else:
+                    x = np.random.uniform(ub[0], ub[0] + threshold)
+
+                # Generate y outside the y domain
+                if np.random.rand() < 0.5:
+                    y = np.random.uniform(lb[1] - threshold, lb[1])
+                else:
+                    y = np.random.uniform(ub[1], ub[1] + threshold)
+
+                theta = np.random.uniform(-np.pi, np.pi)
+
+            elif self.trajectory_type == "between_rows":
+                # Randomly pick one of the 4 vertices
+                vertices = [
+                    (lb[0]-1.5, lb[1]-1.5),  # bottom-left
+                    (lb[0]-1.5, ub[1]+1.5),  # top-left
+                    (ub[0]-1.5, lb[1]-1.5),  # bottom-right
+                    (ub[0]-1.5, ub[1]+1.5)   # top-right
+                ]
+                x, y = vertices[np.random.randint(0, 4)]
+
+                # Random heading from cardinal directions
+                orientation_choice = np.random.choice(orientations)
+                theta = direction_map[orientation_choice]
+
+                print(f"Selected start at vertex: ({x:.2f}, {y:.2f}) with orientation {orientation_choice}")
+
+            else:
+                # Default fallback: inside field, away from trees
+                x = np.random.uniform(lb[0], ub[0])
+                y = np.random.uniform(lb[1], ub[1])
+                theta = np.random.uniform(-np.pi, np.pi)
+
+            # Ensure initial position is not too close to trees
+            valid = True
+            for tree in self.tree_positions:
+                if np.linalg.norm(np.array([x, y]) - tree) < margin:
+                    valid = False
+                    break
+
+            if valid:
+                return np.array([x, y, theta]).reshape(-1, 1)
+
+    @staticmethod
+    def get_domain(tree_positions):
+        """Return the domain (bounding box) of the tree positions."""
+        x_min = np.min(tree_positions[:, 0])
+        x_max = np.max(tree_positions[:, 0])
+        y_min = np.min(tree_positions[:, 1])
+        y_max = np.max(tree_positions[:, 1])
+        return [x_min, y_min], [x_max, y_max]
 
     def measurement_callback(self, event):
         if not (self.is_mower or self.circle_tree_event.is_set()):
@@ -156,7 +229,7 @@ class TrajectoryGenerator:
         elif self.idx is not None:
             self.lambda_values[self.idx] = self.bayes(self.lambda_values[self.idx], z_k[self.idx])
             # When the lambda value reaches a threshold, clear the event to stop observation.
-            if self.lambda_values[self.idx] * 1e3 >= 999:
+            if self.calculate_entropy(self.lambda_values[self.idx]) <= 0.025:
                 self.circle_tree_event.clear()
 
         current_entropy = self.calculate_entropy(self.lambda_values)
@@ -328,7 +401,7 @@ class TrajectoryGenerator:
         numerator = lambda_prev * z
         denominator = numerator + (1 - lambda_prev) * (1 - z)
         return numerator / denominator
-    
+
     def generate_mower_path_between_rows(self, offset=2.0, spacing=4.0, heading_direction='O', axis='x'):
         """
         Generate a mower path that includes external rows outside the tree grid.
@@ -379,28 +452,29 @@ class TrajectoryGenerator:
 
         # Generate x coordinates in the correct order
         if x_step > 0:
-            x_coords = np.arange(x_min, x_max + 1e-9, x_step)
+            x_coords = np.arange(x_min , x_max + x_step , x_step)
         else:
-            x_coords = np.arange(x_max, x_min - 1e-9, x_step)
+            x_coords = np.arange(x_max , x_min + x_step , x_step)
 
         # Generate y coordinates in the correct order
         if y_step > 0:
-            y_coords = np.arange(y_min, y_max + 1e-9, y_step)
+            y_coords = np.arange(y_min , y_max + y_step, y_step)
         else:
-            y_coords = np.arange(y_max, y_min - 1e-9, y_step)
+            y_coords = np.arange(y_max , y_min + y_step, y_step)
 
-        # Create grid waypoints: iterate over y first (rows), then x (columns)
+
+        # Create grid waypoints
+
         waypoints = []
         direction_map = {'N': np.pi/2, 'E': 0, 'S': -np.pi/2, 'W': np.pi}
-        fixed_heading = direction_map.get(heading_direction.upper(), 0)
-        
+        fixed_heading = np.random.choice(list(direction_map.values()))
+        axis = np.random.choice(['x', 'y'])
 
         if axis == 'x':
             for y in y_coords:
                 for x in x_coords:
                     waypoints.append((x, y, fixed_heading))
                 x_coords = x_coords[::-1]       
-    
         else:
             for x in x_coords:
                 for y in y_coords:
@@ -422,7 +496,8 @@ class TrajectoryGenerator:
         # Generate the simple mower path.
         # You can adjust offset, spacing, and heading_direction as needed.
         path = self.generate_mower_path_between_rows(offset=2.0, spacing=4.0, heading_direction='E', axis='y')
-        self.plot_path(path, self.tree_positions)
+        
+        #self.plot_path(path, self.tree_positions)
 
         total_time = 0
         for i in range(1, len(path)):
@@ -558,320 +633,11 @@ class TrajectoryGenerator:
                 writer.writerow(row)
         print(f"Plot data saved to {filename}")
 
-    def plot_animated_trajectory_and_entropy_2d(self, trajectory_type):
-        self.save_plot_data_csv(trajectory_type)
-
-        x_trajectory = np.array([traj[0] for traj in self.pose_history])
-        y_trajectory = np.array([traj[1] for traj in self.pose_history])
-        theta_trajectory = np.array([traj[2] for traj in self.pose_history])
-        self.pose_history = np.array(self.pose_history)
-        lambda_history = np.array(self.lambda_history)
-        time_history = np.array(self.time_history)
-
-        x_min = np.min(self.tree_positions[:, 0])
-        x_max = np.max(self.tree_positions[:, 0])
-        y_min = np.min(self.tree_positions[:, 1])
-        y_max = np.max(self.tree_positions[:, 1])
-        lb, ub = [x_min, y_min], [x_max, y_max]
-
-        fig_static = make_subplots(
-            rows=1, cols=2,
-            column_widths=[0.7, 0.3],
-            specs=[[{"type": "scatter"}, {"type": "scatter"}]]
-        )
-
-        fig_static.add_trace(
-            go.Scatter(
-                x=x_trajectory,
-                y=y_trajectory,
-                mode="lines+markers",
-                name="Drone Trajectory",
-                line=dict(color="orange", width=4),
-                marker=dict(size=5, color="orange")
-            ),
-            row=1, col=1
-        )
-
-        for i in range(self.tree_positions.shape[0]):
-            fig_static.add_trace(
-                go.Scatter(
-                    x=[self.tree_positions[i, 0]],
-                    y=[self.tree_positions[i, 1]],
-                    mode="markers+text",
-                    marker=dict(
-                        size=10,
-                        color=[2 * (lambda_history[-1][i] - 0.5)],
-                        colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
-                        cmin=0,
-                        cmax=1,
-                        showscale=False
-                    ),
-                    name=f"Tree {i}: {lambda_history[-1][i]:.2f}",
-                    text=[str(i)],
-                    textposition="top center"
-                ),
-                row=1, col=1
-            )
-
-        fig_static.add_trace(
-            go.Scatter(
-                x=time_history,
-                y=self.entropy_history,
-                mode="lines+markers",
-                name="Sum of Entropies",
-                line=dict(color="blue", width=2),
-                marker=dict(size=5, color="blue")
-            ),
-            row=1, col=2
-        )
-
-        fig_static.update_layout(
-            title=f"Complete Drone Trajectory and Sum of Entropies: {trajectory_type} baseline ",
-            xaxis=dict(title="X Position", range=[lb[0] - 3, ub[0] + 3]),
-            yaxis=dict(title="Y Position", range=[lb[1] - 3, ub[1] + 3]),
-            xaxis2=dict(title="Time (s)"),
-            yaxis2=dict(title="Sum of Entropies"),
-        )
-
-        arrow_length = 0.5
-        arrow_annotations = []
-        for x0, y0, theta in zip(x_trajectory, y_trajectory, theta_trajectory):
-            x1 = x0 + arrow_length * np.cos(theta)
-            y1 = y0 + arrow_length * np.sin(theta)
-            arrow_annotations.append(
-                go.layout.Annotation(
-                    x=x1,
-                    y=y1,
-                    xref="x", yref="y",
-                    ax=x0,
-                    ay=y0,
-                    axref="x", ayref="y",
-                    showarrow=True,
-                    arrowhead=3,
-                    arrowwidth=1.5,
-                    arrowcolor="orange"
-                )
-            )
-        fig_static.update_layout(annotations=arrow_annotations)
-        fig_static.show()
-
-        sample_rate = 10
-        sampled_indices = range(0, len(self.entropy_history), sample_rate)
-        sampled_time_history = time_history[sampled_indices]
-        sampled_entropy_history = np.array(self.entropy_history)[sampled_indices]
-        sampled_x_trajectory = x_trajectory[sampled_indices]
-        sampled_y_trajectory = y_trajectory[sampled_indices]
-        sampled_theta_trajectory = theta_trajectory[sampled_indices]
-        sampled_lambda_history = lambda_history[sampled_indices]
-
-        fig_animated = make_subplots(
-            rows=1, cols=2,
-            column_widths=[0.7, 0.3],
-            specs=[[{"type": "scatter"}, {"type": "scatter"}]]
-        )
-
-        fig_animated.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines+markers",
-                name="Drone Trajectory",
-                line=dict(color="orange", width=4),
-                marker=dict(size=5, color="orange")
-            ),
-            row=1, col=1
-        )
-
-        for i in range(self.tree_positions.shape[0]):
-            fig_animated.add_trace(
-                go.Scatter(
-                    x=[self.tree_positions[i, 0]],
-                    y=[self.tree_positions[i, 1]],
-                    mode="markers+text",
-                    marker=dict(
-                        size=10,
-                        color="#FF0000",
-                        colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
-                        cmin=0,
-                        cmax=1,
-                        showscale=False
-                    ),
-                    name=f"Tree {i}: {sampled_lambda_history[0][i]:.2f}",
-                    text=[str(i)],
-                    textposition="top center"
-                ),
-                row=1, col=1
-            )
-
-        fig_animated.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines+markers",
-                name="Sum of Entropies",
-                line=dict(color="blue", width=2),
-                marker=dict(size=5, color="blue")
-            ),
-            row=1, col=2
-        )
-
-        frames = []
-        for k in range(len(sampled_entropy_history)):
-            tree_data = []
-            for i in range(self.tree_positions.shape[0]):
-                tree_data.append(
-                    go.Scatter(
-                        x=[self.tree_positions[i, 0]],
-                        y=[self.tree_positions[i, 1]],
-                        mode="markers+text",
-                        marker=dict(
-                            size=10,
-                            color=[2 * (sampled_lambda_history[k][i] - 0.5)],
-                            colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
-                            cmin=0,
-                            cmax=1,
-                            showscale=False
-                        ),
-                        name=f"Tree {i}: {sampled_lambda_history[k][i]:.2f}",
-                        text=[str(i)],
-                        textposition="top center"
-                    )
-                )
-
-            sum_entropy_past = sampled_entropy_history[:k + 1]
-            x_start_traj = sampled_x_trajectory[:k + 1]
-            y_start_traj = sampled_y_trajectory[:k + 1]
-            theta_traj = sampled_theta_trajectory[:k + 1]
-            x_end_traj = x_start_traj + 0.5 * np.cos(theta_traj)
-            y_end_traj = y_start_traj + 0.5 * np.sin(theta_traj)
-            list_of_actual_orientations = []
-            for x0, y0, x1, y1 in zip(x_start_traj, y_start_traj, x_end_traj, y_end_traj):
-                arrow = go.layout.Annotation(
-                    dict(
-                        x=x1,
-                        y=y1,
-                        xref="x", yref="y",
-                        text="",
-                        showarrow=True,
-                        axref="x", ayref="y",
-                        ax=x0,
-                        ay=y0,
-                        arrowhead=3,
-                        arrowwidth=1.5,
-                        arrowcolor="orange",
-                    )
-                )
-                list_of_actual_orientations.append(arrow)
-
-            time_label = go.layout.Annotation(
-                dict(
-                    x=0.95,
-                    y=0.95,
-                    xref="paper", yref="paper",
-                    text=f"Time: {sampled_time_history[k]:.2f} s",
-                    showarrow=False,
-                    font=dict(size=14, color="black"),
-                    bgcolor="white",
-                    bordercolor="black",
-                    borderwidth=1
-                )
-            )
-
-            frame = go.Frame(
-                data=[
-                    go.Scatter(
-                        x=sampled_x_trajectory[:k + 1],
-                        y=sampled_y_trajectory[:k + 1],
-                        mode="lines+markers",
-                        line=dict(color="orange", width=4),
-                        marker=dict(size=5, color="orange")
-                    ),
-                    *tree_data,
-                    go.Scatter(
-                        x=sampled_time_history[:k + 1],
-                        y=sum_entropy_past,
-                        mode="lines+markers",
-                        line=dict(color="blue", width=2),
-                        marker=dict(size=5, color="blue")
-                    ),
-                ],
-                name=f"Frame {k}",
-                layout=dict(annotations=[*list_of_actual_orientations, time_label])
-            )
-            frames.append(frame)
-
-        fig_animated.frames = frames
-
-        fig_animated.update_layout(
-            title=f"Drone Trajectory and Sum of Entropies: {trajectory_type} baseline ",
-            xaxis=dict(title="X Position", range=[lb[0] - 3, ub[0] + 3]),
-            yaxis=dict(title="Y Position", range=[lb[1] - 3, ub[1] + 3]),
-            xaxis2=dict(title="Time (s)"),
-            yaxis2=dict(title="Sum of Entropies"),
-            updatemenus=[
-                dict(
-                    type="buttons",
-                    buttons=[
-                        dict(
-                            label="Play",
-                            method="animate",
-                            args=[None, {"frame": {"duration": 200, "redraw": True}, "fromcurrent": True}]
-                        ),
-                        dict(
-                            label="Pause",
-                            method="animate",
-                            args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}]
-                        )
-                    ],
-                    showactive=True,
-                    x=0.1,
-                    y=0
-                )
-            ],
-            sliders=[{
-                "active": 0,
-                "yanchor": "top",
-                "xanchor": "left",
-                "currentvalue": {
-                    "font": {"size": 20},
-                    "prefix": "Frame Time: ",
-                    "visible": True,
-                    "xanchor": "right"
-                },
-                "transition": {"duration": 50, "easing": "cubic-in-out"},
-                "pad": {"b": 10, "t": 50},
-                "len": 0.9,
-                "x": 0.1,
-                "y": 0,
-                "steps": [
-                    {
-                        "args": [
-                            [f.name],
-                            {
-                                "frame": {"duration": 50, "redraw": True},
-                                "mode": "immediate",
-                                "layout": {"annotations": f.layout.annotations}
-                            }
-                        ],
-                        "label": f"{sampled_time_history[k]:.2f} s",
-                        "method": "animate",
-                    }
-                    for k, f in enumerate(frames)
-                ],
-            }]
-        )
-
-        fig_animated.show()
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        filename = os.path.join(os.path.join(script_dir, "baselines"),
-                                f"{trajectory_type}_{self.logger.timestamp}_baseline_results.html")
-        fig_animated.write_html(filename)
-
     def run_tree_to_tree_trajectory(self):
             self.logger.start_logging()
             tree_order = self.generate_tree_to_tree_path()
             tree_path = [self.tree_positions[idx].tolist() for idx in tree_order]
-            self.plot_path(tree_path, self.tree_positions)
+            #self.plot_path(tree_path, self.tree_positions)
 
             total_time = 0
             total_distance = 0
@@ -960,10 +726,14 @@ class TrajectoryGenerator:
             self.run_tree_to_tree_trajectory()
         else:
             self.run_greedy_trajectory()
-
+        
+        self.shutdown()
         # Corrected the parameter passed for plotting from an undefined 'mode' to self.trajectory_type.
-        self.plot_animated_trajectory_and_entropy_2d(self.trajectory_type)
+        #self.plot_animated_trajectory_and_entropy_2d(self.trajectory_type)
 
+    def shutdown(self):
+        if hasattr(self, 'measurement_timer'):
+            self.measurement_timer.shutdown()
 
 if __name__ == '__main__':
     try:
