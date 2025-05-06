@@ -1,37 +1,44 @@
+#!/usr/bin/env python
 import os
 import re
 import time
+import csv
+import math
+import threading
 
+import rospy
 import casadi as ca
 import numpy as np
 import torch
-
-from nmpc_ros_package.ros_com_lib.bridge_class import BridgeClass
-from nmpc_ros_package.ros_com_lib.sensors import SENSORS
+import tf2_ros
+from scipy.stats import norm
 
 import l4casadi as l4c
-from scipy.stats import norm 
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# ---------------------------
-# Global Constants (defined early for use in the NN class)
-# ---------------------------
-hidden_size = 64
-hidden_layers = 3
-nn_input_dim = 3
+# ROS message imports
+from geometry_msgs.msg import Pose, PoseStamped, Point, Quaternion
+from std_msgs.msg import Float32MultiArray
+from visualization_msgs.msg import MarkerArray
+from nav_msgs.msg import Path
+import tf
 
-N =10
-dt = 0.25
-T = dt * N
-nx = 3  # Represents [x, y, theta] (position/heading); state X is 6-D ([pos; vel])
+# Service import for tree poses (as in sensors.py)
+from nmpc_ros.srv import GetTreesPoses
 
-DECAY_THRESHOLD = 3.0   # seconds before starting decay for unseen objects
-DECAY_RATE      = 0.1   # decay rate (per second) for exponential drop toward 0.5
+# Import helper functions from sensors.py
+from nmpc_ros_package.ros_com_lib.sensors import create_path_from_mpc_prediction, create_tree_markers
 
 # ---------------------------
 # Simple Neural Network
 # ---------------------------
 class MultiLayerPerceptron(torch.nn.Module):
-    def __init__(self, input_dim):
+    input_layer: torch.nn.Linear
+    hidden_layer: torch.nn.ModuleList
+    out_layer: torch.nn.Linear
+
+    def __init__(self, input_dim, hidden_size=64, hidden_layers=3):
         super().__init__()
         # If input_dim==3 we add an extra input for sin/cos of the angle.
         in_features = input_dim if input_dim != 3 else input_dim + 1
@@ -42,7 +49,7 @@ class MultiLayerPerceptron(torch.nn.Module):
         self.out_layer = torch.nn.Linear(hidden_size, 1)
 
     def forward(self, x):
-        # If the last dimension is 3, assume the third element is an angle 
+        # If the last dimension is 3, assume the third element is an angle
         # and replace it with its sin and cos.
         if x.shape[-1] == 3:
             sin_cos = torch.cat([torch.sin(x[..., -1:]), torch.cos(x[..., -1:])], dim=-1)
@@ -53,652 +60,753 @@ class MultiLayerPerceptron(torch.nn.Module):
         x = self.out_layer(x)
         return x
 
-def get_latest_best_model():
-    # Get the directory where THIS script is stored
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Models are stored in a subdirectory "models/" relative to this script.
-    model_dir = os.path.join(script_dir, "models")
-    
-    # Find the latest best model file matching the pattern.
-    model_files = [
-        f for f in os.listdir(model_dir)
-        if re.match(r"best_model_epoch_(\d+)\.pth", f)
-    ]
-    
-    if not model_files:
-        raise FileNotFoundError(f"No model files found in {model_dir}")
-    
-    latest_model = max(
-        model_files,
-        key=lambda x: int(re.match(r"best_model_epoch_(\d+)\.pth", x).group(1))
-    )
-    
-    return os.path.join(model_dir, latest_model)
-
 # ---------------------------
-# Domain and Dynamics Functions
+# Neural MPC Class
 # ---------------------------
-def get_domain(tree_positions):
-    """Return the domain (bounding box) of the tree positions."""
-    x_min = np.min(tree_positions[:, 0])
-    x_max = np.max(tree_positions[:, 0])
-    y_min = np.min(tree_positions[:, 1])
-    y_max = np.max(tree_positions[:, 1])
-    return [x_min, y_min], [x_max, y_max]
+class NeuralMPC:
+    def __init__(self, run_dir=None, initial_randomic=False):
+        # Global Constants and Parameters
+        self.hidden_size = 64
+        self.hidden_layers = 3
+        self.nn_input_dim = 3
 
-def kin_model():
-    """
-    Kinematic model: state X = [x, y, theta, vx, vy, omega] and control U = [ax, ay, angular_acc].
-    Uses simple Euler integration.
-    """
-    X = ca.MX.sym('X', nx * 2)  # 6 states
-    U = ca.MX.sym('U', nx)      # 3 controls
-    X_next = X + dt * ca.vertcat(X[nx:], U)
-    return ca.Function('F', [X, U], [X_next])
+        self.N = 5
+        self.dt = 0.2
+        self.T = self.dt * self.N
+        self.nx = 3  # Represents [x, y, theta]
+        self.n_control = self.nx
+        self.n_state = self.nx * 2
+        self.NUM_TARGET_TREES = 9
+        self.NUM_OBSTACLE_TREES = 2
 
-
-def bayes(lambda_prev, z):
-    """
-    Bayesian update for belief:
-       lambda_next = (lambda_prev * z) / (lambda_prev * z + (1 - lambda_prev) * (1 - z) + epsilon)
-    """
-    z = ca.fmin(ca.fmax(z,0.5), 1 - 1e-6)
-    prod = lambda_prev*z
-    denom = prod + (1 - lambda_prev)* (1 - z)
-    return prod / denom
-
-def bayes_decay(lambda_prev, z, unseen_timers):
-    """
-    Bayesian update for belief, with exponential decay for prolonged unseen objects.
-    lambda_prev: previous belief vector
-    z: current observation vector
-    """
-    # Convert inputs to numpy arrays for element-wise operations
-    lam_prev_np = np.array(lambda_prev.full() if isinstance(lambda_prev, ca.DM) else lambda_prev).flatten()
-    z_np        = np.array(z.full() if isinstance(z, ca.DM) else z).flatten()
-    dt_seconds  = dt  # time step (seconds) from global dt
-
-    # 1. Update unseen timers: reset if observed, increment if still unseen
-    observed_mask = (z_np > 0.5)
-    unseen_timers[observed_mask]  = 0.0               # object seen, reset timer
-    unseen_timers[~observed_mask] += dt_seconds       # object unseen, accumulate time
-
-    # 2. Standard Bayesian update (no decay) for this time step
-    prod        = lam_prev_np * z_np
-    denom       = prod + (1 - lam_prev_np) * (1 - z_np)
-    lam_post_np = prod / denom                       # Bayes formula result for each lambda
-
-    # 3. Apply exponential decay if an object remained unseen beyond threshold
-    decay_mask = (~observed_mask) & (unseen_timers >= DECAY_THRESHOLD)
-    # For those objects, exponentially decay lambda toward 0.5:
-    lam_post_np[decay_mask] = 0.5 + (lam_prev_np[decay_mask] - 0.5) * np.exp(-DECAY_RATE * dt_seconds)
-
-    # 4. Return updated lambda as a CasADi DM column vector (same shape as input)
-    return ca.DM(lam_post_np).reshape((len(lam_post_np), 1))
-
-def entropy(p):
-    """
-    Compute the binary entropy of a probability p.
-    Values are clipped to avoid log(0). Uses element-wise multiplication.
-    """
-    p = ca.fmin(p, 1 - 1e-6)
-    return (-p*ca.log10(p) - (1 - p)* (ca.log10(1 - p))) / ca.log10(2)
+        self.entropy_target = self.entropy_f(self.NUM_TARGET_TREES)
+        # For storing the latest tree scores from the sensor callback.
+        self.latest_trees_scores = None
+        # For storing the latest robot state from the gps callback.
 
 
-# =============================================================================
-# Modified MPC Optimization Function
-# =============================================================================
-
-def mpc_opt(g_nn, trees, lb, ub, x0, lambda_vals, steps=10):
-    """
-    Set up and solve the MPC optimization problem with an added objective to attract
-    the agent towards low-entropy trees when entropy reduction is insufficient.
-    """
-    # --- Basic Dimensions ---
-    nx = 3                   # Split factor: state is 2*nx (6-D) and control is nx (3-D)
-    n_state = nx * 2         # 6-dimensional state: [x, y, theta, vx, vy, omega]
-    n_control = nx           # 3-dimensional control: [ax, ay, alpha]
-    # --- Create the Optimization Problem ---
-    opti = ca.Opti()
-    F_ = kin_model()  # kinematic model function
-
-    # Decision variables:
-    X = opti.variable(n_state, steps + 1)
-    U = opti.variable(n_control, steps)
-    
-    # Parameter vector: initial state and tree beliefs.
-    num_trees = trees.shape[0]
-    P0 = opti.parameter(n_state + num_trees)
-    X0 = P0[: n_state]
-    lambda_0 = P0[n_state:]
-    # Initialize belief evolution.
-    lambda_evol = [lambda_0]
-    
-    # Convert tree positions to a CasADi DM.
-    trees_dm = ca.DM(trees)  # Expected shape: (num_trees, 2)
-
-    # --- Weights and Safety Parameters ---
-    w_control = 1e-2         # Control effort weight
-    w_ang = 1e-6             # Angular control weight
-    w_entropy = 10.0         # Weight for final entropy
-    w_attract = 5.0        # Weight for low-entropy attraction (tuned parameter)
-    safe_distance = 1.0      # Safety margin (meters)
-
-    # Initialize the objective.
-    obj = 0
-
-    # Initial condition constraint.
-    opti.subject_to(X[:, 0] == X0)
-
-    # --- Loop Over the Prediction Horizon ---
-    for i in range(steps):
-        # State and Input Bounds
-        opti.subject_to(opti.bounded(lb[0] - 3.5, X[0, i + 1], ub[0] + 3.5))
-        opti.subject_to(opti.bounded(lb[1] - 3.5, X[1, i + 1], ub[1] + 3.5))
-        opti.subject_to(opti.bounded(-10*np.pi, X[2, i + 1], 10*np.pi))
-        opti.subject_to(opti.bounded(-5.0, X[3, i + 1], 5.0))
-        opti.subject_to(opti.bounded(-5.0, X[4, i + 1], 5.0))
-        opti.subject_to(opti.bounded(-3.14, X[5, i + 1], 3.14))
-        opti.subject_to(opti.bounded(-10.0, U[0:2, i], 10.0))
-        opti.subject_to(opti.bounded(-12, U[2, i], +12))
+        rospy.init_node("nmpc_node", anonymous=True, log_level=rospy.DEBUG)
         
-        opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
-        
-        # Control effort regularization (uncomment if needed)
-        obj += w_control * ca.sumsqr(U[0:2, i]) + w_ang * ca.sumsqr(U[2, i])
-        
-        # --- Collision Avoidance Constraint ---
-        # Ensure the robot remains at least safe_distance away from every tree.
-        delta = X[:2, i+1] - trees_dm.T
-        # Squared distances for each tree
-        sq_dists = ca.diag(ca.mtimes(delta.T, delta))
-        # The closest tree must be at least safe_distance away.
-        opti.subject_to(ca.mmin(sq_dists) >= safe_distance**2)
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        # Subscribers
+        rospy.Subscriber("tree_scores", Float32MultiArray, self.tree_scores_callback)
+        # Publishers
+        self.cmd_pose_pub = rospy.Publisher("cmd/pose", Pose, queue_size=10)
+        self.pred_path_pub = rospy.Publisher("predicted_path", Path, queue_size=10)
+        self.tree_markers_pub = rospy.Publisher("tree_markers", MarkerArray, queue_size=10)
 
-    # --- Neural Network Predictions & Belief Updates ---
-    nn_batch = []
-    for i in range(trees_dm.shape[0]):
-        # Ensure the robot remains at least safe_distance away from every tree.
-        delta = X[:2,1:] - trees_dm[i,:].T
-        # --- Neural Network Prediction & Belief Update ---
-        heading = X[2,1:]
-        nn_batch.append(ca.horzcat(delta.T, heading.T))
+        # Get tree positions from service using the sensors.py serializer logic.
+        self.trees_pos = self.get_trees_poses()
+        self.num_total_trees = self.trees_pos.shape[0]
+        self.entropy_entire_field = self.entropy_f(self.num_total_trees)
 
-    g_out = g_nn(ca.vcat([*nn_batch]))
-    z_k = ca.fmax(g_out, 0.5)  # threshold the NN output
+        # Initialize two lambda vector
+        self.lambda_k = ca.DM.ones(self.num_total_trees, 1) * 0.5
 
-    for i in range(steps):
-        lambda_next = bayes(lambda_evol[-1], z_k[i::steps])
-        lambda_evol.append(lambda_next)
-    
-    # --- Entropy Minimization Objective ---
-    epsilon_dist = 1e-3 # Avoid division by zero
-    dist_vector = ca.hcat([(ca.sum1((trees_dm.T - X[:2, i+1] )**2) + epsilon_dist)]).T
-    entropy_value = w_entropy *ca.sum1(entropy(lambda_evol[-1]) - entropy(lambda_evol[0]))  - w_attract*ca.sum1((1.0-2.0*(lambda_evol[0]-0.5))**2/dist_vector)
-    obj += entropy_value
-
-    # --- Solve the Optimization ---
-    opti.minimize(obj)
-    
-    # --- Solver Options and Solve ---
-    options = {
-        "ipopt": {
-            "tol": 5*1e-1,
-            "warm_start_init_point": "yes",
-            "hessian_approximation": "limited-memory",
-            "print_level": 5,
-            "sb": "no",
-            "mu_strategy": "monotone",
-            "max_iter": 3000
-        }
-    }
-    opti.solver("ipopt", options)
-    
-    # Set the parameter values: ensure x0 is (6,1) and lambda_vals is (num_trees,1).
-    opti.set_value(P0, ca.vertcat(x0, lambda_vals))
-    
-    sol = opti.solve()
-    
-    # Create the MPC step function for warm starting future iterations.
-    inputs = [P0, opti.x, opti.lam_g]
-    outputs = [U[:, 0], X, opti.x, opti.lam_g]
-    mpc_step = opti.to_function("mpc_step", inputs, outputs)
-    
-    return (mpc_step,
-            ca.DM(sol.value(U[:, 0])),
-            ca.DM(sol.value(X)),
-            ca.DM(sol.value(opti.x)),
-            ca.DM(sol.value(opti.lam_g))) 
-# =============================================================================
-# Simulation Function
-# =============================================================================
-def run_simulation():
-    F_ = kin_model()
-    bridge = BridgeClass(SENSORS)
-
-    trees_pos = np.array(bridge.call_server({"trees_poses": None})["trees_poses"])
-    lb, ub = get_domain(trees_pos)
-    lambda_k = ca.reshape(ca.DM.ones(len(trees_pos)) * 0.5, (len(trees_pos), 1))
-
-    # [New] Initialize unseen-object timers and decay parameters
-    unseen_timers   = np.zeros(len(trees_pos))   # track how long each tree has been unseen
-    mpc_horizon = N
+        # MPC horizon (number of steps)
+        self.mpc_horizon = self.N
+        self.baselines_dir = os.path.join( os.path.dirname(os.path.abspath(__file__)), "../../baselines") if run_dir is None else run_dir
+        self.initial_randomic = initial_randomic
 
     # ---------------------------
-    # Load the Learned Neural Network Model
+    # Callback Functions
     # ---------------------------
-    model = MultiLayerPerceptron(input_dim=nn_input_dim) 
-    # Note: Adjust 'weights_only' if needed by your model saving logic.
-    model.load_state_dict(torch.load(get_latest_best_model(), weights_only=True))
-    model.eval()
-    g_nn = l4c.L4CasADi(model, batched=True, device='cuda')
-    
-    # Initialize robot state: assume update_robot_state() returns [x, y, theta].
-    vx_k = ca.DM.zeros(nx)
-    # Logging containers.
-    all_trajectories = []
-    lambda_history = []
-    entropy_history = []
-    durations = []
 
-    sim_time = 600  # Total simulation time in seconds
-    mpciter = 0
+    def robot_state_update_thread(self):
+        """Continuously update the robot's state using TF at 30 Hz."""
+        try:
+            # Look up the transform from 'map' to 'drone_base_link'
+            trans = self.tf_buffer.lookup_transform('map', 'drone_base_link', rospy.Time())
+            # Extract the yaw angle from the quaternion
+            (_, _, yaw) = tf.transformations.euler_from_quaternion([
+                trans.transform.rotation.x,
+                trans.transform.rotation.y,
+                trans.transform.rotation.z,
+                trans.transform.rotation.w
+            ])
+            # Update current_state with [x, y, yaw]
+            return [trans.transform.translation.x,
+                                  trans.transform.translation.y,
+                                  yaw]
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn("Failed to get transform: %s", e)
+            return None
+
+    def tree_scores_callback(self, msg):
+        """
+        Callback for tree scores.
+        """
+        scores = np.array(msg.data).reshape(-1, 1)
+        self.latest_trees_scores = scores
+
 
     # ---------------------------
-    # Main MPC Loop
+    # Service Call to Get Trees Poses
     # ---------------------------
-    while mpciter * T < sim_time:
-        print('Step:', mpciter)
-        print('Observe and update state')
-        new_data = bridge.get_data()
-        x_k = ca.vertcat(ca.DM(bridge.update_robot_state()), vx_k)
-        while new_data["tree_scores"] is None:
-            new_data = bridge.get_data()
-        print(new_data["tree_scores"])
+    def get_trees_poses(self):
+        """
+        Calls the GetTreesPoses service and returns tree positions as an (N,2) numpy array.
+        The serializer logic is taken from sensors.py.
+        """
+        rospy.wait_for_service("/obj_pose_srv")
+        try:
+            trees_srv = rospy.ServiceProxy("/obj_pose_srv", GetTreesPoses)
+            response = trees_srv()  # Adjust parameters if needed
+            # Using the serializer from sensors.py:
+            trees_pos = np.array([[pose.position.x, pose.position.y] for pose in response.trees_poses.poses])
+            return trees_pos
+        except rospy.ServiceException as e:
+            rospy.logerr("Service call failed: %s", e)
+            return np.array([])
 
-        # Ensure tree_scores are a column vector.
-        z_k = ca.reshape(ca.DM(new_data["tree_scores"]), (len(new_data["tree_scores"]), 1))
-        lambda_k = bayes_decay(lambda_k, z_k, unseen_timers)
-        print("Current state x_k:", x_k)
-        print("Lambda: ", lambda_k)
-
-        bridge.pub_data({
-            "tree_markers": {"trees_pos": trees_pos, "lambda": lambda_k.full().flatten()}
-        })
-
-        start_time = time.time()
-        if mpciter == 0:
-            # Initialize MPC.
-            mpc_step, u, x_traj, x_dec, lam = mpc_opt(g_nn, trees_pos, lb, ub, x_k, lambda_k, mpc_horizon)
-        else:
-            # Warm-start MPC.
-            u, x_traj, x_dec, lam = mpc_step(ca.vertcat(x_k, lambda_k), x_dec, lam)
-        durations.append(time.time() - start_time)
-
-
-        # ---------------------------
-        # Publish Data and Apply Control
-        # ---------------------------
-        bridge.pub_data({
-            "predicted_path": x_traj[:nx, 1:], 
-        })
-        
-        bridge.pub_data({"cmd_pose": F_(x_k, u[0,:])})
-        time.sleep(T/N)
-
-        # Update velocity component from the predicted trajectory.
-        vx_k = x_traj[nx:, 1]
-
-        # Compute and log overall entropy.
-        entropy_k = ca.sum1(entropy(ca.fmin(lambda_k, 1 - 1e-3))).full().flatten()[0]
-        lambda_history.append(lambda_k.full().flatten().tolist())
-        entropy_history.append(entropy_k)
-        all_trajectories.append(x_traj[:nx, :].full())
-
-        mpciter += 1
-        print(entropy_k)
-        if entropy_k < 1.0:
-            break
-
-    return all_trajectories, entropy_history, lambda_history, durations, g_nn, trees_pos, lb, ub
-
-
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
-def plot_animated_trajectory_and_entropy_2d( all_trajectories, entropy_history, lambda_history, trees, lb, ub, computation_durations):
-    
-    model = MultiLayerPerceptron(input_dim=nn_input_dim) 
-    # Note: Adjust 'weights_only' if needed by your model saving logic.
-    model.load_state_dict(torch.load(get_latest_best_model(), weights_only=True))
-    model.eval()
-    g_nn = l4c.L4CasADi(model, name='plotting_f', batched=True, device='cuda')
-    
-
-    # Extract trajectory data
-    x_trajectory = np.array([traj[0] for traj in all_trajectories])
-    y_trajectory = np.array([traj[1] for traj in all_trajectories])
-    theta_trajectory = np.array([traj[2] for traj in all_trajectories])  # Drone orientation (yaw)
-    all_trajectories = np.array(all_trajectories)
-    lambda_history = np.array(lambda_history)
-    
-    # Compute entropy reduction for each step
-    entropy_mpc_pred = []
-    for k in range(all_trajectories.shape[0]):
-        lambda_k = lambda_history[k]
-        entropy_mpc_pred_k = [entropy_history[k]]  # Start with the initial entropy value
-        for i in range(all_trajectories.shape[2]-1):
-            relative_position_robot_trees = np.tile(all_trajectories[k, :2, i+1], (trees.shape[0], 1)) - trees
-            distance_robot_trees = np.sqrt(np.sum(relative_position_robot_trees**2, axis=1))
-            theta = np.tile(all_trajectories[k, 2, i+1], (trees.shape[0], 1))  # Drone yaw
-            # Build NN input using CasADi horzcat
-            input_nn = ca.horzcat(relative_position_robot_trees, theta)
-            # If the tree is far, set z_k to 0.5; otherwise use the NN prediction (thresholded)
-            z_k = (distance_robot_trees > 10) * 0.5 + (distance_robot_trees <= 10) * ca.fmax(g_nn(input_nn), 0.5)
-            lambda_k = bayes(lambda_k, z_k)
-            reduction = ca.sum1(entropy(lambda_k)).full().flatten()[0]
-            entropy_mpc_pred_k.append(reduction)
-        entropy_mpc_pred.append(entropy_mpc_pred_k)
-    
-    entropy_mpc_pred = np.array(entropy_mpc_pred)
-    sum_entropy_history = entropy_history  # use provided history
-
-    # Compute cumulative computation durations (if needed later)
-    cumulative_durations = np.cumsum(computation_durations)
-
-    # Create a subplot with 2 rows and 2 columns
-    fig = make_subplots(
-        rows=2, cols=2,
-        column_widths=[0.7, 0.3],
-        row_heights=[0.6, 0.4],
-        specs=[
-            [{"type": "scatter"}, {"type": "scatter"}],  # First row: 2D map and entropy plot
-            [{"type": "scatter"}, {"type": "scatter"}]   # Second row: (empty) and computation durations plot
+    # ---------------------------
+    # Utility Functions
+    # ---------------------------
+    def get_latest_best_model(self, cls=''):
+        # Get the directory where THIS script is stored.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Models are stored in a subdirectory "models/" relative to this script.
+        model_dir = os.path.join(script_dir, "models", cls)
+        # Find the latest best model file matching the pattern.
+        model_files = [
+            f for f in os.listdir(model_dir)
+            if re.match(r"best_model_epoch_(\d+)\.pth", f)
         ]
-    )
-
-    # Add the initial MPC predicted trajectory to the first subplot.
-    fig.add_trace(
-        go.Scatter(
-            x=x_trajectory[0],
-            y=y_trajectory[0],
-            mode="lines+markers",
-            name="MPC Future Trajectory",
-            line=dict(color="red", width=4),
-            marker=dict(size=5, color="blue")
-        ),
-        row=1, col=1
-    )
-
-    # Add an (initially empty) trace for the drone trajectory.
-    fig.add_trace(
-        go.Scatter(
-            x=[],
-            y=[],
-            mode="lines+markers",
-            name="Drone Trajectory",
-            line=dict(color="orange", width=4),
-            marker=dict(size=5, color="orange")
-        ),
-        row=1, col=1
-    )
-
-    # Add tree markers with text showing the tree number.
-    # The legend name also includes the initial lambda value.
-    for i in range(trees.shape[0]):
-        fig.add_trace(
-            go.Scatter(
-                x=[trees[i, 0]],
-                y=[trees[i, 1]],
-                mode="markers+text",
-                marker=dict(
-                    size=10,
-                    color="#FF0000",  # initial color (red)
-                    colorscale=[[0, "#FF0000"], [1, "#00FF00"]],  # Red to green scale
-                    cmin=0,
-                    cmax=1,
-                    showscale=False
-                ),
-                name=f"Tree {i}: {lambda_history[0][i]:.2f}",
-                text=[str(i)],        # Plot the tree number as text
-                textposition="top center"
-            ),
-            row=1, col=1
+        if not model_files:
+            raise FileNotFoundError(f"No model files found in {model_dir}")
+        latest_model = max(
+            model_files,
+            key=lambda x: int(re.match(r"best_model_epoch_(\d+)\.pth", x).group(1))
         )
+        print( os.path.join(model_dir, latest_model))
+        return os.path.join(model_dir, latest_model)
 
-    # Add the sum of entropies plot to the top-right subplot.
-    fig.add_trace(
-        go.Scatter(
-            x=[],
-            y=[],
-            mode="lines+markers",
-            name="Sum of Entropies (Past)",
-            line=dict(color="blue", width=2),
-            marker=dict(size=5, color="blue")
-        ),
-        row=1, col=2
-    )
+    @staticmethod
+    def get_domain(tree_positions):
+        """Return the domain (bounding box) of the tree positions."""
+        x_min = np.min(tree_positions[:, 0])
+        x_max = np.max(tree_positions[:, 0])
+        y_min = np.min(tree_positions[:, 1])
+        y_max = np.max(tree_positions[:, 1])
+        return [x_min, y_min], [x_max, y_max]
 
-    fig.add_trace(
-        go.Scatter(
-            x=[],
-            y=[],
-            mode="lines+markers",
-            name="Sum of Entropies (Future)",
-            line=dict(color="purple", width=2, dash="dot"),
-            marker=dict(size=5, color="purple")
-        ),
-        row=1, col=2
-    )
+    @staticmethod
+    def kin_model(nx, dt):
+        nx = 6
+        # Control: [ax, ay, az]
+        nu = 3
+        
+        # Continuous time dynamics (x_dot = f(x, u))
+        # Symbolics
+        x_sym = ca.SX.sym('x', nx) # State symbolic variable
+        u_sym = ca.SX.sym('u', nu) # Control symbolic variable
+        
+        # Unpack state and control for clarity
+        px, py, pw, vx, vy, vw = [x_sym[i] for i in range(nx)]
+        ax, ay, aw = [u_sym[i] for i in range(nu)]
+        
+        # x_dot = [vx, vy, vw, ax, ay, aw]
+        x_dot = ca.vertcat(vx, vy, vw, ax, ay, aw)
+        
+        # Create a CasADi function for continuous dynamics
+        f_continuous = ca.Function('f_cont', [x_sym, u_sym], [x_dot], ['x', 'u'], ['x_dot'])
+        
+        # Discrete time dynamics (using RK4 integration for better accuracy)
+        # Note: Simple Euler integration could also be used: x_next = x_sym + dt * x_dot
+        k1 = f_continuous(x_sym, u_sym)
+        k2 = f_continuous(x_sym + dt / 2 * k1, u_sym)
+        k3 = f_continuous(x_sym + dt / 2 * k2, u_sym)
+        k4 = f_continuous(x_sym + dt * k3, u_sym)
+        x_next = x_sym + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        
+        # Create a CasADi function for discrete dynamics
+        F = ca.Function('F', [x_sym, u_sym], [x_next], ['x_k', 'u_k'], ['x_k1'])
+        return F
 
-    # Add the computation durations plot to the bottom-right subplot.
-    fig.add_trace(
-        go.Scatter(
-            x=[],
-            y=[],
-            mode="lines+markers",
-            name="Computation Durations",
-            line=dict(color="green", width=2),
-            marker=dict(size=5, color="green")
-        ),
-        row=2, col=2
-    )
+    @staticmethod
+    def bayes(lambda_prev, z):
+        """
+        Bayesian update for belief:
+           lambda_next = (lambda_prev * z) / (lambda_prev * z + (1 - lambda_prev) * (1 - z))
+        """
+        prod = lambda_prev * z
+        denom = prod + (1 - lambda_prev) * (1 - z)
+        return prod / denom
 
-    # Create frames for animation
-    frames = []
-    for k in range(len(entropy_mpc_pred)):
-        # For each frame, update tree markers with the current lambda values.
-        tree_data = []
-        for i in range(trees.shape[0]):
-            tree_data.append(
-                go.Scatter(
-                    x=[trees[i, 0]],
-                    y=[trees[i, 1]],
-                    mode="markers+text",
-                    marker=dict(
-                        size=10,
-                        # Use a simple linear mapping to set the color; adjust if needed.
-                        color=[2*(lambda_history[k][i] - 0.5)],
-                        colorscale=[[0, "#FF0000"], [1, "#00FF00"]],
-                        cmin=0,
-                        cmax=1,
-                        showscale=False
-                    ),
-                    # Update the legend name with the current lambda value.
-                    name=f"Tree {i}: {lambda_history[k][i]:.2f}",
-                    text=[str(i)],  # Show tree number as text
-                    textposition="top center"
-                )
-            )
+    @staticmethod
+    def bayes_decay(lambda_prev, z, unseen_timers):
+        """
+        Bayesian update for belief, with exponential decay for prolonged unseen objects.
+        lambda_prev: previous belief vector
+        z: current observation vector
+        """
+        DECAY_THRESHOLD = 10.0   # seconds before starting decay for unseen objects
+        DECAY_RATE      = 0.5   # decay rate (per second) for exponential drop toward 0.5
+        # Convert inputs to numpy arrays for element-wise operations
+        lam_prev_np = np.array(lambda_prev.full() if isinstance(lambda_prev, ca.DM) else lambda_prev).flatten()
+        z_np        = np.array(z.full() if isinstance(z, ca.DM) else z).flatten()
+        dt_seconds  = 0.2  # time step (seconds) from global dt
 
-        # Update the entropy curves
-        sum_entropy_past = sum_entropy_history[:k+1]
-        sum_entropy_future = entropy_mpc_pred[k]
+        # 1. Update unseen timers: reset if observed, increment if still unseen
+        observed_mask = (z_np > 0.5)
+        unseen_timers[observed_mask]  = 0.0               # object seen, reset timer
+        unseen_timers[~observed_mask] += dt_seconds       # object unseen, accumulate time
 
-        # Update computation durations (past values)
-        computation_durations_past = computation_durations[:k+1]
+        # 2. Standard Bayesian update (no decay) for this time step
+        prod        = lam_prev_np * z_np
+        denom       = prod + (1 - lam_prev_np) * (1 - z_np)
+        lam_post_np = prod / denom                       # Bayes formula result for each lambda
 
-        # Prepare drone orientation arrows for the current frame.
-        x_start = x_trajectory[k]
-        y_start = y_trajectory[k]
-        theta = theta_trajectory[k]
-        x_end = x_start + 0.5 * np.cos(theta)
-        y_end = y_start + 0.5 * np.sin(theta)
+        # 3. Apply exponential decay if an object remained unseen beyond threshold
+        decay_mask = (~observed_mask) & (unseen_timers >= DECAY_THRESHOLD)
+        # For those objects, exponentially decay lambda toward 0.5:
+        lam_post_np[decay_mask] = 0.5 + (lam_prev_np[decay_mask] - 0.5) * np.exp(-DECAY_RATE * dt_seconds)
 
-        list_of_actual_orientations = []
-        # For the current MPC trajectory (red arrow)
-        for x0, y0, x1, y1 in zip(x_start, y_start, x_end, y_end):
-            arrow = go.layout.Annotation(
-                dict(
-                    x=x1,
-                    y=y1,
-                    xref="x", yref="y",
-                    text="",
-                    showarrow=True,
-                    axref="x", ayref="y",
-                    ax=x0,
-                    ay=y0,
-                    arrowhead=3,
-                    arrowwidth=1.5,
-                    arrowcolor="red",
-                )
-            )
-            list_of_actual_orientations.append(arrow)
+        # 4. Return updated lambda as a CasADi DM column vector (same shape as input)
+        return ca.DM(lam_post_np).reshape((len(lam_post_np), 1))
 
-        # Also add past drone trajectory arrows (orange)
-        x_start_traj = x_trajectory[:k+1, 0]
-        y_start_traj = y_trajectory[:k+1, 0]
-        theta_traj = theta_trajectory[:k+1, 0]
-        x_end_traj = x_start_traj + 0.5 * np.cos(theta_traj)
-        y_end_traj = y_start_traj + 0.5 * np.sin(theta_traj)
-        for x0, y0, x1, y1 in zip(x_start_traj, y_start_traj, x_end_traj, y_end_traj):
-            arrow = go.layout.Annotation(
-                dict(
-                    x=x1,
-                    y=y1,
-                    xref="x", yref="y",
-                    text="",
-                    showarrow=True,
-                    axref="x", ayref="y",
-                    ax=x0,
-                    ay=y0,
-                    arrowhead=3,
-                    arrowwidth=1.5,
-                    arrowcolor="orange",
-                )
-            )
-            list_of_actual_orientations.append(arrow)
+    @staticmethod
+    def entropy_f(num_targets):
+        """
+        Compute the binary entropy of a probability p.
+        Values are clipped to avoid log(0).
+        """
+        p = ca.MX.sym(f'input_entropy_f{num_targets}_dim', num_targets)
+        output = -4*(p-0.5)**2 + 1 #(-p * ca.log10(p) - (1 - p) * ca.log10(1 - p)) / ca.log10(2)
+        return ca.Function(f'entropy_f_{num_targets}_dim', [p], [output])
 
-        frame = go.Frame(
-            data=[
-                # MPC future trajectory (red)
-                go.Scatter(
-                    x=x_trajectory[k],
-                    y=y_trajectory[k],
-                    mode="lines+markers",
-                    line=dict(color="red", width=4),
-                    marker=dict(size=5, color="blue")
-                ),
-                # Drone actual trajectory (orange)
-                go.Scatter(
-                    x=x_trajectory[:k+1, 0],
-                    y=y_trajectory[:k+1, 0],
-                    mode="lines+markers",
-                    line=dict(color="orange", width=4),
-                    marker=dict(size=5, color="orange")
-                ),
-                *tree_data,  # Tree markers with updated lambda and tree number
-                # Past entropy
-                go.Scatter(
-                    x=np.arange(len(sum_entropy_past)),
-                    y=sum_entropy_past,
-                    mode="lines+markers",
-                    line=dict(color="blue", width=2),
-                    marker=dict(size=5, color="blue")
-                ),
-                # Future entropy prediction
-                go.Scatter(
-                    x=np.arange(k, k+len(sum_entropy_future)),
-                    y=sum_entropy_future,
-                    mode="lines+markers",
-                    line=dict(color="purple", width=2, dash="dot"),
-                    marker=dict(size=5, color="purple")
-                ),
-                # Computation durations
-                go.Scatter(
-                    x=np.arange(len(computation_durations_past)),
-                    y=computation_durations_past,
-                    mode="lines+markers",
-                    line=dict(color="green", width=2),
-                    marker=dict(size=5, color="green")
-                )
-            ],
-            name=f"Frame {k}",
-            layout=dict(annotations=list_of_actual_orientations)
+    def get_target_tree_indices(self, robot_position, num_target=None, entropy_threshold=0.025):
+        """
+        Returns the indexes of the 'num_target' trees (from self.trees_pos) that are closest to
+        the robot_position and have an effective entropy higher than 'entropy_threshold'.
+        Effective entropy is min(H(lambda_raw), H(lambda_ripe)).
+        If fewer than 'num_target' trees meet the criterion, the nearest ones meeting it are duplicated.
+        If no trees meet the criterion, the 'num_target' overall nearest trees are returned.
+        """
+        if num_target is None:
+            num_target = self.NUM_TARGET_TREES
+
+        # Compute Euclidean distances from the robot to each tree.
+        # Ensure robot_position is 1D array [x, y]
+        robot_pos_1d = np.array(robot_position).flatten()
+        distances = np.linalg.norm(self.trees_pos[:, :2] - robot_pos_1d, axis=1)
+
+        # Compute binary entropies for lambdas.
+        H = self.entropy_entire_field(self.lambda_k)
+
+        # Compute effective entropy (minimum of the two).
+        H_min = H.full()
+        
+        # Get indices where effective entropy is above the threshold.
+        candidate_indices = np.where(H_min > entropy_threshold)[0]
+        if candidate_indices.size == 0:
+            # If no tree meets the entropy threshold, just take the overall nearest ones
+            print("Warning: No trees above entropy threshold. Selecting nearest trees.")
+            sorted_indices_all = np.argsort(distances)
+            return sorted_indices_all[:num_target]
+
+        # Sort candidate indices by distance.
+        sorted_candidates = candidate_indices[np.argsort(distances[candidate_indices])]
+
+        # If the number of selected candidates is less than num_target,
+        # re-add (duplicate) the nearest ones among those above threshold.
+        if sorted_candidates.size < num_target:
+            repeats = int(np.ceil(num_target / sorted_candidates.size))
+            # Duplicate the candidate array and slice the first num_target elements
+            sorted_candidates = np.tile(sorted_candidates, repeats)[:num_target]
+        # Return the first num_target indices.
+        return sorted_candidates[:num_target]
+
+    # ---------------------------
+    # NEW Function to select NEAREST tree indices (for obstacle avoidance)
+    # ---------------------------
+    def get_nearest_tree_indices(self, robot_position, num_obstacle=None):
+        """
+        Returns the indices of the 'num_obstacle' trees (from self.trees_pos)
+        that are closest to the robot_position.
+        """
+        if num_obstacle is None:
+            num_obstacle = self.NUM_OBSTACLE_TREES
+        if num_obstacle > self.num_total_trees:
+            num_obstacle = self.num_total_trees # Cannot select more trees than exist
+
+        # Ensure robot_position is 1D array [x, y]
+        robot_pos_1d = np.array(robot_position).flatten()
+        distances = np.linalg.norm(self.trees_pos - robot_pos_1d, axis=1)
+
+        # Get indices sorted by distance
+        sorted_indices = np.argsort(distances)
+
+        # Return the first 'num_obstacle' indices
+        return sorted_indices[:num_obstacle]
+
+    # ---------------------------
+    # MPC Optimization Function
+    # ---------------------------
+    def mpc_opt(self, g_nn, target_trees, target_lambdas, obstacle_trees, lb, ub, x0, steps=10):
+        opti = ca.Opti()
+        F_ = self.kin_model(self.nx, self.dt)
+
+        # Decision variables
+        X = opti.variable(self.n_state, steps + 1)
+        U = opti.variable(self.n_control, steps)
+
+        # Parameters
+        num_target_trees = target_trees.shape[0]
+        num_obstacle_trees = obstacle_trees.shape[0]
+        param_size = self.n_state + num_target_trees * 3 + num_obstacle_trees * 2
+        P0 = opti.parameter(param_size)
+
+        p_idx = 0
+        X0 = P0[p_idx : p_idx + self.n_state]; p_idx += self.n_state
+        TARGET_TREES_param = P0[p_idx : p_idx + num_target_trees*2].reshape((num_target_trees,2)).T; p_idx += num_target_trees*2
+        L0 = P0[p_idx : p_idx + num_target_trees]; p_idx += num_target_trees
+        OBSTACLE_TREES_param = P0[p_idx : p_idx + num_obstacle_trees*2].reshape((num_obstacle_trees,2)).T
+        lambda_evol = [L0]
+
+        # Weights
+        
+        attraction = 0
+        safe_distance = 1.0
+        obj = 0
+        # Initial condition
+        opti.subject_to(X[:, 0] == X0)
+        ca_batch = []
+        # Dynamics + bounds
+        for i in range(steps):
+            opti.subject_to(opti.bounded(lb[0] - 3.0, X[0, i], ub[0] + 3.0))
+            opti.subject_to(opti.bounded(lb[1] - 3.0, X[1, i], ub[1] + 3.0))
+            opti.subject_to(opti.bounded(-3*np.pi, X[2, i], +3*np.pi))
+            opti.subject_to(opti.bounded(-1.75, X[3:5, i], 1.75))
+            opti.subject_to(opti.bounded(-np.pi/4, X[5, i], np.pi/4))
+
+            opti.subject_to(opti.bounded(-5.0, U[0:2, i], 5.0))
+            opti.subject_to(opti.bounded(-np.pi, U[2, i], np.pi))
+            opti.subject_to(X[:, i + 1] == F_(X[:, i], U[:, i]))
+
+            # Collision avoidance
+            for j in range(num_obstacle_trees):
+                obs_j_pos = OBSTACLE_TREES_param[:, j]
+                dist_sq_obs = ca.sumsqr(X[:2, i+1] - obs_j_pos)
+                opti.subject_to(dist_sq_obs >= safe_distance**2)
+
+            distances_sq = []
+            nn_batch = []
+            for j in range(num_target_trees):
+                obj_j_pos = TARGET_TREES_param[:, j]
+                diff = X[:2, i + 1] - obj_j_pos
+                distances_sq.append(ca.sumsqr(diff) +1e-6)
+                heading_target = X[2, i+1]
+                nn_batch.append(ca.horzcat(diff.T, heading_target))
+            ca_batch.append(ca.vcat([*nn_batch]))
+
+            # Find the minimum squ10.0ed distance
+            Q_dist = 0.0
+            R_xy = 1e-4
+            R_theta = 1e-4
+            min_dist_sq = distances_sq[0]
+            for j in range(1, num_target_trees):
+                min_dist_sq = ca.fmin(min_dist_sq, distances_sq[j])
+            attraction = attraction - Q_dist * ca.exp(-( ca.sqrt(min_dist_sq) - 2.0)**2/(2*100**2))
+            # Optional: Penalize large control inputs or changes in control inputs
+            obj = obj + R_xy * ca.sumsqr(U[:2, i]) + R_theta * ca.sumsqr(U[2, i])
+
+        g_out = g_nn(ca.vcat(ca_batch)) 
+        # Use the NN output to update both branches over the horizon.
+        z_k = ca.fmax(g_out, 0.5)
+        L0_ext = ca.vcat([L0 for _ in range(steps)])
+        z_k_bin = (L0_ext>=0.5)*z_k + (L0_ext<0.5)*(1-z_k)
+        for i in range(steps):
+            lambda_next = self.bayes(lambda_evol[-1], z_k_bin[i*num_target_trees:(i+1)*num_target_trees])
+            lambda_evol.append(lambda_next)
+        entropy_obj = 0
+
+        for i in range(1, steps+1):
+            entropy_future = self.entropy_target(lambda_evol[i])
+            entropy_past = self.entropy_target(lambda_evol[i-1])       
+            entropy_obj += ca.exp(-i)*ca.sum1(entropy_future)
+
+
+        sq_dist_to_targets = ca.sum1((X0[:2] - TARGET_TREES_param)**2)
+        min_sq_dist = ca.mmin(sq_dist_to_targets)
+
+        # 2. Define sigmoid parameters
+        threshold_sq_dist = 9.0
+        sigmoid_steepness = 10.0
+        # 3. Calculate the sigmoid factor
+        # This factor smoothly goes from ~0 (when min_sq_dist << 12) to ~1 (when min_sq_dist >> 12)
+        sigmoid_factor = 1.0 / (1.0 + ca.exp(-sigmoid_steepness * (min_sq_dist - threshold_sq_dist)))
+
+        # 4. Apply the modulation to the attraction term
+        modulated_attraction_term = attraction * sigmoid_factor
+
+        opti.minimize(obj + 10*entropy_obj + modulated_attraction_term)                                 
+        options = {
+            "ipopt": {
+                "tol":1e-6,
+                "warm_start_init_point": "yes",
+                "print_level": 0,
+                "sb": "no",
+                "warm_start_bound_push": 1e-8,
+                "warm_start_mult_bound_push": 1e-8,
+                "mu_init": 1e-5,
+                "bound_relax_factor": 1e-9,
+                "hsllib": '/usr/local/lib/libcoinhsl.so', # Specify HSL library path if used
+                "linear_solver": 'ma27',
+                "hessian_approximation":'limited-memory',
+                "mu_strategy": "monotone",
+                "max_iter": 500,
+            }
+        }
+        opti.solver("ipopt", options)
+        inputs = [P0, opti.x, opti.lam_g]
+        outputs = [U[:, 0], X,  opti.x, opti.lam_g]
+
+        # --- Solve for the first time ---
+        # Concatenate initial parameter values correctly
+        p0_val = ca.vertcat(
+            x0,
+            ca.reshape(target_trees, 2* self.NUM_TARGET_TREES, 1),
+            target_lambdas[:num_target_trees], # Raw lambdas
+            target_lambdas[num_target_trees:], # Ripe lambdas
+            ca.reshape(obstacle_trees, 2* self.NUM_OBSTACLE_TREES, 1)
         )
-        frames.append(frame)
+        opti.set_value(P0, p0_val)
 
-    # Add frames to the figure
-    fig.frames = frames
+        sol = opti.solve()
+        u_sol = sol.value(U[:, 0])
+        x_traj_sol = sol.value(X)
+        x_dec_sol = sol.value(opti.x)
+        lam_g_sol = sol.value(opti.lam_g)
+        mpc_step_func = opti.to_function("mpc_step", inputs, outputs, ["p", "x_init", "x_lam"], ["u_opt", "x_pred", "x_opt", "lam_opt"])
 
-    # Update layout for the subplots and animation controls.
-    fig.update_layout(
-        title="Drone Trajectory, Sum of Entropies, and Computation Durations",
-        xaxis=dict(title="X Position", range=[lb[0] - 3, ub[0] + 3]), 
-        yaxis=dict(title="Y Position", range=[lb[1] - 3, ub[1] + 3]),
-        xaxis2=dict(title="Time Step"),
-        yaxis2=dict(title="Sum of Entropies"),
-        xaxis3=dict(title="Time Step"),
-        yaxis3=dict(title="Computation Duration (s)"),
-        updatemenus=[
-            dict(
-                type="buttons",
-                buttons=[
-                    dict(
-                        label="Play",
-                        method="animate",
-                        args=[None, {"frame": {"duration": 200, "redraw": True}, "fromcurrent": True}]
-                    ),
-                    dict(
-                        label="Pause",
-                        method="animate",
-                        args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}]
+
+        return (mpc_step_func,
+                ca.DM(u_sol),
+                ca.DM(x_traj_sol),
+                ca.DM(x_dec_sol),
+                ca.DM(lam_g_sol))
+
+    def generate_random_initial_state(self, lb, ub, margin=1.5):
+        """
+        Generate a random initial state [x, y, theta] such that:
+         - x is in [lb[0], ub[0]] and y in [lb[1], ub[1]]
+         - The position is at least `margin` meters away from every tree.
+         - theta is chosen uniformly from [-pi, pi].
+        """
+        while True:
+            x = np.random.uniform(lb[0], ub[0])
+            y = np.random.uniform(lb[1], ub[1])
+            valid = True
+            for tree in self.trees_pos:
+                if np.linalg.norm(np.array([x, y]) - tree) < margin:
+                    valid = False
+                    break
+            if valid:
+                theta = np.random.uniform(-np.pi, np.pi)
+                return np.array([x, y, theta]).reshape(-1,1)
+
+    # ---------------------------
+    # Simulation Function
+    # ---------------------------
+    def run_simulation(self):
+        F_ = self.kin_model(self.nx, self.dt)
+        lb, ub = self.get_domain(self.trees_pos)
+        self.mpc_horizon = self.N
+        current_state = None
+
+        if self.initial_randomic:
+            current_state = self.generate_random_initial_state(lb, ub, margin=1.5)
+            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(current_state[2]))
+            cmd_pose_msg = Pose()
+            cmd_pose_msg.position = Point(x=float(current_state[0]), y=float(current_state[1]), z=0.0)
+            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                  y=quaternion[1],
+                                                  z=quaternion[2],
+                                                  w=quaternion[3])
+            self.cmd_pose_pub.publish(cmd_pose_msg)    
+            rospy.sleep(1.5)
+
+        # Wait until a GPS message has been received.
+        rospy.loginfo("Waiting for GPS data...")
+        while current_state is None and not rospy.is_shutdown():
+            current_state =  self.robot_state_update_thread()
+            rospy.sleep(0.05)
+        rospy.loginfo("GPS data received.")
+
+        # ---------------------------
+        # Load the Learned Neural Network Models
+        # ---------------------------
+        model = MultiLayerPerceptron(input_dim=self.nn_input_dim,
+                                     hidden_size=self.hidden_size,
+                                     hidden_layers=self.hidden_layers)
+        model.load_state_dict(torch.load(self.get_latest_best_model(), weights_only=True))
+        model.eval()
+        g_nn = l4c.L4CasADi(model, batched=True, device='cuda', generate_jac_jac=True, generate_adj1=False, generate_jac_adj1=False)
+
+
+        # Initialize robot state from the latest GPS callback.
+        initial_state = current_state  # [x, y, theta]
+        vx_k = ca.DM.zeros(self.nx)  # velocity component: [vx, vy, omega]
+        x_k = ca.vertcat(ca.DM(initial_state), vx_k)
+
+        # Containers for simulation output.
+        all_trajectories = []
+        lambda_history = []
+        entropy_history = []
+        durations = []
+
+        velocity_command_log = []
+        pose_history = []      # [x, y, theta] for each step
+        time_history = []      # simulation time at each step
+
+        sim_start_time = time.time()
+        total_distance = 0.0
+        total_commands = 0
+        sum_vx = 0.0
+        sum_vy = 0.0
+        sum_yaw = 0.0
+        sum_trans_speed = 0.0
+        prev_x = float(x_k[0])
+        prev_y = float(x_k[1])
+
+        unseen_timers   = np.zeros(self.num_total_trees)   # track how long each tree has been unseen
+
+        sim_time = 1000  # Total simulation time in seconds
+        mpciter = 0
+        rate = rospy.Rate(int(1/self.dt))
+        warm_start = True
+        x_dec_prev = None
+        lam_g_prev = None
+        mpc_step = None
+        current_state = None
+        # Main MPC loop.
+        while mpciter < sim_time and not rospy.is_shutdown():
+            loop_iter_start = time.time()
+            rospy.loginfo('Step: %d', mpciter)
+            # Update state from the latest GPS callback.
+            current_state =  self.robot_state_update_thread()
+            while current_state is None and not rospy.is_shutdown():
+                current_state = self.robot_state_update_thread()
+                rospy.sleep(0.05)
+            current_sim_time = time.time() - sim_start_time
+            pose_history.append(current_state)
+            time_history.append(current_sim_time)
+            x_k = ca.vertcat(ca.DM(current_state), vx_k)
+
+            # Wait until tree scores have been received.
+            while self.latest_trees_scores is None:
+                rospy.sleep(0.05)
+            scores = self.latest_trees_scores.copy()
+            # Update both lambda arrays using the bayes update.
+            if (mpciter % 2 == 0): self.lambda_k = self.bayes_decay(self.lambda_k, ca.DM(scores), unseen_timers)
+            #rospy.loginfo("Current state x_k: %s", x_k)
+            #rospy.loginfo("Lambda Ripe: %s", self.lambda_k_ripe)
+            #rospy.loginfo("Lambda Raw: %s", self.lambda_k_raw)
+            #rospy.loginfo("Current tree scores: %s", lambda_score.full().flatten())
+
+            # Publish tree markers using the helper function from sensors.py.
+            tree_markers_msg = create_tree_markers(self.trees_pos, self.lambda_k.full().flatten())
+            self.tree_markers_pub.publish(tree_markers_msg)
+            # --- Select Trees ---
+            robot_position_xy = np.array(current_state[:2])
+            target_indices = range(self.NUM_TARGET_TREES)# self.get_target_tree_indices(robot_position_xy, num_target=self.NUM_TARGET_TREES)
+            obstacle_indices = self.get_nearest_tree_indices(robot_position_xy, num_obstacle=self.NUM_OBSTACLE_TREES)
+
+            target_trees_subset = self.trees_pos[target_indices]
+            obstacle_trees_subset = self.trees_pos[obstacle_indices]
+
+            # Get corresponding lambda values for TARGET trees
+            target_lambdas = self.lambda_k[target_indices]
+
+            step_start_time = time.time()
+            try:
+                if warm_start or mpc_step is None:
+                    print("Running MPC opt (first step / cold start)...")
+                    mpc_step, u, x_traj, x_dec_prev, lam_g_prev = self.mpc_opt(
+                        g_nn, target_trees_subset, target_lambdas, obstacle_trees_subset, lb, ub, x_k, steps=self.N
                     )
-                ],
-                showactive=True,
-                x=0.1,
-                y=0
+                    warm_start = False
+                    print("MPC opt finished.")
+                else:
+                    print("Running MPC step (warm start)...")
+                    # Construct parameter vector for mpc_step
+                    P0_val = ca.vertcat(
+                        x_k,
+                        ca.reshape(target_trees_subset, 2* self.NUM_TARGET_TREES, 1),
+                        target_lambdas,
+                        ca.reshape(obstacle_trees_subset, 2* self.NUM_OBSTACLE_TREES, 1)
+                    )
+                    # Call the compiled MPC step function
+                    u, x_traj, x_dec_prev, lam_g_prev = mpc_step(P0_val, x_dec_prev, lam_g_prev)
+                    print("MPC step finished.")
+
+                step_duration = time.time() - step_start_time
+                durations.append(step_duration)
+                print(f"MPC step duration: {step_duration:.4f} s")
+
+            except Exception as e:
+                rospy.logerr(f"Error during MPC optimization at step {mpciter}: {e}")
+                # Implement fallback behavior (e.g., stop the robot, hover, use previous command)
+                u = ca.DM.zeros(self.n_control) # Command zero acceleration
+                x_traj = ca.repmat(x_k, 1, self.N + 1) # Predict staying still
+                warm_start = True # Force re-optimization next time
+                print("!!! MPC Solver Failed - Commanding Zero Acceleration !!!")
+                return
+
+            durations.append(time.time() - step_start_time)
+            # Log the MPC velocity command.
+            u_np = np.array(u.full()).flatten()
+
+            # Compute the command pose.
+            cmd_pose = F_(x_k, u[:, 0])
+
+            # Publish predicted path.
+            predicted_path_msg = create_path_from_mpc_prediction(x_traj[:self.nx, 1:])
+            self.pred_path_pub.publish(predicted_path_msg)
+
+            # Build and publish the cmd_pose message.
+            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(cmd_pose[2]))
+            cmd_pose_msg = Pose()
+            cmd_pose_msg.position = Point(x=float(cmd_pose[0]), y=float(cmd_pose[1]), z=0.0)
+            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                  y=quaternion[1],
+                                                  z=quaternion[2],
+                                                  w=quaternion[3])
+            self.cmd_pose_pub.publish(cmd_pose_msg)
+
+            vx_k = cmd_pose[self.nx:]
+            velocity_command_log.append([current_sim_time, "MPC", vx_k[0], vx_k[1], vx_k[2]])
+
+            # Update metrics.
+            vx_val = float(vx_k[0])
+            vy_val = float(vx_k[1])
+            yaw_val = float(vx_k[2])
+            sum_vx += vx_val
+            sum_vy += vy_val
+            sum_yaw += yaw_val
+            trans_speed = math.sqrt(vx_val**2 + vy_val**2)
+            sum_trans_speed += trans_speed
+            total_commands += 1
+
+            curr_x = float(x_traj[0, 1])
+            curr_y = float(x_traj[1, 1])
+            distance_step = math.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+            total_distance += distance_step
+            prev_x, prev_y = curr_x, curr_y
+
+            entropy_k = self.entropy_entire_field(self.lambda_k)
+            lambda_history.append(self.lambda_k.full().flatten().tolist())
+            entropy_history.append(ca.sum1(entropy_k).full().flatten()[0])
+            all_trajectories.append(x_traj[:self.nx, :].full())
+
+            mpciter += 1
+            rospy.loginfo("Entropy: %s", entropy_history[-1])
+
+            # Ensure loop runs at desired rate (approx self.dt)
+            loop_elapsed = time.time() - loop_iter_start
+            sleep_time = self.dt - loop_elapsed
+            current_state = None
+            if sleep_time > 0:
+                rate.sleep() # Use ROS rate limiter
+            else:
+                 print(f"Warning: Loop iteration {mpciter} took {loop_elapsed:.4f}s, longer than dt={self.dt}s")
+
+            rospy.sleep(0.1) 
+        # ---------------------------
+        # Final Metrics Calculation and CSV Output
+        # ---------------------------
+        total_execution_time = time.time() - sim_start_time
+        avg_wp_time = total_execution_time / total_commands if total_commands > 0 else 0.0
+        avg_vx = sum_vx / total_commands if total_commands > 0 else 0.0
+        avg_vy = sum_vy / total_commands if total_commands > 0 else 0.0
+        avg_yaw = sum_yaw / total_commands if total_commands > 0 else 0.0
+        avg_trans_speed = sum_trans_speed / total_commands if total_commands > 0 else 0.0
+
+
+        os.makedirs(self.baselines_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        perf_csv = os.path.join(self.baselines_dir, f"mpc_{timestamp}_performance_metrics.csv")
+        with open(perf_csv, mode='w', newline='') as perf_file:
+            headers = [
+                "Total Execution Time (s)",
+                "Total Distance (m)",
+                "Average Waypoint-to-Waypoint Time (s)",
+                "Final Entropy",
+                "Total Commands"
+            ]
+
+            values = [
+                total_execution_time,
+                total_distance,
+                avg_wp_time,
+                entropy_history[-1] if entropy_history else "N/A",
+                total_commands
+            ]
+
+            writer = csv.writer(perf_file)
+            # Write data as columns: one label per row with its value
+            for label, value in zip(headers, values):
+                writer.writerow([label, value])
+
+        vel_csv = os.path.join(self.baselines_dir, f"mpc_{timestamp}_velocity_commands.csv")
+        with open(vel_csv, mode='w', newline='') as vel_file:
+            writer = csv.writer(vel_file)
+            writer.writerow(["Time (s)", "Tag", "x_velocity", "y_velocity", "yaw_velocity"])
+            writer.writerows(velocity_command_log)
+
+        rospy.loginfo("Performance metrics saved to %s", perf_csv)
+        rospy.loginfo("Velocity command log saved to %s", vel_csv)
+
+        plot_csv = os.path.join(self.baselines_dir, f"mpc_{timestamp}_plot_data.csv")
+        with open(plot_csv, mode='w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            tree_positions_flat = self.trees_pos.flatten().tolist()
+            writer.writerow(["tree_positions"] + tree_positions_flat)
+            header = ["time", "x", "y", "theta", "entropy"]
+            if lambda_history and len(lambda_history[0]) > 0:
+                num_trees = len(lambda_history[0])
+                header += [f"lambda_{i}" for i in range(num_trees)]
+            writer.writerow(header)
+            for i in range(len(time_history)):
+                time_val = time_history[i]
+                x, y, theta = np.array(pose_history[i]).flatten()
+                entropy_val = entropy_history[i]
+                lambda_vals = lambda_history[i]
+                row = [time_val, x, y, theta, entropy_val] + lambda_vals
+                writer.writerow(row)
+        rospy.loginfo("Plot data saved to %s", plot_csv)
+
+
+        # ---------------------------------------------------
+        # Save individual Bayesian‐belief (λ) trends per tree
+        # ---------------------------------------------------
+        trends_dir = os.path.join(self.baselines_dir, "bayes_trends")
+        os.makedirs(trends_dir, exist_ok=True)
+        # number of trees = length of one λ‐history entry
+        num_trees = len(lambda_history[0]) if lambda_history else 0
+        for tree_idx in range(num_trees):
+            trend_csv = os.path.join(
+                trends_dir,
+                f"bayes_trend_tree_{tree_idx}_{timestamp}.csv"
             )
-        ],
-        sliders=[{
-            "active": 0,
-            "yanchor": "top",
-            "xanchor": "left",
-            "currentvalue": {
-                "font": {"size": 20},
-                "prefix": "Frame:",
-                "visible": True,
-                "xanchor": "right"
-            },
-            "transition": {"duration": 50, "easing": "cubic-in-out"},
-            "pad": {"b": 10, "t": 50},
-            "len": 0.9,
-            "x": 0.1,
-            "y": 0,
-            "steps": [
-                {
-                    "args": [[f.name], {"frame": {"duration": 50, "redraw": True}, "mode": "immediate"}],
-                    "label": str(k),
-                    "method": "animate",
-                }
-                for k, f in enumerate(frames)
-            ],
-        }]
-    )
+            with open(trend_csv, mode='w', newline='') as trend_file:
+                writer = csv.writer(trend_file)
+                # header: time + this tree's λ
+                writer.writerow(["time_s", f"lambda_tree_{tree_idx}"])
+                # dump each time step
+                for t_val, lambdas in zip(time_history, lambda_history):
+                    writer.writerow([t_val, lambdas[tree_idx]])
+            rospy.loginfo(
+                "Bayesian trend for tree %d saved to %s",
+                tree_idx, trend_csv
+            )
+        return all_trajectories, entropy_history, lambda_history, durations, g_nn, self.trees_pos, lb, ub
 
-    # Show and save the figure.
-    fig.show()
-    fig.write_html('neural_mpc_results.html')
-    return entropy_mpc_pred
-
+# ---------------------------
+# Main Execution
+# ---------------------------
+if __name__ == "__main__":
+    mpc = NeuralMPC()
+    sim_results = mpc.run_simulation()

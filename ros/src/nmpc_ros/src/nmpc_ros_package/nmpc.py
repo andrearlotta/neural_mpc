@@ -40,7 +40,6 @@ class MultiLayerPerceptron(torch.nn.Module):
 
     def __init__(self, input_dim, hidden_size=64, hidden_layers=3):
         super().__init__()
-        # If input_dim==3 we add an extra input for sin/cos of the angle.
         in_features = input_dim if input_dim != 3 else input_dim + 1
         self.input_layer = torch.nn.Linear(in_features, hidden_size)
         self.hidden_layer = torch.nn.ModuleList(
@@ -49,8 +48,7 @@ class MultiLayerPerceptron(torch.nn.Module):
         self.out_layer = torch.nn.Linear(hidden_size, 1)
 
     def forward(self, x):
-        # If the last dimension is 3, assume the third element is an angle
-        # and replace it with its sin and cos.
+
         if x.shape[-1] == 3:
             sin_cos = torch.cat([torch.sin(x[..., -1:]), torch.cos(x[..., -1:])], dim=-1)
             x = torch.cat([x[..., :-1], sin_cos], dim=-1)
@@ -70,7 +68,7 @@ class NeuralMPC:
         self.hidden_layers = 3
         self.nn_input_dim = 3
 
-        self.N = 10
+        self.N = 5
         self.dt = 0.2
         self.T = self.dt * self.N
         self.nx = 3  # Represents [x, y, theta]
@@ -90,11 +88,11 @@ class NeuralMPC:
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         # Subscribers
-        rospy.Subscriber("agent_0/tree_scores", Float32MultiArray, self.tree_scores_callback)
+        rospy.Subscriber("tree_scores", Float32MultiArray, self.tree_scores_callback)
         # Publishers
-        self.cmd_pose_pub = rospy.Publisher("agent_0/cmd/pose", Pose, queue_size=10)
-        self.pred_path_pub = rospy.Publisher("agent_0/predicted_path", Path, queue_size=10)
-        self.tree_markers_pub = rospy.Publisher("agent_0/tree_markers", MarkerArray, queue_size=10)
+        self.cmd_pose_pub = rospy.Publisher("cmd/pose", Pose, queue_size=10)
+        self.pred_path_pub = rospy.Publisher("predicted_path", Path, queue_size=10)
+        self.tree_markers_pub = rospy.Publisher("tree_markers", MarkerArray, queue_size=10)
 
         # Get tree positions from service using the sensors.py serializer logic.
         self.trees_pos = self.get_trees_poses()
@@ -346,7 +344,7 @@ class NeuralMPC:
             opti.subject_to(opti.bounded(lb[0] - 3.0, X[0, i], ub[0] + 3.0))
             opti.subject_to(opti.bounded(lb[1] - 3.0, X[1, i], ub[1] + 3.0))
             opti.subject_to(opti.bounded(-3*np.pi, X[2, i], +3*np.pi))
-            opti.subject_to(opti.bounded(-2.0, X[3:5, i], 2.0))
+            opti.subject_to(opti.bounded(-1.75, X[3:5, i], 1.75))
             opti.subject_to(opti.bounded(-np.pi/4, X[5, i], np.pi/4))
 
             opti.subject_to(opti.bounded(-5.0, U[0:2, i], 5.0))
@@ -369,7 +367,6 @@ class NeuralMPC:
                 nn_batch.append(ca.horzcat(diff.T, heading_target))
             ca_batch.append(ca.vcat([*nn_batch]))
 
-            # Find the minimum squ10.0ed distance
             Q_dist = 10.0
             R_xy = 1e-2
             R_theta = 1e-2
@@ -400,7 +397,7 @@ class NeuralMPC:
         min_sq_dist = ca.mmin(sq_dist_to_targets)
 
         # 2. Define sigmoid parameters
-        threshold_sq_dist = 9.0
+        threshold_sq_dist = 81.0
         sigmoid_steepness = 10.0
         # 3. Calculate the sigmoid factor
         # This factor smoothly goes from ~0 (when min_sq_dist << 12) to ~1 (when min_sq_dist >> 12)
@@ -424,7 +421,7 @@ class NeuralMPC:
                 "linear_solver": 'ma27',
                 "hessian_approximation":'limited-memory',
                 "mu_strategy": "monotone",
-                "max_iter": 500,
+                "max_iter": 1000,
             }
         }
         opti.solver("ipopt", options)
@@ -539,7 +536,7 @@ class NeuralMPC:
         prev_x = float(x_k[0])
         prev_y = float(x_k[1])
 
-        sim_time = 5600  # Total simulation time in seconds
+        sim_time = 6000  # Total simulation time in seconds
         mpciter = 0
         rate = rospy.Rate(int(1/self.dt))
         warm_start = True
@@ -566,7 +563,7 @@ class NeuralMPC:
                 rospy.sleep(0.05)
             scores = self.latest_trees_scores.copy()
             # Update both lambda arrays using the bayes update.
-            self.lambda_k = self.bayes(self.lambda_k, ca.DM(scores))
+            if (mpciter % 2 == 0): self.lambda_k = self.bayes(self.lambda_k, ca.DM(scores))
             #rospy.loginfo("Current state x_k: %s", x_k)
             #rospy.loginfo("Lambda Ripe: %s", self.lambda_k_ripe)
             #rospy.loginfo("Lambda Raw: %s", self.lambda_k_raw)
@@ -613,20 +610,20 @@ class NeuralMPC:
                 print(f"MPC step duration: {step_duration:.4f} s")
 
             except Exception as e:
-                print(1/0)
                 rospy.logerr(f"Error during MPC optimization at step {mpciter}: {e}")
                 # Implement fallback behavior (e.g., stop the robot, hover, use previous command)
                 u = ca.DM.zeros(self.n_control) # Command zero acceleration
                 x_traj = ca.repmat(x_k, 1, self.N + 1) # Predict staying still
                 warm_start = True # Force re-optimization next time
                 print("!!! MPC Solver Failed - Commanding Zero Acceleration !!!")
+                return
 
             durations.append(time.time() - step_start_time)
             # Log the MPC velocity command.
             u_np = np.array(u.full()).flatten()
 
             # Compute the command pose.
-            cmd_pose = F_(x_k, u[:, 0]*0.9)
+            cmd_pose = F_(x_k, u[:, 0])
 
             # Publish predicted path.
             predicted_path_msg = create_path_from_mpc_prediction(x_traj[:self.nx, 1:])
@@ -749,294 +746,9 @@ class NeuralMPC:
 
         return all_trajectories, entropy_history, lambda_history, durations, g_nn, self.trees_pos, lb, ub
 
-    # ---------------------------
-    # Plotting Function
-    # ---------------------------
-    def plot_animated_trajectory_and_entropy_2d(self, all_trajectories, entropy_history, lambda_history, trees, lb, ub, computation_durations):
-        # Load both neural network models for plotting.
-        model = MultiLayerPerceptron(input_dim=self.nn_input_dim,
-                                         hidden_size=self.hidden_size,
-                                         hidden_layers=self.hidden_layers)
-        model.load_state_dict(torch.load(self.get_latest_best_model(), weights_only=True))
-        model.eval()
-        g_nn = l4c.L4CasADi(model, name='plotting_f_ripe', batched=True, device='cuda')
-
-        x_trajectory = np.array([traj[0] for traj in all_trajectories])
-        y_trajectory = np.array([traj[1] for traj in all_trajectories])
-        theta_trajectory = np.array([traj[2] for traj in all_trajectories])
-        all_trajectories = np.array(all_trajectories)
-        lambda_history = np.array(lambda_history)
-
-        # Compute predicted entropy reduction using the two NNs.
-        entropy_mpc_pred = []
-        for k in range(all_trajectories.shape[0]):
-            lambda_k = ca.DM(lambda_history[k])
-            entropy_mpc_pred_k = [entropy_history[k]]
-            for i in range(all_trajectories.shape[2]-1):
-                state_pred = all_trajectories[k, :, i+1]
-                rel_pos = np.tile(state_pred[:2], (trees.shape[0], 1)) - trees
-                distance = np.sqrt(np.sum(rel_pos**2, axis=1))
-                theta_val = state_pred[2]
-                input_nn = ca.horzcat(ca.DM(rel_pos), ca.DM([[theta_val]]*trees.shape[0]))
-                nn_val = ca.fmax(g_nn(input_nn), 0.5)
-                lambda_initial = np.array(lambda_history[k]).flatten()
-                nn_np = np.array(nn_val.full()).flatten()
-                z_vals = np.where(distance > 10, 0.5, z_vals)
-                z_dm = ca.DM(z_vals)
-                lambda_k = self.bayes(lambda_k, z_dm)
-                current_entropy = ca.sum1(self.entropy_entire_field(lambda_k)).full().flatten()[0]
-                entropy_mpc_pred_k.append(current_entropy)
-            entropy_mpc_pred.append(entropy_mpc_pred_k)
-        entropy_mpc_pred = np.array(entropy_mpc_pred)
-        sum_entropy_history = entropy_history
-        cumulative_durations = np.cumsum(computation_durations)
-
-        # Create the figure.
-        fig = make_subplots(
-            rows=2, cols=2,
-            column_widths=[0.7, 0.3],
-            row_heights=[0.6, 0.4],
-            specs=[
-                [{"type": "scatter"}, {"type": "scatter"}],
-                [{"type": "scatter"}, {"type": "scatter"}]
-            ]
-        )
-
-        # MPC predicted trajectory.
-        fig.add_trace(
-            go.Scatter(
-                x=x_trajectory[0],
-                y=y_trajectory[0],
-                mode="lines+markers",
-                name="MPC Future Trajectory",
-                line=dict(width=4),
-                marker=dict(size=5)
-            ),
-            row=1, col=1
-        )
-        # Drone trajectory (empty initially).
-        fig.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines+markers",
-                name="Drone Trajectory",
-                line=dict(width=4),
-                marker=dict(size=5)
-            ),
-            row=1, col=1
-        )
-
-        # Add tree markers.
-        for i in range(trees.shape[0]):
-            fig.add_trace(
-                go.Scatter(
-                    x=[trees[i, 0]],
-                    y=[trees[i, 1]],
-                    mode="markers+text",
-                    marker=dict(size=10, color=lambda_history[0][i], colorscale=[[0, "#00FF00"], [1, "#FF0000"]]),
-                    name=f"Tree {i}: {lambda_history[0][i]:.2f}",
-                    text=[str(i)],
-                    textposition="top center"
-                ),
-                row=1, col=1
-            )
-
-        fig.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines+markers",
-                name="Sum of Entropies (Past)",
-                line=dict(width=2),
-                marker=dict(size=5)
-            ),
-            row=1, col=2
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines+markers",
-                name="Sum of Entropies (Future)",
-                line=dict(width=2, dash="dot"),
-                marker=dict(size=5)
-            ),
-            row=1, col=2
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines+markers",
-                name="Computation Durations",
-                line=dict(width=2),
-                marker=dict(size=5)
-            ),
-            row=2, col=2
-        )
-
-        # Build animation frames.
-        frames = []
-        for k in range(len(entropy_mpc_pred)):
-            tree_data = []
-            for i in range(trees.shape[0]):
-                tree_data.append(
-                    go.Scatter(
-                        x=[trees[i, 0]],
-                        y=[trees[i, 1]],
-                        mode="markers+text",
-                        marker=dict(size=10, color=lambda_history[k][i], colorscale=[[0, "#00FF00"], [1, "#FF0000"]]),
-                        name=f"Tree {i}: {lambda_history[k][i]:.2f}",
-                        text=[str(i)],
-                        textposition="top center"
-                    )
-                )
-            sum_entropy_past = sum_entropy_history[:k+1]
-            sum_entropy_future = entropy_mpc_pred[k]
-            computation_durations_past = computation_durations[:k+1]
-
-            x_start = x_trajectory[k]
-            y_start = y_trajectory[k]
-            theta_val = theta_trajectory[k]
-            x_end = x_start + 0.5 * np.cos(theta_val)
-            y_end = y_start + 0.5 * np.sin(theta_val)
-            list_of_actual_orientations = []
-            for x0, y0, x1, y1 in zip(x_start, y_start, x_end, y_end):
-                arrow = go.layout.Annotation(
-                    dict(
-                        x=x1, y=y1,
-                        xref="x", yref="y",
-                        showarrow=True,
-                        ax=x0, ay=y0,
-                        arrowhead=3, arrowwidth=1.5,
-                        arrowcolor="red",
-                    )
-                )
-                list_of_actual_orientations.append(arrow)
-            for x0, y0, x1, y1 in zip(x_trajectory[:k+1, 0],
-                                        y_trajectory[:k+1, 0],
-                                        x_trajectory[:k+1, 0] + 0.5 * np.cos(theta_trajectory[:k+1, 0]),
-                                        y_trajectory[:k+1, 0] + 0.5 * np.sin(theta_trajectory[:k+1, 0])):
-                arrow = go.layout.Annotation(
-                    dict(
-                        x=x1, y=y1,
-                        xref="x", yref="y",
-                        showarrow=True,
-                        ax=x0, ay=y0,
-                        arrowhead=3, arrowwidth=1.5,
-                        arrowcolor="orange",
-                    )
-                )
-                list_of_actual_orientations.append(arrow)
-
-            frame = go.Frame(
-                data=[
-                    go.Scatter(
-                        x=x_trajectory[k],
-                        y=y_trajectory[k],
-                        mode="lines+markers",
-                        line=dict(width=4),
-                        marker=dict(size=5)
-                    ),
-                    go.Scatter(
-                        x=x_trajectory[:k+1, 0],
-                        y=y_trajectory[:k+1, 0],
-                        mode="lines+markers",
-                        line=dict(width=4),
-                        marker=dict(size=5)
-                    ),
-                    *tree_data,
-                    go.Scatter(
-                        x=np.arange(len(sum_entropy_past)),
-                        y=sum_entropy_past,
-                        mode="lines+markers",
-                        line=dict(width=2),
-                        marker=dict(size=5)
-                    ),
-                    go.Scatter(
-                        x=np.arange(k, k+len(sum_entropy_future)),
-                        y=sum_entropy_future,
-                        mode="lines+markers",
-                        line=dict(width=2, dash="dot"),
-                        marker=dict(size=5)
-                    ),
-                    go.Scatter(
-                        x=np.arange(len(computation_durations_past)),
-                        y=computation_durations_past,
-                        mode="lines+markers",
-                        line=dict(width=2),
-                        marker=dict(size=5)
-                    )
-                ],
-                name=f"Frame {k}",
-                layout=dict(annotations=list_of_actual_orientations)
-            )
-            frames.append(frame)
-
-        fig.frames = frames
-        fig.update_layout(
-            title="Drone Trajectory, Sum of Entropies, and Computation Durations",
-            xaxis=dict(title="X Position", range=[lb[0] - 3, ub[0] + 3]),
-            yaxis=dict(title="Y Position", range=[lb[1] - 3, ub[1] + 3]),
-            xaxis2=dict(title="Time Step"),
-            yaxis2=dict(title="Sum of Entropies"),
-            xaxis3=dict(title="Time Step"),
-            yaxis3=dict(title="Computation Duration (s)"),
-            updatemenus=[
-                dict(
-                    type="buttons",
-                    buttons=[
-                        dict(
-                            label="Play",
-                            method="animate",
-                            args=[None, {"frame": {"duration": 200, "redraw": True}, "fromcurrent": True}]
-                        ),
-                        dict(
-                            label="Pause",
-                            method="animate",
-                            args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}]
-                        )
-                    ],
-                    showactive=True,
-                    x=0.1,
-                    y=0
-                )
-            ],
-            sliders=[{
-                "active": 0,
-                "yanchor": "top",
-                "xanchor": "left",
-                "currentvalue": {
-                    "font": {"size": 20},
-                    "prefix": "Frame:",
-                    "visible": True,
-                    "xanchor": "right"
-                },
-                "transition": {"duration": 50, "easing": "cubic-in-out"},
-                "pad": {"b": 10, "t": 50},
-                "len": 0.9,
-                "x": 0.1,
-                "y": 0,
-                "steps": [
-                    {
-                        "args": [[f.name], {"frame": {"duration": 50, "redraw": True}, "mode": "immediate"}],
-                        "label": str(k),
-                        "method": "animate",
-                    }
-                    for k, f in enumerate(frames)
-                ],
-            }]
-        )
-        fig.show()
-        fig.write_html('neural_mpc_results.html')
-        return entropy_mpc_pred
-
 # ---------------------------
 # Main Execution
 # ---------------------------
 if __name__ == "__main__":
     mpc = NeuralMPC()
     sim_results = mpc.run_simulation()
-    # Optionally, call the plotting method:
-    # mpc.plot_animated_trajectory_and_entropy_2d(*sim_results[:-4], computation_durations=sim_results[3])

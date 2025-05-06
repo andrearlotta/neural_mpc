@@ -46,9 +46,9 @@ def load_csv_data(csv_path):
 
 def main():
     # Define baseline modes and directories
-    modes = ["greedy", "trees_to_trees"]
+    modes = ["mpc"] #tree_to_tree, greedy, between_rows
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    baselines_dir = os.path.join(script_dir, "test_for_creating_plot")  # Adjust directory path if needed
+    baselines_dir = "csv_plot_path"
 
     # Create a custom colormap for tree lambda visualization:
     # Red for 0, Yellow for 0.5, and Green for 1.
@@ -138,10 +138,10 @@ def main():
         ax_traj.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=3)
 
         algorithm_labels = {
-            "trees_to_trees": "Linear Path",
+            "tree_to_tree": "Linear Path",
             "greedy": "Greedy Approach",
             "between_rows" : "Mower Path",
-            "mpc": "Model Predictive Control",
+            "mpc": "Neural Model Predictive Control",
             # Add additional mappings as needed
         }
         label = algorithm_labels.get(mode, mode)  
@@ -150,7 +150,7 @@ def main():
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
         # Save figure with a filename that includes the algorithm (mode) name
-        output_path = os.path.join(baselines_dir, f"{mode}_baseline_comparison.png")
+        output_path = os.path.join(baselines_dir, f"{mode}_baseline_comparison.eps")
         plt.savefig(output_path)
         print(f"Saved comparison plot for {mode} to: {output_path}")
 

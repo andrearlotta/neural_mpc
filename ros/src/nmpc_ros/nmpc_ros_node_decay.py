@@ -1,6 +1,26 @@
-from nmpc_ros_package.nmpc_decay  import run_simulation, plot_animated_trajectory_and_entropy_2d
+from nmpc_ros_package.nmpc_decay  import NeuralMPC
+import os
+import re
 
 if __name__ == '__main__':
-    # Run the simulation with the default parameters
-    all_trajectories, entropy_history, lambda_history, durations, g_nn, trees_pos, lb, ub = run_simulation()
-    entropy_mpc_pred = plot_animated_trajectory_and_entropy_2d(all_trajectories, entropy_history, lambda_history, trees_pos, lb, ub, durations)
+    N_tests = 1
+    for test_num in range(0,N_tests):
+        # Base folder to store all test run outputs.
+        base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decay_test_9trees")
+        os.makedirs(base_test_folder, exist_ok=True)
+
+        # Find the next test number
+        existing_runs = [
+            int(match.group(1)) for d in os.listdir(base_test_folder)
+            if (match := re.match(r'run_(\d+)', d)) and os.path.isdir(os.path.join(base_test_folder, d))
+        ]
+        next_test_num = max(existing_runs, default=0) + 1
+
+        # Create run folder
+        run_folder = os.path.join(base_test_folder, f"run_{next_test_num}")
+        os.makedirs(run_folder, exist_ok=True)
+        print(f"================== Starting Test Run {next_test_num} ==================")
+
+        mpc = NeuralMPC(run_dir=run_folder, initial_randomic=True)
+        # Run the simulation with the specified initial state and output folder.
+        mpc.run_simulation()

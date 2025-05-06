@@ -9,6 +9,6 @@
   <include file="$(find yolov7_ros)/launch/yolov7.launch"/>
 
   <node name="data_association_node" pkg="nmpc_ros" type="data_association_node.py" output="screen"
-        launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@'" /> 
-  <node name="baseline_node" pkg="nmpc_ros" type="baseline_node.py" output="screen"/>
+        launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@'" ns="agent_0" /> 
+  <node name="baseline_node" pkg="nmpc_ros" type="baseline_node.py" output="screen" ns="agent_0"/>
 </launch>

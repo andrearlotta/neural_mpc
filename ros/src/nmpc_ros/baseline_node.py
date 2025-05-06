@@ -113,8 +113,8 @@ class TrajectoryGenerator:
 
         self.is_mower =( self.trajectory_type == 'between_rows')
         # Initialize PID controllers.
-        self.pid_controller_x = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
-        self.pid_controller_y = PIDController(kp=3.0 if self.is_mower else 3.0, kd=1)
+        self.pid_controller_x = PIDController(kp=3.0 if self.is_mower else 7.0, kd=1)
+        self.pid_controller_y = PIDController(kp=3.0 if self.is_mower else 7.0, kd=1)
         self.pid_controller_yaw = PIDController(kp=3.0 if self.is_mower else .25, kd=0.1)
 
         self.idx = None
@@ -136,7 +136,7 @@ class TrajectoryGenerator:
             "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
         })
 
-        self.max_velocity = 0.95 if self.is_mower else 2.0         # Maximum velocity of the robot
+        self.max_velocity = 0.45 if self.is_mower else 3.0         # Maximum velocity of the robot
         self.max_yaw_velocity = np.pi/4      # Maximum yaw velocity (rad/s)
 
         self.dt = 0.1
@@ -145,7 +145,7 @@ class TrajectoryGenerator:
         # Maximum time allowed for observation around a tree (in seconds)
         self.max_observe_time = 30.0
         self.rate = rospy.Rate(int(1 / self.dt))
-        self.measurement_timer = rospy.Timer(rospy.Duration(0.5), self.measurement_callback)
+        self.measurement_timer = rospy.Timer(rospy.Duration(0.4), self.measurement_callback)
         while self.bridge.get_data()["tree_scores"] is None:
             pass
 
@@ -359,7 +359,7 @@ class TrajectoryGenerator:
         self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
         phi = math.atan2(self.y - center_y, self.x - center_x)
         radius = np.sqrt((self.x - center_x) ** 2 + (self.y - center_y) ** 2)
-        delta_phi = self.dt * 14 * math.pi / 180  # Angular increment (in radians)
+        delta_phi = self.dt * 15 * math.pi / 180  # Angular increment (in radians)
 
         while self.circle_tree_event.is_set():
             desired_x = center_x + radius * math.cos(phi)
@@ -742,12 +742,12 @@ if __name__ == '__main__':
     try:
         bridge = BridgeClass(SENSORS)
         # Initialize and run the trajectory generator
-        modes = ['greedy', 'tree_to_tree', 'between_rows']
+        modes = ['greedy']
         for mode in modes:
             for test_num in range(0, 2):
                 import re
                 # Define base folder
-                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"batch_test_25trees_{mode}")
+                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"batch_test_random_trees_{mode}_2")
                 os.makedirs(base_test_folder, exist_ok=True)
 
                 # Find the next test number

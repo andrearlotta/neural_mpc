@@ -29,17 +29,17 @@ class DataAssociationNode:
         self.publish_visualization = rospy.get_param('~publish_visualization', True)
 
         detection_sub = message_filters.Subscriber("/yolov7/detect", Detection2DArray)
-        depth_image_sub = message_filters.Subscriber("agent_0/camera/depth/image/compressed", CompressedImage)
+        depth_image_sub = message_filters.Subscriber("camera/depth/image/compressed", CompressedImage)
 
         self.ts = message_filters.ApproximateTimeSynchronizer([detection_sub, depth_image_sub], queue_size=10, slop=0.2)
         self.ts.registerCallback(self.synchronized_callback)
 
-        self.camera_info_sub = rospy.Subscriber("agent_0/camera/depth/camera_info", CameraInfo, self.camera_info_callback)
-        self.scores_pub = rospy.Publisher("agent_0/tree_scores", Float32MultiArray, queue_size=1)
+        self.camera_info_sub = rospy.Subscriber("camera/depth/camera_info", CameraInfo, self.camera_info_callback)
+        self.scores_pub = rospy.Publisher("tree_scores", Float32MultiArray, queue_size=1)
         
         if self.publish_visualization:
-            self.marker_scores_pub = rospy.Publisher("agent_0/scores_markers", MarkerArray, queue_size=1)
-            self.marker_fruits_pub = rospy.Publisher("agent_0/fruits_markers", MarkerArray, queue_size=1)
+            self.marker_scores_pub = rospy.Publisher("scores_markers", MarkerArray, queue_size=1)
+            self.marker_fruits_pub = rospy.Publisher("fruits_markers", MarkerArray, queue_size=1)
         
         self.cam_model = PinholeCameraModel()
         self.tf_listener = tf.TransformListener()

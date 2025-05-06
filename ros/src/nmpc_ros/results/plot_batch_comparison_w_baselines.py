@@ -108,14 +108,14 @@ def gather_metrics(base_dir):
 
         perf_files = glob.glob(os.path.join(run, "*performance_metrics.csv"))
         if not perf_files:
-            # print(f"  - No performance metrics CSV found in {run}") # Reduce noise
+            print(f"  - No performance metrics CSV found in {run}") # Reduce noise
             continue
 
         perf_file = perf_files[0]
         perf = load_performance_metrics(perf_file)
 
         if perf is None:
-             # print(f"  - Failed to load performance metrics from {perf_file}") # Reduce noise
+             print(f"  - Failed to load performance metrics from {perf_file}") # Reduce noise
              continue
 
         # --- This run has valid metrics, proceed ---
@@ -470,12 +470,12 @@ def plot_comparison_metrics(all_metrics, test_counts):
     # Use the collected handles and labels for a single, unified legend
     if legend_handles: # Check if we collected any handles
          fig.legend(handles=legend_handles, labels=legend_labels,
-                   loc='upper center', ncol=min(num_algorithms, 4),
+                   loc='upper center', ncol=num_algorithms,
                    bbox_to_anchor=(0.5, 0.96), fontsize='medium')
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.92]) # Adjust rect for suptitle and legend
 
-    plot_filename = "comparison_performance_summary_clipped.png"
+    plot_filename = "comparison_performance_summary_clipped_random_trees.eps"
     try:
         plt.savefig(plot_filename)
         print(f"\nSaved comparison plot: {plot_filename}")
@@ -488,7 +488,7 @@ def plot_comparison_metrics(all_metrics, test_counts):
 # ============================================================================
 # --- export_summary_table remains the same ---
 # ... (function omitted for brevity) ...
-def export_summary_table(all_metrics, test_counts, output_path="summary_metrics_comparison.csv"):
+def export_summary_table(all_metrics, test_counts, output_path="summary_metrics_comparison_random_trees.csv"):
     """ Creates a CSV summary table with median, std, min, max. """
     rows = []
     algorithms = list(all_metrics.keys())
@@ -539,7 +539,7 @@ def export_summary_table(all_metrics, test_counts, output_path="summary_metrics_
 # --- __main__ block with updated dummy data ---
 if __name__ == "__main__":
     base_dirs_to_analyze = {
-        'mpc': 'mpc_test_runs_25_trees',
+        'neural mpc': 'mpc_test_runs_25_trees',
         'greedy': 'batch_test_25trees_greedy',
         'tree_to_tree': 'batch_test_25trees_tree_to_tree',
         'mower': 'batch_test_25trees_between_rows'
@@ -554,55 +554,6 @@ if __name__ == "__main__":
     velocity_header = "Time (s),Tag,x_velocity,y_velocity,yaw_velocity\n" # Added missing commas
 
     np.random.seed(42) # Make dummy data repeatable
-
-    for name, path in base_dirs_to_analyze.items():
-        if not os.path.exists(path):
-            print(f"Creating directory and dummy data for: {path}")
-            os.makedirs(path, exist_ok=True)
-            for i in range(1, 6): # Create 5 dummy runs
-                run_path = os.path.join(path, f"run_{i:03d}")
-                os.makedirs(run_path, exist_ok=True)
-
-                # --- Generate dummy performance data ---
-                exec_time = 100 + i*5 + np.random.randn()*10 * (1 if name != 'greedy' else 0.7) # Greedy faster
-                distance = 50 + i*3 + np.random.randn()*5 * (1 if name != 'mower' else 1.5) # Mower maybe longer dist
-                nmpc_time = 0.1 + np.random.rand()*0.05 * (1 if name != 'mpc' else 1.3) # MPC maybe slower steps
-                # Make mower entropy high, others lower
-                if name == 'mower':
-                     final_entropy = 6.5 + np.random.randn() * 0.5 # << High entropy for mower
-                else:
-                     final_entropy = 2.5 - i*0.1 + np.random.randn()*0.2 # Lower for others
-                commands = 300 + i*15 + np.random.randint(-20, 20)
-
-                perf_file = os.path.join(run_path, f"{name}_run{i}_perf.csv") # Simpler name
-                with open(perf_file, 'w') as f:
-                    f.write(metrics_content.format(
-                        max(10, exec_time), # Ensure non-negative
-                        max(5, distance),
-                        max(0.01, nmpc_time),
-                        max(0.1, final_entropy),
-                        max(50, commands)
-                    ))
-
-                # --- Generate dummy velocity data ---
-                vel_file = os.path.join(run_path, f"{name}_run{i}_vel.csv") # Simpler name
-                with open(vel_file, 'w') as f:
-                    f.write(velocity_header)
-                    # Make mower velocity higher/different for testing
-                    base_vel = 0.5
-                    if name == 'mower':
-                         base_vel = 0.8
-                    elif name == 'greedy':
-                         base_vel = 0.6
-
-                    for t in range(10): # More data points
-                        vx = base_vel + np.random.randn()*0.1 * (1 if i%2==0 else 1.2) # Add variation
-                        vy = np.random.randn()*0.05 * (1 if name != 'tree_to_tree' else 0.3) # tree_to_tree maybe wider turns
-                        # Introduce occasional missing value or non-numeric value? Maybe later.
-                        f.write(f"{t*0.2:.1f},cmd,{vx:.3f},{vy:.3f},{np.random.randn()*0.1:.3f}\n") # Note format string fixed
-
-        else:
-            print(f"Directory exists: {path}. Skipping dummy data creation.")
 
 
     # Run the full batch analysis

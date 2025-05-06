@@ -128,7 +128,7 @@ SENSORS = [
   {
     "name":  "gps",
     "type":  Pose,
-    "topic": "agent_0/pose",
+    "topic": "pose",
     "mode":  "sub",
     "serializer": lambda pose_msg: np.array([pose_msg.position.x, pose_msg.position.y, pose_msg.position.z,
                                           np.arctan2(2.0 * (pose_msg.orientation.w * pose_msg.orientation.z + pose_msg.orientation.x * pose_msg.orientation.y),
@@ -137,14 +137,14 @@ SENSORS = [
   { 
     "name":  "tree_scores",
     "type":  Float32MultiArray,
-    "topic": "agent_0/tree_scores",
+    "topic": "tree_scores",
     "mode":  "sub",
     "serializer": lambda array_msg: np.array(array_msg.data).reshape(-1,1),
   },
   { 
     "name":  "cmd_pose",
     "type":  Pose,
-    "topic": "agent_0/cmd/pose",
+    "topic": "cmd/pose",
     "mode":  "pub",
     "serializer":  lambda arr: Pose(position=Point(x=arr[0,0], y=arr[1,0], z=0.0), orientation=Quaternion(*tf.transformations.quaternion_from_euler(0, 0, arr[2,0]))),
   },
@@ -158,14 +158,14 @@ SENSORS = [
   {
       "name": "predicted_path",
       "type": Path,
-      "topic": "agent_0/predicted_path",
+      "topic": "predicted_path",
       "mode": "pub",
       "serializer": lambda arr: create_path_from_mpc_prediction(arr),
   },
   {
       "name": "tree_markers",
       "type": MarkerArray,
-      "topic": "agent_0/tree_markers",
+      "topic": "tree_markers",
       "mode": "pub",
       "serializer": lambda self: create_tree_markers(self["trees_pos"], self["lambda"]),
   },
