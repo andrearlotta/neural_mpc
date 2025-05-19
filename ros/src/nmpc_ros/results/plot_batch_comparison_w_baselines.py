@@ -5,14 +5,10 @@ import csv
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker # For formatting y-axis if needed
+import matplotlib.ticker as mticker 
 
-# Make plots look a bit nicer
 plt.style.use('seaborn-v0_8')
 
-# --- load_performance_metrics, load_average_velocity, gather_metrics ---
-# (Keep these functions as they were in the previous corrected version)
-# ... (functions omitted for brevity - assume they are the same as the previous answer) ...
 def load_performance_metrics(file_path):
     """ Loads performance metrics from a CSV file. """
     metrics = {}
@@ -23,7 +19,7 @@ def load_performance_metrics(file_path):
                 if len(row) >= 2:
                     key = row[0].strip()
                     try:
-                        # Handle potential whitespace or extra quotes
+                        
                         value_str = row[1].strip().strip('"').strip("'")
                         value = float(value_str)
                         metrics[key] = value
@@ -36,7 +32,7 @@ def load_performance_metrics(file_path):
     except Exception as e:
         print(f"Error reading performance metrics file {file_path}: {e}")
         return None
-    # Ensure required keys exist, even if they have to be NaN
+    
     required_keys = [
         "Total Execution Time (s)", "Total Distance (m)",
         "Average Waypoint-to-Waypoint Time (s)", "Final Entropy",
@@ -44,9 +40,7 @@ def load_performance_metrics(file_path):
     ]
     for rkey in required_keys:
         if rkey not in metrics:
-            # Keep Total Commands out of this example, maybe add it later if needed
-             #metrics[rkey] = np.nan
-             pass
+                         pass
     return metrics
 
 def load_average_velocity(vel_file_path):
@@ -54,15 +48,11 @@ def load_average_velocity(vel_file_path):
     try:
         df = pd.read_csv(vel_file_path)
         if df.empty or 'x_velocity' not in df.columns or 'y_velocity' not in df.columns:
-            # Check specifically for non-numeric before warning? Better to just try calculation.
-             # print(f"Warning: Velocity file {vel_file_path} is empty or missing required columns.")
-             pass # Let the calculation attempt handle non-numeric? Or check dtype?
-        
-        # Ensure velocity columns are numeric, coercing errors to NaN
+            pass
         df['x_velocity'] = pd.to_numeric(df['x_velocity'], errors='coerce')
         df['y_velocity'] = pd.to_numeric(df['y_velocity'], errors='coerce')
 
-        # Drop rows where essential velocity data became NaN
+        
         df.dropna(subset=['x_velocity', 'y_velocity'], inplace=True)
 
         if df.empty:
@@ -70,7 +60,7 @@ def load_average_velocity(vel_file_path):
             return np.nan
 
         df['Linear Velocity'] = np.sqrt(df['x_velocity']**2 + df['y_velocity']**2)
-        # Ensure Linear Velocity didn't somehow become NaN (shouldn't if x/y were valid)
+        
         df.dropna(subset=['Linear Velocity'], inplace=True)
         if df.empty:
              print(f"Warning: No valid linear velocities computed for {vel_file_path}.")
@@ -78,7 +68,7 @@ def load_average_velocity(vel_file_path):
              
         return df['Linear Velocity'].median()
     except FileNotFoundError:
-        # print(f"Warning: Velocity file not found: {vel_file_path}") # Reduces noise maybe
+        
         return np.nan
     except Exception as e:
         print(f"Error loading or processing velocity file {vel_file_path}: {e}")
@@ -96,29 +86,26 @@ def gather_metrics(base_dir):
         "Final Entropy": [],
         "Total Distance (m)": [],
         "Average Velocity (m/s)": [],
-        "Average NMPC Step Execution Time (s)": [] # From Waypoint-to-Waypoint time
+        "Average NMPC Step Execution Time (s)": [] 
     }
 
     tests_found_metrics = 0
-    # print(f"Processing {len(run_folders)} run folders in {base_dir}...") # Less verbose default
+    
     for run_idx, run in enumerate(run_folders):
-        # Optional: print progress if many runs
-        # if (run_idx + 1) % 10 == 0 or run_idx == 0 or run_idx == len(run_folders) - 1:
-        #      print(f"  Processing run {run_idx+1}/{len(run_folders)} in {base_dir}...")
 
         perf_files = glob.glob(os.path.join(run, "*performance_metrics.csv"))
         if not perf_files:
-            print(f"  - No performance metrics CSV found in {run}") # Reduce noise
+            print(f"  - No performance metrics CSV found in {run}")
             continue
 
         perf_file = perf_files[0]
         perf = load_performance_metrics(perf_file)
 
         if perf is None:
-             print(f"  - Failed to load performance metrics from {perf_file}") # Reduce noise
+             print(f"  - Failed to load performance metrics from {perf_file}")
              continue
 
-        # --- This run has valid metrics, proceed ---
+        
         tests_found_metrics += 1
 
         metrics_lists["Total Execution Time (s)"].append(perf.get("Total Execution Time (s)", np.nan))
@@ -128,7 +115,7 @@ def gather_metrics(base_dir):
 
         vel_files = glob.glob(os.path.join(run, "*_velocity_commands.csv"))
         if not vel_files:
-            # print(f"  - No velocity commands CSV found in {run}. Storing NaN for Avg Velocity.") # Reduce noise
+            
             metrics_lists["Average Velocity (m/s)"].append(np.nan)
         else:
              vel_file = vel_files[0]
@@ -137,34 +124,34 @@ def gather_metrics(base_dir):
 
     if tests_found_metrics > 0 :
         print(f"Processed {base_dir}: Found metrics in {tests_found_metrics}/{len(run_folders)} runs.")
-    # else: # Report if nothing found for an algorithm
-         # print(f"Processed {base_dir}: No runs with valid metrics found.")
+    
+         
 
     return metrics_lists, tests_found_metrics
 
 def compute_statistics(values):
     """ Removes NaNs/outliers (IQR), computes median, std, min, max. """
     arr = np.array(values, dtype=float)
-    arr = arr[~np.isnan(arr)] # Filter NaNs first!
+    arr = arr[~np.isnan(arr)] 
 
     if arr.size == 0:
         return np.nan, np.nan, np.nan, np.nan
 
-    # Handle case with very few data points where IQR might be zero or percentiles ill-defined
-    if arr.size < 4: # Need at least 4 points for robust IQR
-        # Fallback to simple stats without outlier removal for small samples
+    
+    if arr.size < 4: 
+        
          filtered_arr = arr
-         # print(f"Warning: compute_statistics received {arr.size} valid points. Skipping IQR outlier removal.")
+         
     else:
         q1 = np.percentile(arr, 25)
         q3 = np.percentile(arr, 75)
         iqr = q3 - q1
 
-        # Handle IQR == 0 case (all data points in middle are same)
+        
         if iqr == 0:
-            # Keep all non-NaN data if IQR is zero
-            lower_bound = q1 - 1e-9 # small tolerance
-            upper_bound = q3 + 1e-9 # small tolerance
+            
+            lower_bound = q1 - 1e-9 
+            upper_bound = q3 + 1e-9 
         else:
             lower_bound = q1 - 1.5 * iqr
             upper_bound = q3 + 1.5 * iqr
@@ -172,11 +159,11 @@ def compute_statistics(values):
         filtered_arr = arr[(arr >= lower_bound) & (arr <= upper_bound)]
 
     if filtered_arr.size == 0:
-        # This can happen if extreme outliers skew IQR bounds
+        
          print(f"Warning: Outlier filtering removed all {arr.size} data points. Returning NaN stats. Original data (first 5): {arr[:5]}")
          return np.nan, np.nan, np.nan, np.nan
 
-    # Calculate stats on the (potentially filtered) array
+    
     median_val = np.median(filtered_arr)
     std_val = np.std(filtered_arr)
     min_val = np.min(filtered_arr)
@@ -185,21 +172,21 @@ def compute_statistics(values):
     return median_val, std_val, min_val, max_val
 
 
-# --- plot_grouped_metrics (for single algo) remains the same ---
-# ... (function omitted for brevity) ...
+
+
 def plot_grouped_metrics(metrics_data, num_tests, algo_name="Algorithm"):
     """ Creates a figure with two subplots for a SINGLE algorithm's metrics. """
     group1_keys = ["Average Velocity (m/s)", "Final Entropy", "Average NMPC Step Execution Time (s)"]
     group2_keys = ["Total Execution Time (s)", "Total Distance (m)"]
 
-    def get_stats(keys): # Inner helper function
+    def get_stats(keys): 
         medians, stds, mins, maxs = [], [], [], []
         for key in keys:
             if key in metrics_data and metrics_data[key]:
-                # Use robust compute_statistics
+                
                 median, std, min_val, max_val = compute_statistics(metrics_data[key])
             else:
-                # print(f"Warning: No data for metric '{key}' for {algo_name}. Plotting as NaN.")
+                
                 median, std, min_val, max_val = np.nan, np.nan, np.nan, np.nan
             medians.append(median)
             stds.append(std)
@@ -214,12 +201,12 @@ def plot_grouped_metrics(metrics_data, num_tests, algo_name="Algorithm"):
     cmap1 = plt.get_cmap('Set2')
     cmap2 = plt.get_cmap('Set3')
 
-    # --- Group 1 Plot ---
+    
     x1 = np.arange(len(group1_keys))
-    # Use np arrays for easier handling of potential NaNs in yerr
+    
     plot_medians1 = np.array(medians1, dtype=float)
     plot_stds1 = np.array(stds1, dtype=float)
-    # Replace NaN std deviations with 0 for error bars (otherwise plotting might fail)
+    
     plot_stds1_safe = np.nan_to_num(plot_stds1)
 
     bars1 = ax1.bar(x1, plot_medians1, yerr=plot_stds1_safe, align='center', alpha=0.85,
@@ -239,18 +226,18 @@ def plot_grouped_metrics(metrics_data, num_tests, algo_name="Algorithm"):
 
     for i, bar in enumerate(bars1):
         height = bar.get_height()
-        median_val = plot_medians1[i] # Get the potentially NaN value
+        median_val = plot_medians1[i] 
         if not np.isnan(median_val):
-             text_y_pos = height + (plot_stds1_safe[i] * 1.05) # Place above error bar
+             text_y_pos = height + (plot_stds1_safe[i] * 1.05) 
              ax1.text(bar.get_x() + bar.get_width()/2., text_y_pos,
                      f"{median_val:.2f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
-             # Add min/max below main value if height allows
-             if height > 0: # Avoid cluttering baseline
+             
+             if height > 0: 
                   ax1.text(bar.get_x() + bar.get_width()/2., height / 2,
                           f"Min: {mins1[i]:.2f}\nMax: {maxs1[i]:.2f}",
                           ha='center', va='center', fontsize=7, alpha=0.8)
 
-    # --- Group 2 Plot ---
+    
     x2 = np.arange(len(group2_keys))
     plot_medians2 = np.array(medians2, dtype=float)
     plot_stds2 = np.array(stds2, dtype=float)
@@ -291,7 +278,7 @@ def plot_grouped_metrics(metrics_data, num_tests, algo_name="Algorithm"):
         print(f"Saved single algorithm plot: {plot_filename}")
     except Exception as e:
         print(f"Error saving plot {plot_filename}: {e}")
-    plt.close(fig) # Close the figure to free memory
+    plt.close(fig) 
 
 
 def run_single_analysis(algo_name, base_dir):
@@ -322,8 +309,8 @@ def run_batch_analysis(base_dirs_dict):
 
         all_metrics[algo_name] = metrics_data
         test_counts[algo_name] = num_tests
-        # Optional: Run single plot generation here if desired for each algo
-        # run_single_analysis(algo_name, base_dir) # Calls plot_grouped_metrics
+        
+        
 
     if not all_metrics:
         print("\nError: No algorithms processed successfully with data. Exiting batch analysis.")
@@ -334,9 +321,9 @@ def run_batch_analysis(base_dirs_dict):
     export_summary_table(all_metrics, test_counts)
     print("\n--- Batch Analysis Complete ---")
 
-# ============================================================================
-# ============= MODIFIED PLOT_COMPARISON_METRICS =============================
-# ============================================================================
+
+
+
 def plot_comparison_metrics(all_metrics, test_counts):
     """ Plots grouped bar charts comparing algorithms, with bar clipping and fixed legend. """
     group1_metrics = ["Total Execution Time (s)", "Total Distance (m)"]
@@ -348,23 +335,23 @@ def plot_comparison_metrics(all_metrics, test_counts):
         print("No algorithms have data for comparison plotting.")
         return
 
-    # Determine bar width dynamically
-    total_width = 0.8 # Total width allocated for bars within a group
+    
+    total_width = 0.8 
     bar_width = total_width / num_algorithms
     cmap = plt.get_cmap("tab10")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(17, 7)) # Slightly wider
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(17, 7)) 
 
-    legend_handles = [] # To store one handle per algorithm for the legend
+    legend_handles = [] 
     legend_labels = []
 
-    # --- Helper function to plot one group ---
+    
     def plot_group(ax, group_metrics, title, set_y_limit=None, is_first_plot=False):
         num_metrics = len(group_metrics)
         x_indices = np.arange(num_metrics)
-        clip_threshold = set_y_limit if set_y_limit is not None else np.inf # Use limit for clipping if set
+        clip_threshold = set_y_limit if set_y_limit is not None else np.inf 
 
-        all_plot_upper_bounds = [] # Track y-values for axis limits
+        all_plot_upper_bounds = [] 
 
         for i, algo in enumerate(algorithms):
             algo_medians = []
@@ -374,70 +361,70 @@ def plot_comparison_metrics(all_metrics, test_counts):
             for metric in group_metrics:
                  values = all_metrics.get(algo, {}).get(metric, [])
                  algo_raw_values.append(values)
-                 median, std, _, _ = compute_statistics(values) # Get the TRUE median/std
+                 median, std, _, _ = compute_statistics(values) 
                  algo_medians.append(median)
                  algo_stds.append(std)
 
             plot_medians = np.array(algo_medians, dtype=float)
             plot_stds = np.array(algo_stds, dtype=float)
-            plot_stds_safe = np.nan_to_num(plot_stds) # Use 0 std for NaN error bars
+            plot_stds_safe = np.nan_to_num(plot_stds) 
 
-            # Calculate positions
-            offset = (i - num_algorithms / 2 + 0.5) * bar_width # Center group around tick
+            
+            offset = (i - num_algorithms / 2 + 0.5) * bar_width 
             bar_positions = x_indices + offset
 
-            # --- Bar Clipping Logic ---
-            plot_heights = plot_medians.copy() # Start with actual medians
-            clipped_mask = plot_heights > clip_threshold # Find bars exceeding threshold
-            plot_heights[clipped_mask] = clip_threshold # Cap their height
+            
+            plot_heights = plot_medians.copy() 
+            clipped_mask = plot_heights > clip_threshold 
+            plot_heights[clipped_mask] = clip_threshold 
 
-            bars = ax.bar(bar_positions, plot_heights, width=bar_width * 0.9, # Slightly thinner bars
-                          label=f"{algo} (n={test_counts.get(algo, 0)})", # Label needed for initial handle collection
+            bars = ax.bar(bar_positions, plot_heights, width=bar_width * 0.9, 
+                          label=f"{algo} (n={test_counts.get(algo, 0)})", 
                           yerr=plot_stds_safe,
                           capsize=4,
                           alpha=0.9, color=cmap(i % cmap.N),
-                          error_kw={'alpha': 0.6}) # Make error bars slightly transparent
+                          error_kw={'alpha': 0.6}) 
 
-            # Store legend info only from the first plot group
+            
             if is_first_plot:
-                if bars: # Ensure bars were actually created (data wasn't all NaN)
-                    legend_handles.append(bars[0]) # Get handle from first bar of this algo
+                if bars: 
+                    legend_handles.append(bars[0]) 
                     legend_labels.append(f"{algo} (n={test_counts.get(algo, 0)})")
 
-            # Add hatching and text for clipped bars
+            
             for j, bar in enumerate(bars):
-                original_median = plot_medians[j] # The actual calculated median
+                original_median = plot_medians[j] 
                 is_clipped = clipped_mask[j]
 
-                if np.isnan(original_median): # Skip annotation for NaN bars
+                if np.isnan(original_median): 
                     continue
 
-                # Apply hatching if clipped
+                
                 if is_clipped:
                     bar.set_hatch('///')
-                    bar.set_edgecolor('grey') # Make edge visible over hatch
+                    bar.set_edgecolor('grey') 
 
-                # --- Text Annotation ---
-                text_y = plot_heights[j] # Start text position at (potentially clipped) bar top
-                # Add error bar height to text position if std exists
+                
+                text_y = plot_heights[j] 
+                
                 if not np.isnan(plot_stds[j]) and plot_stds[j] > 0:
-                    # Make sure not to position based on error bar if the bar itself was clipped much lower
-                    # If clipped, put text just above clip line. Otherwise, above error bar.
+                    
+                    
                      if is_clipped:
-                         text_y = clip_threshold # Position text right above the clip line
+                         text_y = clip_threshold 
                      else:
-                         text_y += plot_stds_safe[j] # Position above error bar end
+                         text_y += plot_stds_safe[j] 
 
-                # Add a small absolute offset based on current axis scale for clarity
+                
                 y_offset = (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.02
                 text_y += y_offset
 
-                # Use the ORIGINAL median for the text label!
+                
                 ax.text(bar.get_x() + bar.get_width() / 2., text_y,
                         f"{original_median:.2f}", ha='center', va='bottom', fontsize=7, rotation=0, fontweight='bold')
 
 
-            # Track max values for y-limit setting (use capped height + error bar for visible extent)
+            
             valid_bounds = [h + s for h, s in zip(plot_heights, plot_stds_safe) if not np.isnan(h)]
             if valid_bounds:
                 all_plot_upper_bounds.extend(valid_bounds)
@@ -449,31 +436,30 @@ def plot_comparison_metrics(all_metrics, test_counts):
         ax.set_title(title)
         ax.grid(axis='y', linestyle='--', alpha=0.6)
 
-        # Set Y limits
+        
         if set_y_limit is not None:
-            ax.set_ylim(0, set_y_limit * 1.1) # Add a little space above forced limit
+            ax.set_ylim(0, set_y_limit * 1.1) 
         elif all_plot_upper_bounds:
-             y_upper = max(all_plot_upper_bounds) * 1.15 # Increased space for text above bars
+             y_upper = max(all_plot_upper_bounds) * 1.15 
              ax.set_ylim(0, y_upper if not np.isnan(y_upper) and y_upper > 0 else 1)
         else:
-             ax.set_ylim(0, 1) # Default if no valid data
+             ax.set_ylim(0, 1) 
 
 
-    # --- Plot the two groups ---
-    # Pass is_first_plot=True only to the first call to collect legend handles
+    
     plot_group(ax1, group1_metrics, "Execution Time & Distance", is_first_plot=True)
-    plot_group(ax2, group2_metrics, "Entropy & Velocity", set_y_limit=4.0) # Explicitly clip/limit at 4
+    plot_group(ax2, group2_metrics, "Entropy & Velocity", set_y_limit=4.0)
 
-    # --- Final Figure Touches ---
+
     fig.suptitle("Performance Comparison Across Algorithms", fontsize=18)
 
-    # Use the collected handles and labels for a single, unified legend
-    if legend_handles: # Check if we collected any handles
+
+    if legend_handles: 
          fig.legend(handles=legend_handles, labels=legend_labels,
                    loc='upper center', ncol=num_algorithms,
                    bbox_to_anchor=(0.5, 0.96), fontsize='medium')
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.92]) # Adjust rect for suptitle and legend
+    plt.tight_layout(rect=[0, 0.03, 1, 0.92]) 
 
     plot_filename = "comparison_performance_summary_clipped_random_trees.eps"
     try:
@@ -482,12 +468,10 @@ def plot_comparison_metrics(all_metrics, test_counts):
     except Exception as e:
         print(f"\nError saving comparison plot {plot_filename}: {e}")
 
-    plt.show() # Display the plot
-    plt.close(fig) # Close figure after showing/saving
+    plt.show()
+    plt.close(fig)
 
-# ============================================================================
-# --- export_summary_table remains the same ---
-# ... (function omitted for brevity) ...
+
 def export_summary_table(all_metrics, test_counts, output_path="summary_metrics_comparison_random_trees.csv"):
     """ Creates a CSV summary table with median, std, min, max. """
     rows = []
@@ -502,11 +486,10 @@ def export_summary_table(all_metrics, test_counts, output_path="summary_metrics_
     sorted_metric_keys = sorted(list(all_metric_keys))
 
     for algo in algorithms:
-        metrics = all_metrics.get(algo, {}) # Use get for safety
+        metrics = all_metrics.get(algo, {})
         t_count = test_counts.get(algo, 0)
         for metric in sorted_metric_keys:
             values = metrics.get(metric, [])
-            # Always calculate true statistics for the table
             median, std, min_val, max_val = compute_statistics(values)
             rows.append({
                 "Metric": metric,
@@ -530,19 +513,17 @@ def export_summary_table(all_metrics, test_counts, output_path="summary_metrics_
         df.to_csv(output_path, index=False)
         print(f"\n✅ Summary table saved: {output_path}")
         print("\n--- Summary Statistics Table ---")
-        # Use Pandas to_string for better console formatting, handle NaNs
         print(df.to_string(index=False, na_rep='N/A', float_format="%.4f"))
     except Exception as e:
         print(f"\n❌ Error saving summary table to {output_path}: {e}")
 
 
-# --- __main__ block with updated dummy data ---
 if __name__ == "__main__":
     base_dirs_to_analyze = {
-        'neural mpc': 'mpc_test_runs_25_trees',
-        'greedy': 'batch_test_25trees_greedy',
-        'tree_to_tree': 'batch_test_25trees_tree_to_tree',
-        'mower': 'batch_test_25trees_between_rows'
+        'neural_mpc': 'mpc_test_runs_25_trees',
+        'greedy': 'batch_test_trees_greedy_gt',
+        'tree_to_tree': 'batch_test_trees_linear_gt',
+        'mower': 'batch_test_trees_mower_gt'
     }
 
     print("\n--- Setting up Test Environment (Dummy Files) ---")
@@ -550,14 +531,6 @@ if __name__ == "__main__":
     Total Distance (m), {:.2f}
     Average Waypoint-to-Waypoint Time (s), {:.4f}
     Final Entropy, {:.3f}
-    Total Commands, {:.0f}""" # Format string
-    velocity_header = "Time (s),Tag,x_velocity,y_velocity,yaw_velocity\n" # Added missing commas
-
-    np.random.seed(42) # Make dummy data repeatable
-
-
-    # Run the full batch analysis
+    Total Commands, {:.0f}""" 
+    velocity_header = "Time (s),Tag,x_velocity,y_velocity,yaw_velocity\n"
     run_batch_analysis(base_dirs_to_analyze)
-
-    # Example: You could still run single analysis if needed
-    # run_single_analysis('mower', base_dirs_to_analyze['mower'])

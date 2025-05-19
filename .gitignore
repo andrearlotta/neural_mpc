@@ -15,3 +15,5 @@ unity_exec/*
 *events.out.*
 *.svg
 *.eps
+unity_app/*
+*_exec*/*

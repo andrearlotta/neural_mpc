@@ -7,7 +7,7 @@ if __name__ == '__main__':
     N_tests = 1
     for test_num in range(0,N_tests):
         # Base folder to store all test run outputs.
-        base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_test_random_trees_nmpc_3")
+        base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_test_100_trees_nmpc_05_25")
         os.makedirs(base_test_folder, exist_ok=True)
 
         # Find the next test number
@@ -23,7 +23,6 @@ if __name__ == '__main__':
         print(f"================== Starting Test Run {next_test_num} ==================")
 
         mpc = NeuralMPC(run_dir=run_folder, initial_randomic=True)
-        # Run the simulation with the specified initial state and output folder.
         mpc.run_simulation()
         # Optionally, plot the entropy and tree lambda trends for this run.
         #mpc.plot_entropy_separately()

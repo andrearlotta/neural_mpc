@@ -1,2 +1,4 @@
 ---
+
 geometry_msgs/PoseArray trees_poses
+uint8[] tree_types # 0 for raw, 1 for ripe

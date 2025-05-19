@@ -10,11 +10,15 @@ import csv
 import time
 import os
 import threading
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from nmpc_ros_package.ros_com_lib.bridge_class import BridgeClass
-from nmpc_ros_package.ros_com_lib.sensors import SENSORS
 
+from geometry_msgs.msg import Pose, PoseStamped, Point, Quaternion
+from std_msgs.msg import Float32MultiArray
+from visualization_msgs.msg import MarkerArray
+from nav_msgs.msg import Path
+import tf
+from nmpc_ros_package.ros_com_lib.sensors import create_tree_markers
+
+from nmpc_ros.srv import GetTreesPoses
 
 class PIDController:
     def __init__(self, kp, kd):
@@ -99,19 +103,28 @@ class Logger:
 
 
 class TrajectoryGenerator:
-    def __init__(self, trajectory_type, bridge, run_folder="baselines", random_initial_state=True):
+    def __init__(self, trajectory_type, run_folder="baselines", random_initial_state=True):
         self.run_folder = run_folder
         # Get trajectory mode and initialize Logger only once.
         self.trajectory_type = trajectory_type
         self.logger = Logger(trajectory_type, run_folder)
+
+        rospy.init_node("baseline_node", anonymous=True, log_level=rospy.DEBUG)
+        
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        self.cmd_pose_pub = rospy.Publisher("cmd/pose", Pose, queue_size=10)
+        self.tree_markers_pub = rospy.Publisher("tree_markers", MarkerArray, queue_size=10)
+        rospy.Subscriber("tree_scores", Float32MultiArray, self.tree_scores_callback)
 
         # New history lists for storing poses and bayesian (lambda) values
         self.pose_history = []      # Each entry: [x, y, theta]
         self.lambda_history = []    # Each entry: copy of lambda_values at that step
         self.entropy_history = []
         self.time_history = []
-
-        self.is_mower =( self.trajectory_type == 'between_rows')
+        self.latest_trees_scores = None
+        self.is_mower =( self.trajectory_type == 'mower')
         # Initialize PID controllers.
         self.pid_controller_x = PIDController(kp=3.0 if self.is_mower else 7.0, kd=1)
         self.pid_controller_y = PIDController(kp=3.0 if self.is_mower else 7.0, kd=1)
@@ -120,21 +133,31 @@ class TrajectoryGenerator:
         self.idx = None
 
         self.circle_tree_event = threading.Event()
-        # Bridge for robot state and sensor data.
-        self.bridge = bridge
-        self.tree_positions = np.array(self.bridge.call_server({"trees_poses": None})["trees_poses"])
+ 
+        # Get tree positions from service using the sensors.py serializer logic.
+        self.tree_positions, self.trees_gt_id = self.get_trees_poses_and_types()
+        self.num_total_trees = self.tree_positions.shape[0]
         lb, ub = self.get_domain(self.tree_positions)
         initial_state = self.generate_random_initial_state(lb, ub, margin=1.75)
         print(f"Initial State: {initial_state}")
         # Publish the initial random position.
-        if random_initial_state: self.bridge.pub_data({ "cmd_pose": initial_state})
+        if random_initial_state:
+            current_state = self.generate_random_initial_state(lb, ub, margin=1.5)
+            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(current_state[2]))
+            cmd_pose_msg = Pose()
+            cmd_pose_msg.position = Point(x=float(current_state[0]), y=float(current_state[1]), z=0.0)
+            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                  y=quaternion[1],
+                                                  z=quaternion[2],
+                                                  w=quaternion[3])
+            self.cmd_pose_pub.publish(cmd_pose_msg)            
         rospy.sleep(2.5)
-        self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
+        self.x, self.y, self.theta = np.array(self.robot_state_update_thread()).flatten()
         self.lambda_values = np.full(len(self.tree_positions), 0.5)  # Initialize lambda
 
-        self.bridge.pub_data({
-            "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
-        })
+
+        tree_markers_msg = create_tree_markers(self.tree_positions, self.lambda_values.flatten())
+        self.tree_markers_pub.publish(tree_markers_msg)
 
         self.max_velocity = 0.45 if self.is_mower else 3.0         # Maximum velocity of the robot
         self.max_yaw_velocity = np.pi/4      # Maximum yaw velocity (rad/s)
@@ -146,21 +169,94 @@ class TrajectoryGenerator:
         self.max_observe_time = 30.0
         self.rate = rospy.Rate(int(1 / self.dt))
         self.measurement_timer = rospy.Timer(rospy.Duration(0.4), self.measurement_callback)
-        while self.bridge.get_data()["tree_scores"] is None:
-            pass
+
+    # ---------------------------
+    # Service Call to Get Trees Poses
+    # ---------------------------
+    def get_trees_poses_and_types(self):
+        """
+        Calls the GetTreesPoses service and returns:
+        - tree_positions: An (N,2) numpy array of [x, y] positions.
+        - tree_types: An (N,) numpy array of types (0 for raw, 1 for ripe).
+        """
+        service_name = "/obj_pose_srv" # Assicurati che corrisponda al server C#
+        try:
+            rospy.wait_for_service(service_name, timeout=5.0)
+            trees_srv = rospy.ServiceProxy(service_name, GetTreesPoses)
+            response = trees_srv()
+
+            trees_pos = np.array([[pose.position.x, pose.position.y]
+                                for pose in response.trees_poses.poses])
+            
+            # Assuming each byte in raw_byte_string is a tree type
+            if isinstance(response.tree_types, bytes):
+                tree_types_list = list(response.tree_types) # Converts b'\x00\x01\x02' to [0, 1, 2]
+            else:
+                # Handle other cases or raise an error if the type is unexpected
+                rospy.logerr(f"Unexpected type for raw tree types data: {type(response.tree_types)}")
+                tree_types_list = [] # Or some default
+            tree_types = np.array(tree_types_list, dtype=np.uint8)
+
+            if len(trees_pos) != len(tree_types):
+                rospy.logwarn(f"Mismatch in number of poses ({len(trees_pos)}) and types ({len(tree_types)}).")
+                return np.array([]), np.array([])
+                
+            return trees_pos, tree_types
+            
+        except rospy.ServiceException as e:
+            rospy.logerr(f"Service call to {service_name} failed: {e}")
+            return np.array([]), np.array([])
+        except rospy.ROSException as e:
+            rospy.logerr(f"Failed to connect to service {service_name}: {e}")
+            return np.array([]), np.array([])
+        except AttributeError as e:
+            rospy.logerr(f"Failed to access 'tree_types' in service response: {e}. "
+                        "Ensure .srv file and messages are updated.")
+            return np.array([]), np.array([])
+
+    # ---------------------------
+    # Callback Functions
+    # ---------------------------
+    def tree_scores_callback(self, msg):
+        """
+        Callback for tree scores.
+        """
+        scores = np.array(msg.data).reshape(-1, 1)
+        self.latest_trees_scores = scores
+
+    def robot_state_update_thread(self):
+        """Continuously update the robot's state using TF at 30 Hz."""
+        try:
+            # Look up the transform from 'map' to 'drone_base_link'
+            trans = self.tf_buffer.lookup_transform('map', 'drone_base_link', rospy.Time())
+            # Extract the yaw angle from the quaternion
+            (_, _, yaw) = tf.transformations.euler_from_quaternion([
+                trans.transform.rotation.x,
+                trans.transform.rotation.y,
+                trans.transform.rotation.z,
+                trans.transform.rotation.w
+            ])
+            # Update current_state with [x, y, yaw]
+            return [trans.transform.translation.x,
+                                  trans.transform.translation.y,
+                                  yaw]
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn("Failed to get transform: %s", e)
+            return None
+
 
     def generate_random_initial_state(self, lb, ub, margin=1.25):
         """
         Generate a random initial state [x, y, theta].
-        - If mode is 'tree_to_tree', start outside the field bounds.
-        - If mode is 'between_rows', start from one of the four field corners.
+        - If mode is 'linear', start outside the field bounds.
+        - If mode is 'mower', start from one of the four field corners.
         """
         threshold = 1.5  # Extra margin
         direction_map = {'N': np.pi/2, 'E': 0, 'S': -np.pi/2, 'W': np.pi}
         orientations = ['N', 'S', 'E', 'W']
 
         while True:
-            if self.trajectory_type == "tree_to_tree":
+            if self.trajectory_type == "linear":
                 # Generate x outside the x domain
                 if np.random.rand() < 0.5:
                     x = np.random.uniform(lb[0] - threshold, lb[0])
@@ -175,7 +271,7 @@ class TrajectoryGenerator:
 
                 theta = np.random.uniform(-np.pi, np.pi)
 
-            elif self.trajectory_type == "between_rows":
+            elif self.trajectory_type == "mower":
                 # Randomly pick one of the 4 vertices
                 vertices = [
                     (lb[0]-1.5, lb[1]-1.5),  # bottom-left
@@ -219,13 +315,13 @@ class TrajectoryGenerator:
     def measurement_callback(self, event):
         if not (self.is_mower or self.circle_tree_event.is_set()):
             return
-        new_data = self.bridge.get_data()
-        if new_data is None or new_data.get("tree_scores") is None:
-            return
-        z_k = new_data["tree_scores"].flatten()
-
+        if  self.latest_trees_scores is None : return
+        z_k = self.latest_trees_scores
+        
         if self.is_mower:
-            self.lambda_values = self.bayes(self.lambda_values, z_k)
+            for i in range(len(z_k)):
+                self.lambda_values[i] = self.bayes(self.lambda_values[i], z_k[i])
+                self.lambda_values = self.bayes(self.lambda_values, z_k)
         elif self.idx is not None:
             self.lambda_values[self.idx] = self.bayes(self.lambda_values[self.idx], z_k[self.idx])
             # When the lambda value reaches a threshold, clear the event to stop observation.
@@ -233,9 +329,8 @@ class TrajectoryGenerator:
                 self.circle_tree_event.clear()
 
         current_entropy = self.calculate_entropy(self.lambda_values)
-        self.bridge.pub_data({
-            "tree_markers": {"trees_pos": self.tree_positions, "lambda": self.lambda_values}
-        })
+        tree_markers_msg = create_tree_markers(self.tree_positions, self.lambda_values.flatten())
+        self.tree_markers_pub.publish(tree_markers_msg)
 
     def calculate_entropy(self, lambda_values):
         """Simple entropy calculation based on lambda values."""
@@ -302,7 +397,7 @@ class TrajectoryGenerator:
         start_time = time.time()
 
         while not rospy.is_shutdown():
-            current_state = np.array(self.bridge.update_robot_state()).flatten()
+            current_state = np.array(self.robot_state_update_thread()).flatten()
             self.x, self.y, self.theta = current_state[:3]
             self.pose_history.append(current_state[:3])
             self.time_history.append(time.time() - self.logger.start_time)
@@ -338,7 +433,15 @@ class TrajectoryGenerator:
             self.logger.log_velocity(x_output, y_output, yaw_output, tag="move_to_waypoint")
     
             cmd_pose = np.array([self.x + x_output * self.dt, self.y + y_output * self.dt, self.theta + yaw_output * self.dt]).reshape(-1, 1)
-            self.bridge.pub_data({"cmd_pose": cmd_pose})
+            # Build and publish the cmd_pose message.
+            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(cmd_pose[2]))
+            cmd_pose_msg = Pose()
+            cmd_pose_msg.position = Point(x=float(cmd_pose[0]), y=float(cmd_pose[1]), z=0.0)
+            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                  y=quaternion[1],
+                                                  z=quaternion[2],
+                                                  w=quaternion[3])
+            self.cmd_pose_pub.publish(cmd_pose_msg)
 
             # Calculate the distance traveled in this step.
             step_distance = np.linalg.norm([x_output * self.dt,  y_output * self.dt])
@@ -356,7 +459,7 @@ class TrajectoryGenerator:
         center_x, center_y = self.tree_positions[self.idx]
         start_time = time.time()
 
-        self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
+        self.x, self.y, self.theta = np.array(self.robot_state_update_thread()).flatten()
         phi = math.atan2(self.y - center_y, self.x - center_x)
         radius = np.sqrt((self.x - center_x) ** 2 + (self.y - center_y) ** 2)
         delta_phi = self.dt * 15 * math.pi / 180  # Angular increment (in radians)
@@ -366,7 +469,7 @@ class TrajectoryGenerator:
             desired_y = center_y + radius * math.sin(phi)
             desired_theta = phi + math.pi  # Face the tree center
 
-            self.x, self.y, self.theta = np.array(self.bridge.update_robot_state()).flatten()
+            self.x, self.y, self.theta = np.array(self.robot_state_update_thread()).flatten()
             self.pose_history.append([self.x, self.y, self.theta])
             self.lambda_history.append(self.lambda_values.copy())
             self.entropy_history.append(self.calculate_entropy(self.lambda_values))
@@ -388,7 +491,15 @@ class TrajectoryGenerator:
             self.logger.log_velocity(x_output, y_output, yaw_output, tag=f"observe_tree_{self.idx}")
 
             cmd_pose = np.array([self.x + x_output * self.dt, self.y + y_output * self.dt, self.theta + yaw_output]).reshape(-1, 1)
-            self.bridge.pub_data({"cmd_pose": cmd_pose})
+            # Build and publish the cmd_pose message.
+            quaternion = tf.transformations.quaternion_from_euler(0, 0, float(cmd_pose[2]))
+            cmd_pose_msg = Pose()
+            cmd_pose_msg.position = Point(x=float(cmd_pose[0]), y=float(cmd_pose[1]), z=0.0)
+            cmd_pose_msg.orientation = Quaternion(x=quaternion[0],
+                                                  y=quaternion[1],
+                                                  z=quaternion[2],
+                                                  w=quaternion[3])
+            self.cmd_pose_pub.publish(cmd_pose_msg)
             phi += delta_phi
             step_distance = np.linalg.norm([x_output * self.dt, y_output * self.dt])
             self.logger.add_distance(step_distance)
@@ -402,7 +513,7 @@ class TrajectoryGenerator:
         denominator = numerator + (1 - lambda_prev) * (1 - z)
         return numerator / denominator
 
-    def generate_mower_path_between_rows(self, offset=2.0, spacing=4.0, heading_direction='O', axis='x'):
+    def generate_mower_path_mower(self, offset=2.0, spacing=4.0, heading_direction='O', axis='x'):
         """
         Generate a mower path that includes external rows outside the tree grid.
 
@@ -418,7 +529,7 @@ class TrajectoryGenerator:
         y_max = np.max(self.tree_positions[:, 1]) + offset
 
         # Use initial position and orientation
-        [drone_x],[drone_y],[_] = self.bridge.update_robot_state()
+        drone_x,drone_y,_ = self.robot_state_update_thread()
 
 
         def find_nearest_vertex(drone_x, drone_y, x_min_inner, x_max_inner, y_min_inner, y_max_inner):
@@ -485,7 +596,7 @@ class TrajectoryGenerator:
         return waypoints
 
 
-    def run_between_rows_trajectory(self):
+    def run_mower_trajectory(self):
         """
         Execute a simple mower trajectory using the generated mower path.
 
@@ -497,7 +608,7 @@ class TrajectoryGenerator:
 
         # Generate the simple mower path.
         # You can adjust offset, spacing, and heading_direction as needed.
-        path = self.generate_mower_path_between_rows(offset=2.0, spacing=4.0, heading_direction='E', axis='y')
+        path = self.generate_mower_path_mower(offset=2.0, spacing=4.0, heading_direction='E', axis='y')
         
         #self.plot_path(path, self.tree_positions)
 
@@ -518,7 +629,7 @@ class TrajectoryGenerator:
         self.logger.finalize_performance_metrics(final_entropy, final_bayes)
         print("Simple mower trajectory complete")
 
-    def generate_tree_to_tree_path(self):
+    def generate_linear_path(self):
         if len(self.tree_positions) == 0:
             return []
 
@@ -615,35 +726,47 @@ class TrajectoryGenerator:
         if not os.path.exists(baselines_dir):
             os.makedirs(baselines_dir)
         filename = os.path.join(baselines_dir, f"{self.trajectory_type}_{self.logger.timestamp}_plot_data.csv")
-        with open(filename, 'w', newline='') as csvfile:
+        with open(filename, mode='w', newline='') as csvfile:
             writer = csv.writer(csvfile)
+            
+            # Write tree positions (existing)
             tree_positions_flat = self.tree_positions.flatten().tolist()
             writer.writerow(["tree_positions"] + tree_positions_flat)
 
-            header = ["time", "x", "y", "theta", "entropy"]
-            if len(self.lambda_history) > 0:
-                num_trees = len(self.lambda_history[0])
-                header += [f"lambda_{i}" for i in range(num_trees)]
-            writer.writerow(header)
+            writer.writerow(["trees_gt_id"] + self.trees_gt_id.tolist())
 
+            header = ["time", "x", "y", "theta", "entropy"]
+            if self.lambda_history and self.lambda_history[0] is not None and len(self.lambda_history[0]) > 0:
+                num_lambdas = len(self.lambda_history[0]) # Number of trees based on lambda
+                header += [f"lambda_{i}" for i in range(num_lambdas)]
+            writer.writerow(header)
+            
             for i in range(len(self.time_history)):
                 time_val = self.time_history[i]
-                x, y, theta = self.pose_history[i]
-                entropy = self.entropy_history[i]
-                lambda_vals = list(self.lambda_history[i])
-                row = [time_val, x, y, theta, entropy] + lambda_vals
-                writer.writerow(row)
-        print(f"Plot data saved to {filename}")
+                # Ensure pose_history[i] is a flat list/array of 3 elements
+                current_pose = np.array(self.pose_history[i]).flatten()
+                if len(current_pose) == 3:
+                    x, y, theta = current_pose
+                else: # Fallback or error
+                    x, y, theta = 0.0, 0.0, 0.0 
+                    rospy.logwarn(f"Unexpected pose format at index {i}: {self.pose_history[i]}")
 
-    def run_tree_to_tree_trajectory(self):
+                entropy_val = self.entropy_history[i]
+                lambda_vals = self.lambda_history[i] if self.lambda_history[i] is not None else []
+                row = [time_val, x, y, theta, entropy_val] + lambda_vals.tolist()
+                writer.writerow(row)
+                
+        rospy.loginfo("Plot data saved to %s", filename)
+
+    def run_linear_trajectory(self):
             self.logger.start_logging()
-            tree_order = self.generate_tree_to_tree_path()
+            tree_order = self.generate_linear_path()
             tree_path = [self.tree_positions[idx].tolist() for idx in tree_order]
             #self.plot_path(tree_path, self.tree_positions)
 
             total_time = 0
             total_distance = 0
-            current_state = np.array(self.bridge.update_robot_state()).flatten()[:2]
+            current_state = np.array(self.robot_state_update_thread()).flatten()[:2]
             prev_point = current_state
 
             for idx in tree_order:
@@ -688,7 +811,7 @@ class TrajectoryGenerator:
         observation_distance_threshold = 2.0
 
         while candidates:
-            current_pos = np.array(self.bridge.update_robot_state()).flatten()[:2]
+            current_pos = np.array(self.robot_state_update_thread()).flatten()[:2]
             candidates.sort(key=lambda c: (c['bayes'], np.linalg.norm(np.array(c['position']) - current_pos)))
             next_candidate = candidates[0]
             angle = np.pi*(np.random.random()*2 -1)
@@ -722,12 +845,12 @@ class TrajectoryGenerator:
         After completion, the trajectory and entropy r
             eduction are plotted.
         """
-        if self.trajectory_type == "between_rows":
+        if self.trajectory_type == "mower":
             self.is_mower = True
-            self.run_between_rows_trajectory()
-        elif self.trajectory_type == "tree_to_tree":
-            self.run_tree_to_tree_trajectory()
-        else:
+            self.run_mower_trajectory()
+        elif self.trajectory_type == "linear":
+            self.run_linear_trajectory()
+        elif  self.trajectory_type == "greedy":
             self.run_greedy_trajectory()
         
         self.shutdown()
@@ -740,14 +863,13 @@ class TrajectoryGenerator:
 
 if __name__ == '__main__':
     try:
-        bridge = BridgeClass(SENSORS)
         # Initialize and run the trajectory generator
-        modes = ['greedy']
+        modes = ['greedy', 'linear', 'mower']
         for mode in modes:
             for test_num in range(0, 2):
                 import re
                 # Define base folder
-                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"batch_test_random_trees_{mode}_2")
+                base_test_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"batch_test_100trees_{mode}_gt")
                 os.makedirs(base_test_folder, exist_ok=True)
 
                 # Find the next test number
@@ -762,7 +884,7 @@ if __name__ == '__main__':
                 os.makedirs(run_folder, exist_ok=True)
 
                 print(f"================== Starting Test Run {next_test_num} ==================")
-                trajectory_generator = TrajectoryGenerator(mode, bridge, run_folder=run_folder)
+                trajectory_generator = TrajectoryGenerator(mode, run_folder=run_folder)
                 trajectory_generator.run()
                 trajectory_generator.save_plot_data_csv()
     except rospy.ROSInterruptException:

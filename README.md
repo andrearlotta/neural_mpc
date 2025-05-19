@@ -1,69 +1,84 @@
-# Neural MPC for Tree Monitoring Using a Surrogate Model
+## 1. Clone the Repository with Submodules
 
-This repository contains a Python implementation of a Neural Model Predictive Control (MPC) system for a drone navigating a field of trees. The goal is to estimate tree maturity confidence using a surrogate model, optimize the drone's trajectory, and visualize the results.
+To clone the repository along with its submodules:
 
----
+```bash
+git clone --recurse-submodules https://github.com/newline-lab/agri_neural_mpc.git
+cd agri_neural_mpc
+```
 
-## Features
-- Train a neural network (NN) as a surrogate model for estimating confidence based on tree and drone positions.
-- Perform Bayesian updates to refine tree confidence estimates.
-- Implement Neural MPC for trajectory planning to maximize information gain (reduce entropy).
-- Visualize results, including drone trajectory, entropy reduction, and computation durations.
+```bash
+git submodule update --init --recursive
+```
 
----
+This ensures all submodules are initialized and updated recursively.
 
-## Installation
+## 2. Set Up Python Environment
 
-1. Clone the repository:
-    ```bash
-    git clone <repository-url>
-    cd <repository-folder>
-    ```
+It's recommended to use a virtual environment:
 
-2. Install required dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
 
----
+## 3. Install Python Dependencies
 
-## Usage
+Install the required Python packages:
 
-1. **Train the Neural Network** (Optional):
-    - Set `train = True` in the script to train the NN. Training data is synthetically generated based on drone and tree positions.
-    - The trained model is saved in the `saved_models_*` directory.
+```bash
+pip install --upgrade pip
+pip install -r requirements_portable.txt
+```
 
-2. **Run the MPC Script**:
-    - Simply run the script using:
-      ```bash
-      python script_name.py
-      ```
-    - The script will load the pre-trained NN and simulate the drone navigating the environment.
+## 4. Install PyTorch
 
-3. **View Visualizations**:
-    - The script generates an animated plot that includes:
-      - Drone trajectory
-      - Tree maturity confidence (`λ`) changes
-      - Entropy reduction
-      - Computation durations for MPC iterations
-    - Results are also saved as an interactive HTML file: `neural_mpc_results_lambda_maximization.html`.
+Choose the appropriate installation based on your system:
 
----
+- For CUDA 11.8:
 
-## Configuration
+  ```bash
+  pip install torch==2.0.1+cu118 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
+  ```
 
-- The script allows for adjusting key parameters like:
-  - Neural network architecture (hidden layers, neurons, etc.).
-  - MPC parameters such as horizon, time step, and state/control constraints.
-  - Tree grid size and spacing.
+- For CPU-only:
 
-Modify these parameters directly in the script to experiment with different settings.
+  ```bash
+  pip install torch torchvision torchaudio
+  ```
 
----
+For other configurations, refer to the [official PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
-## Outputs
+## 5. Set Up ROS Dependencies
 
-- **Animation**: An animated visualization of the drone's trajectory and the confidence (`λ`) updates.
-- **HTML File**: Interactive visualization saved as `neural_mpc_results.html`.
+Source your ROS environment:
 
----
+```bash
+source /opt/ros/noetic/setup.bash
+```
+
+Then, install ROS package dependencies:
+
+```bash
+cd ros
+rosdep update
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+## 6. Build the Workspace
+
+Build your ROS workspace:
+
+```bash
+catkin_make
+source devel/setup.bash
+```
+
+Or, if you're using `catkin_tools`:
+
+```bash
+catkin build
+source devel/setup.bash
+```
+
+
