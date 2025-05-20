@@ -28,7 +28,7 @@ Install the required Python packages:
 
 ```bash
 pip install --upgrade pip
-pip install -r requirements_portable.txt
+pip install -r requirements.txt
 ```
 
 ## 4. Install PyTorch
